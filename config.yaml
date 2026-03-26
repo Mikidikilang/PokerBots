@@ -24,7 +24,7 @@ project:
 # Futtatási környezet (Runtime)
 # ---------------------------------------------------------------------------
 runtime:
-  platform: "kaggle"                    # Opciók: "kaggle", "local", "cloud"
+  platform: "local"                    # Opciók: "kaggle", "local", "cloud"
   device: "auto"                        # "auto" -> CUDA ha elérhető, egyébként CPU
   num_workers: 4                        # DataLoader / Rollout worker szálak száma
   log_level: "INFO"                     # Python logging szint: DEBUG, INFO, WARNING, ERROR
@@ -36,7 +36,7 @@ runtime:
 environment:
   game_engine: "rlcard"                 # Játékmotor backend: "rlcard" vagy "pettingzoo"
   game_type: "no-limit-holdem"
-  num_players: 6                        # Asztalméret: 2, 3, 4, 6, 8, 9
+  num_players: 2                        # Asztalméret: 2, 3, 4, 6, 8, 9
   initial_stack_bb: 200                 # Induló zsetonkészlet Big Blind egységben
   small_blind: 1                        # Kisvak mérete (abszolút chip érték)
   big_blind: 2                          # Nagyvak mérete (abszolút chip érték)
@@ -120,7 +120,7 @@ ppo:
   gae_lambda: 0.95                      # Generalized Advantage Estimation (λ)
 
   # --- Mintavételezés és Batch ---
-  rollout_steps: 2048                   # Lépések száma egy rollout-ban (adatgyűjtés)
+  rollout_steps: 10                   # Lépések száma egy rollout-ban (adatgyűjtés)  majd vissza 10-20k-ra
   num_epochs: 4                         # PPO epoch-ok száma egy batch-en belül
   batch_size: 64                        # Mini-batch méret a gradiens frissítéshez
   num_mini_batches: 4                   # Mini-batch darabszám (rollout_steps / batch_size)
