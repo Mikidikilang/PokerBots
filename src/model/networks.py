@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Dict
 
 import torch
 import torch.nn as nn
@@ -106,6 +106,30 @@ class NetworkConfig:
             self.observation_dim, self.num_actions,
             self.actor_hidden_layers, self.weight_init,
         )
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any], num_players: int = None) -> "NetworkConfig":
+        """
+        Létrehoz egy NetworkConfig instance-t egy szótárból, szigorú mező
+        szűréssel.
+
+        Args:
+            data: A konfigurációs szótár (általában a config.yaml-ból).
+            num_players: A játékosok száma, ami felülírja a szótárban
+                         található `num_players` értéket.
+
+        Returns:
+            NetworkConfig instance.
+        """
+        payload = data.copy()
+        if num_players is not None:
+            payload["num_players"] = num_players
+
+        # Csak azokat a kulcsokat tartjuk meg, amik a dataclass mezői
+        known_keys = cls.__dataclass_fields__.keys()
+        filtered_payload = {k: v for k, v in payload.items() if k in known_keys}
+
+        return cls(**filtered_payload)
 
 
 # =============================================================================
