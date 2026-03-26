@@ -495,6 +495,15 @@ class PokerActorCritic(nn.Module):
         _, value = self.forward(observation)
         return value
 
+    def save_checkpoint(self, path: str) -> None:
+        """Menti a modell súlyait a megadott útvonalra.
+        
+        Args:
+            path: A mentési útvonal.
+        """
+        torch.save(self.state_dict(), path)
+        logger.info("Modell checkpoint mentve ide: %s", path)
+
     # =========================================================================
     # Súlyinicializáció
     # =========================================================================

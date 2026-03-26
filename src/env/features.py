@@ -173,6 +173,8 @@ class ObservationBuilder:
             KeyError: Ha a raw_state-ből hiányzik egy kötelező kulcs.
             ValueError: Ha a kártyaformátum érvénytelen.
         """
+        if isinstance(raw_state, tuple):
+            raw_state = raw_state[0]
         logger.debug("Observation építése nyers állapotból: %d kulcs", len(raw_state))
 
         try:
