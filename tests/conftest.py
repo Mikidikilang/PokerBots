@@ -225,7 +225,7 @@ except ImportError:
 def sample_config() -> dict[str, Any]:
     """Betolti a config.yaml-t teszteleshez."""
     config_path = Path(__file__).parent.parent / "config.yaml"
-    with open(config_path, "r") as f:
+    with open(config_path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 

@@ -313,7 +313,7 @@ class TestOrchestrator:
         """Extrem passzivitas triggereli a beavatkozast."""
         orch_cfg = OrchestratorConfig(
             num_players=6, eval_interval=1,
-            telemetry_window=500, enable_hot_reload=False,
+            telemetry_window=2000, enable_hot_reload=False,
         )
         orch = AutoAdaptiveOrchestrator.get_instance(orch_cfg, sample_config)
 

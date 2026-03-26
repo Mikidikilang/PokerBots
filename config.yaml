@@ -298,7 +298,7 @@ reward_shaping:
 # ---------------------------------------------------------------------------
 mlops:
   # --- Hugging Face Hub ---
-  hf_repo_id: "your-username/poker-ai-checkpoints"     # HF repozitórium azonosító
+  hf_repo_id: "Mikidikilang/poker-ai-checkpoints"     # HF repozitórium azonosító
   hf_repo_type: "model"
 
   # --- Checkpoint Mentés ---
