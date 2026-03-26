@@ -1,0 +1,275 @@
+"""
+Kozos Pytest Fixture-ok es Mock Infrastruktura (conftest.py).
+
+Ez a fajl biztositja a megosztott teszt fixture-oket es a torch mock
+rendszert az osszes tesztmodul szamara. A mock lehetove teszi a tesztek
+futtatast torch telepites nelkul is (CI/CD kompatibilitas).
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import random
+import tempfile
+from pathlib import Path
+from typing import Any, Generator
+
+import numpy as np
+import pytest
+import yaml
+
+# =============================================================================
+# Torch Mock Infrastruktura
+# =============================================================================
+# A mock CSAK akkor aktivalodik, ha a valodi torch nem elerheto.
+# Produkcios kornyezetben a valodi torch-ot hasznalja.
+# =============================================================================
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    import types
+
+    torch_mock = types.ModuleType("torch")
+
+    class FakeTensor:
+        """Minimalis Tensor mock a tesztekhez."""
+
+        def __init__(self, data: Any = None, dtype: Any = None) -> None:
+            if isinstance(data, FakeTensor):
+                self._data = data._data.copy()
+            elif isinstance(data, np.ndarray):
+                self._data = data.astype(np.float32)
+            elif isinstance(data, (list, tuple)):
+                self._data = np.array(data, dtype=np.float32)
+            elif isinstance(data, (int, float)):
+                self._data = np.array([data], dtype=np.float32)
+            elif data is None:
+                self._data = np.array([0.0], dtype=np.float32)
+            else:
+                self._data = np.atleast_1d(np.array(data, dtype=np.float32))
+            self.shape = self._data.shape
+            self.dtype = dtype or "float32"
+
+        def __getitem__(self, k: Any) -> FakeTensor:
+            r = self._data[k]
+            return FakeTensor(np.atleast_1d(r) if not isinstance(r, np.ndarray) else r)
+
+        def __setitem__(self, k: Any, v: Any) -> None:
+            self._data[k] = v
+
+        def item(self) -> float:
+            return float(self._data.flat[0])
+
+        def sum(self) -> FakeTensor:
+            return FakeTensor(np.array([self._data.sum()]))
+
+        def min(self) -> FakeTensor:
+            return FakeTensor(np.array([self._data.min()]))
+
+        def max(self) -> FakeTensor:
+            return FakeTensor(np.array([self._data.max()]))
+
+        def mean(self) -> FakeTensor:
+            return FakeTensor(np.array([self._data.mean()]))
+
+        def std(self) -> FakeTensor:
+            return FakeTensor(np.array([max(self._data.std(), 1e-8)]))
+
+        def flatten(self) -> FakeTensor:
+            return FakeTensor(self._data.flatten())
+
+        def reshape(self, *s: int) -> FakeTensor:
+            return FakeTensor(self._data.reshape(*s))
+
+        def unsqueeze(self, d: int) -> FakeTensor:
+            return FakeTensor(np.expand_dims(self._data, d))
+
+        def squeeze(self, d: int | None = None) -> FakeTensor:
+            return FakeTensor(self._data.squeeze() if d is None else np.squeeze(self._data, d))
+
+        def numel(self) -> int:
+            return self._data.size
+
+        def bool(self) -> np.ndarray:
+            return self._data.astype(bool)
+
+        def any(self) -> bool:
+            return bool(self._data.any())
+
+        def dim(self) -> int:
+            return len(self.shape)
+
+        def tolist(self) -> list:
+            return self._data.tolist()
+
+        def detach(self) -> FakeTensor:
+            return self
+
+        def long(self) -> FakeTensor:
+            return self
+
+        def to(self, *a: Any, **kw: Any) -> FakeTensor:
+            return self
+
+        def norm(self) -> FakeTensor:
+            return FakeTensor(np.array([np.linalg.norm(self._data)]))
+
+        def __add__(self, o: Any) -> FakeTensor:
+            return FakeTensor(self._data + (o._data if isinstance(o, FakeTensor) else o))
+
+        def __radd__(self, o: Any) -> FakeTensor:
+            return FakeTensor((o._data if isinstance(o, FakeTensor) else o) + self._data)
+
+        def __sub__(self, o: Any) -> FakeTensor:
+            return FakeTensor(self._data - (o._data if isinstance(o, FakeTensor) else o))
+
+        def __rsub__(self, o: Any) -> FakeTensor:
+            return FakeTensor((o._data if isinstance(o, FakeTensor) else o) - self._data)
+
+        def __mul__(self, o: Any) -> FakeTensor:
+            return FakeTensor(self._data * (o._data if isinstance(o, FakeTensor) else o))
+
+        def __rmul__(self, o: Any) -> FakeTensor:
+            return FakeTensor((o._data if isinstance(o, FakeTensor) else o) * self._data)
+
+        def __truediv__(self, o: Any) -> FakeTensor:
+            return FakeTensor(self._data / (o._data if isinstance(o, FakeTensor) else o))
+
+        def __eq__(self, o: Any) -> FakeTensor:
+            return FakeTensor((self._data == (o._data if isinstance(o, FakeTensor) else o)).astype(np.float32))
+
+        def __repr__(self) -> str:
+            return f"FakeTensor(shape={self.shape})"
+
+    # Torch API mock
+    torch_mock.Tensor = FakeTensor
+    torch_mock.float32 = "float32"
+    torch_mock.zeros = lambda *a, dtype=None: FakeTensor(np.zeros(a[0] if len(a) == 1 and isinstance(a[0], (list, tuple)) else (a[0],) if len(a) == 1 else a))
+    torch_mock.tensor = lambda d, dtype=None: FakeTensor(d)
+    torch_mock.cat = lambda t, dim=0: FakeTensor(np.concatenate([x._data.flatten() for x in t]))
+    torch_mock.stack = lambda t, dim=0: FakeTensor(np.stack([x._data for x in t], axis=dim))
+    torch_mock.randn = lambda *a: FakeTensor(np.random.randn(*a))
+    torch_mock.softmax = lambda t, dim=-1: FakeTensor(np.exp(t._data - t._data.max()) / np.exp(t._data - t._data.max()).sum())
+    torch_mock.device = lambda x: x
+    torch_mock.no_grad = lambda: types.SimpleNamespace(__enter__=lambda s: None, __exit__=lambda s, *a: None)
+    torch_mock.save = lambda o, p: __import__("pickle").dump(o, open(str(p), "wb"))
+    torch_mock.load = lambda p, **kw: __import__("pickle").load(open(str(p), "rb")) if os.path.exists(str(p)) else {}
+    torch_mock.get_rng_state = lambda: FakeTensor(np.array([42]))
+    torch_mock.set_rng_state = lambda s: None
+    torch_mock.manual_seed = lambda s: None
+
+    class _FakeGenerator:
+        _state = FakeTensor(np.array([0]))
+        def get_state(self) -> FakeTensor: return self._state
+        def set_state(self, s: Any) -> None: self._state = s
+        def manual_seed(self, s: int) -> None: pass
+    torch_mock.Generator = _FakeGenerator
+
+    # CUDA mock
+    cuda_mod = types.ModuleType("torch.cuda")
+    cuda_mod.is_available = lambda: False
+    torch_mock.cuda = cuda_mod
+
+    # Distributions mock
+    dist_mod = types.ModuleType("torch.distributions")
+    class _FakeCategorical:
+        def __init__(self, probs: Any = None, logits: Any = None) -> None:
+            self._p = np.ones(9) / 9
+            self.probs = FakeTensor(self._p)
+        def sample(self) -> FakeTensor:
+            return FakeTensor(np.array([np.random.randint(0, 9)]))
+        def log_prob(self, v: Any) -> FakeTensor:
+            return FakeTensor(np.array([-1.5]))
+        def entropy(self) -> FakeTensor:
+            return FakeTensor(np.array([1.5]))
+    dist_mod.Categorical = _FakeCategorical
+    torch_mock.distributions = dist_mod
+
+    # nn mock
+    nn_mod = types.ModuleType("torch.nn")
+    nn_mod.Module = type("Module", (), {"parameters": lambda s: [], "train": lambda s: None, "eval": lambda s: None})
+    torch_mock.nn = nn_mod
+
+    # optim mock
+    optim_mod = types.ModuleType("torch.optim")
+    class _FakeAdam:
+        def __init__(self, params: Any = None, lr: float = 0.001, eps: float = 1e-8) -> None:
+            self.param_groups = [{"lr": lr}]
+        def zero_grad(self) -> None: pass
+        def step(self) -> None: pass
+        def state_dict(self) -> dict: return {}
+        def load_state_dict(self, d: dict) -> None: pass
+    optim_mod.Adam = _FakeAdam
+    torch_mock.optim = optim_mod
+
+    # Register mocks
+    sys.modules["torch"] = torch_mock
+    sys.modules["torch.cuda"] = cuda_mod
+    sys.modules["torch.nn"] = nn_mod
+    sys.modules["torch.nn.functional"] = types.ModuleType("torch.nn.functional")
+    sys.modules["torch.distributions"] = dist_mod
+    sys.modules["torch.optim"] = optim_mod
+
+    torch = torch_mock
+
+
+# =============================================================================
+# Pytest Fixture-ok
+# =============================================================================
+
+@pytest.fixture
+def sample_config() -> dict[str, Any]:
+    """Betolti a config.yaml-t teszteleshez."""
+    config_path = Path(__file__).parent.parent / "config.yaml"
+    with open(config_path, "r") as f:
+        return yaml.safe_load(f)
+
+
+@pytest.fixture
+def sample_raw_state() -> dict[str, Any]:
+    """Egy tipikus nyers jatekallapot a features.py teszteleshez."""
+    return {
+        "hand": ["AS", "KH"],
+        "public_cards": ["TC", "JD", "QS"],
+        "pot": 150.0,
+        "my_chips": 1800.0,
+        "opponent_chips": [2000.0, 1500.0, 1000.0, 800.0, 2200.0],
+        "big_blind": 10.0,
+        "amount_to_call": 50.0,
+        "min_raise": 100.0,
+        "position": 5,
+        "betting_history": [
+            {"action": 3, "amount": 50, "player": 0},
+            {"action": 1, "amount": 50, "player": 1},
+        ],
+        "legal_actions": [0, 1, 3, 4, 5, 8],
+    }
+
+
+@pytest.fixture
+def sample_preflop_state() -> dict[str, Any]:
+    """Pre-flop allapot (ures board)."""
+    return {
+        "hand": ["AH", "AD"],
+        "public_cards": [],
+        "pot": 15.0,
+        "my_chips": 2000.0,
+        "opponent_chips": [2000.0, 2000.0, 2000.0, 2000.0, 2000.0],
+        "big_blind": 10.0,
+        "amount_to_call": 10.0,
+        "min_raise": 20.0,
+        "position": 0,
+        "betting_history": [],
+        "legal_actions": [0, 1, 2, 3, 4, 5, 6, 7, 8],
+    }
+
+
+@pytest.fixture
+def temp_dir() -> Generator[str, None, None]:
+    """Ideiglenes konyvtar a fajl-muveletekhez."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield tmpdir
