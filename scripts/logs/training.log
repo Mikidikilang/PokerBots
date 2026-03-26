@@ -1,0 +1,7 @@
+2026-03-26 16:32:05 | INFO     | __main__                                 | setup_logging             | Logging inicializalva: level=INFO, log_file=logs\training.log
+2026-03-26 16:32:05 | INFO     | __main__                                 | main                      | ============================================================
+  PokerAI NLHE Training — Lokalis CLI
+  Config: config.yaml
+  Device: auto
+  Resume: False
+============================================================

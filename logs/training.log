@@ -1,0 +1,37 @@
+2026-03-26 16:31:12 | INFO     | __main__                                 | setup_logging             | Logging inicializalva: level=INFO, log_file=logs\training.log
+2026-03-26 16:31:12 | INFO     | __main__                                 | main                      | ============================================================
+  PokerAI NLHE Training — Lokalis CLI
+  Config: config.yaml
+  Device: auto
+  Resume: False
+============================================================
+2026-03-26 16:31:12 | INFO     | __main__                                 | load_config               | Konfiguracio betoltve: config.yaml (projekt: PokerAI-NLHE, v0.1.0)
+2026-03-26 16:36:05 | INFO     | __main__                                 | setup_logging             | Logging inicializalva: level=INFO, log_file=logs\training.log
+2026-03-26 16:36:05 | INFO     | __main__                                 | main                      | ============================================================
+  PokerAI NLHE Training — Lokalis CLI
+  Config: config.yaml
+  Device: auto
+  Resume: False
+============================================================
+2026-03-26 16:36:05 | INFO     | __main__                                 | load_config               | Konfiguracio betoltve: config.yaml (projekt: PokerAI-NLHE, v0.1.0)
+2026-03-26 16:36:35 | INFO     | __main__                                 | build_training_pipeline   | Device: cpu
+2026-03-26 16:38:07 | INFO     | __main__                                 | setup_logging             | Logging inicializalva: level=INFO, log_file=logs\training.log
+2026-03-26 16:38:07 | INFO     | __main__                                 | main                      | ============================================================
+  PokerAI NLHE Training — Lokalis CLI
+  Config: config.yaml
+  Device: auto
+  Resume: False
+============================================================
+2026-03-26 16:38:07 | INFO     | __main__                                 | load_config               | Konfiguracio betoltve: config.yaml (projekt: PokerAI-NLHE, v0.1.0)
+2026-03-26 16:38:10 | INFO     | __main__                                 | build_training_pipeline   | Device: cpu
+2026-03-26 16:38:10 | INFO     | src.mlops.state_manager                  | set_global_seed           | Globalis seed beallitva: 42 (python, numpy, torch_cpu, dataloader)
+2026-03-26 16:38:10 | INFO     | __main__                                 | create_environment        | Kornyezet inicializalas: engine=rlcard, players=2
+2026-03-26 16:38:12 | INFO     | __main__                                 | create_environment        | RLCard kornyezet letrehozva: no-limit-holdem, 2 jatekos
+2026-03-26 16:38:12 | INFO     | src.env.features                         | __init__                  | ObservationBuilder inicializálva: 2 játékos, 18 max akció, normalizáció=[0.0, 1.0]
+2026-03-26 16:38:12 | INFO     | __main__                                 | build_training_pipeline   | ObservationBuilder: dim=273
+2026-03-26 16:38:12 | INFO     | src.model.networks                       | __init__                  | PokerActorCritic init: obs=281, actions=9, actor=(512, 256, 128), critic=(512, 256, 128), init=orthogonal
+2026-03-26 16:38:12 | INFO     | src.model.networks                       | __init__                  | Fúzió: cards=128 + ctx=32 + hist=64 = 224
+2026-03-26 16:38:12 | INFO     | src.model.networks                       | _initialize_weights       | Súlyinit: orthogonal, gain=1.00, 16 Linear réteg (policy out gain=0.01)
+2026-03-26 16:38:12 | INFO     | src.model.networks                       | __init__                  | PokerActorCritic kész: 607,466 összes / 607,466 tanítható param
+2026-03-26 16:38:12 | INFO     | __main__                                 | build_training_pipeline   | PokerActorCritic: 607,466 params
+2026-03-26 16:38:12 | INFO     | src.training.buffer                      | __init__                  | RolloutBuffer inicializalva: size=10, gamma=0.990, gae_lambda=0.950, mini_batches=4
