@@ -40,6 +40,9 @@ class PokerEnvironment(Protocol):
 
     Barmely jatekmotor (RLCard, PettingZoo, egyedi) megvalosithatja
     ezt az interfeszt a collector-ral valo kompatibilitas erdekeben.
+    
+    Megjegyzés: Az RLCard engine step() metódusa 2 értéket ad vissza (obs, reward).
+    A done állapot az is_over() metódussal kérdezhetô le.
     """
 
     def reset(self) -> dict[str, Any]:
@@ -50,14 +53,25 @@ class PokerEnvironment(Protocol):
         """
         ...
 
-    def step(self, action: int) -> tuple[dict[str, Any], float, bool, dict[str, Any]]:
-        """Vegrehajt egy akciot es visszaadja az uj allapotot.
+    def step(self, action: int) -> tuple[dict[str, Any], float]:
+        """Vegrehajt egy akciot es visszaadja az uj allapotot es jutalmat.
+        
+        RLCard format: 2 értéket ad vissza (obs, reward).
+        A done állapot az is_over() metódussal kérdezhetô le.
 
         Args:
             action: Az akcio indexe (0-8).
 
         Returns:
-            Tuple: (uj_allapot, jutalom, vege_van, info_szotar)
+            Tuple: (uj_allapot, jutalom)
+        """
+        ...
+
+    def is_over(self) -> bool:
+        """Visszaadja, hogy vége van-e az epizódnak.
+        
+        Returns:
+            True ha az epizód vége, False egyébként.
         """
         ...
 
@@ -220,7 +234,10 @@ class RolloutCollector:
             value_val: torch.Tensor = value.squeeze()
 
             # 3. Kornyezet leptetes
-            next_obs, reward, done, info = self.env.step(action_int)
+            # RLCard engine: step() 2 értéket ad vissza (obs, reward)
+            # A done állapot az is_over() metódussal kérdezhetô le
+            next_obs, reward = self.env.step(action_int)
+            done: bool = self.env.is_over()
 
             # 4. Atmenet tarolasa
             self.buffer.add(

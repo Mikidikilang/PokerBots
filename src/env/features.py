@@ -154,44 +154,63 @@ class ObservationBuilder:
         """A nyers játékállapotból elkészíti a teljes megfigyelési szótárat.
 
         Args:
-            raw_state: A játékmotor nyers kimeneti szótára. Elvárt kulcsok:
+            raw_state: A játékmotor nyers kimeneti szótára. Lehet RLCard-specifikus
+                       beágyazott `raw_obs` kulccsal, vagy lapos szótár. Elvárt kulcsok:
                 - ``hand``: List[str] — saját lapok (pl. ["AS", "KH"])
-                - ``public_cards``: List[str] — közös lapok (pl. ["TC", "JD", "QS"])
-                - ``pot``: float — aktuális pot méret (abszolút chip)
-                - ``my_chips``: float — saját zsetonállás (abszolút chip)
+                - ``public_cards``: List[str] — közös lapok
+                - ``pot``: float — aktuális pot méret
+                - ``my_chips``: float — saját zsetonállás
                 - ``opponent_chips``: List[float] — ellenfelek zsetonállásai
                 - ``big_blind``: float — nagyvak méret
-                - ``amount_to_call``: float — megadandó tét (abszolút chip)
-                - ``position``: int — saját pozíció index (0-tól)
-                - ``betting_history``: List[dict] — licitlépések történelme
-                - ``legal_actions``: List[int] — legális akció indexek
+                - ``amount_to_call``: float — megadandó tét
+                - ``position``: int — saját pozíció index
+                - ``betting_history``: List[dict] — licittörténet
+                - ``legal_actions``: List[int | Action] — legális akció indexek 
+                  vagy RLCard Action objektumok (automatikusan int-é konvertálva)
 
         Returns:
             Dict[str, torch.Tensor] formátumú megfigyelési szótár.
 
         Raises:
-            KeyError: Ha a raw_state-ből hiányzik egy kötelező kulcs.
+            KeyError: Ha a `state_source`-ból hiányzik egy kötelező kulcs.
             ValueError: Ha a kártyaformátum érvénytelen.
         """
         if isinstance(raw_state, tuple):
             raw_state = raw_state[0]
         logger.debug("Observation építése nyers állapotból: %d kulcs", len(raw_state))
 
+        # RLCard-kompatibilitás: ha a releváns adatok a 'raw_obs' alatt vannak,
+        # azt a szótárt használjuk, de a 'legal_actions' és egyéb külső
+        # kulcsok megtartása érdekében összefésüljük.
+        state_source = raw_state
+        if "raw_obs" in raw_state and isinstance(raw_state["raw_obs"], dict):
+            logger.debug("Beágyazott 'raw_obs' kulcs detektálva, RLCard állapot.")
+            # A raw_obs kulcsait beemeljük a fő szótárba, felülírva, ha ütközés van.
+            # Ez biztosítja, hogy a 'hand', 'pot', stb. elérhető legyen,
+            # miközben a 'legal_actions' és 'action_mask' is megmarad.
+            state_source = {**raw_state, **raw_state["raw_obs"]}
+
         try:
             observation: dict[str, torch.Tensor] = {
-                "hole_cards": self._encode_cards(raw_state["hand"]),
-                "community_cards": self._encode_cards(raw_state.get("public_cards", [])),
-                "env_metrics": self._encode_env_metrics(raw_state),
+                "hole_cards": self._encode_cards(state_source["hand"]),
+                "community_cards": self._encode_cards(state_source.get("public_cards", [])),
+                "env_metrics": self._encode_env_metrics(state_source),
                 "betting_history": self._encode_betting_history(
-                    raw_state.get("betting_history", [])
+                    state_source.get("betting_history", [])
                 ),
-                "position": self._encode_position(raw_state.get("position", 0)),
+                "position": self._encode_position(state_source.get("position", 0)),
                 "action_mask": self._encode_action_mask(
-                    raw_state.get("legal_actions", list(range(9)))
+                    state_source.get("legal_actions", list(range(9)))
                 ),
             }
         except KeyError as exc:
-            logger.error("Hiányzó kulcs a nyers állapotból: %s", exc)
+            logger.error(
+                "Hiányzó kulcs az állapotforrásból ('%s'): %s. "
+                "Elérhető kulcsok: %s",
+                "raw_obs" if "raw_obs" in raw_state else "raw_state",
+                exc,
+                list(state_source.keys()),
+            )
             raise
 
         # Dimenzió ellenőrzés (DEBUG szinten)
@@ -292,11 +311,11 @@ class ObservationBuilder:
             if len(card_str) != 2:
                 raise ValueError(
                     f"Érvénytelen kártyaformátum: '{card_str}'. "
-                    f"Elvárt formátum: 'RS' (pl. 'AS' = Ász Pikk)."
+                    f"Elvárt formátum: 'SR' (pl. 'SA' = Ász Pikk)."
                 )
 
-            rank_char: str = card_str[0]
-            suit_char: str = card_str[1]
+            suit_char: str = card_str[0]
+            rank_char: str = card_str[1]
 
             if rank_char not in RANK_MAP:
                 raise ValueError(
@@ -454,15 +473,20 @@ class ObservationBuilder:
         logger.debug("Pozíció kódolva: index=%d/%d", position_index, num_positions)
         return position_vector
 
-    def _encode_action_mask(self, legal_actions: list[int]) -> torch.Tensor:
+    def _encode_action_mask(self, legal_actions: list[int | Any]) -> torch.Tensor:
         """Bináris akció érvényességi maszkot generál.
 
         Az érvényes akciók indexeinél 1.0, az érvénytelen (illegális)
         akcióknál 0.0 áll. Ezt a maszkot a hálózat utolsó rétegén,
         a Softmax előtt alkalmazzuk logit maszkolásra.
 
+        Támogatja az RLCard Action objektumokat (Enum-okat) és egyszerű
+        integer indexeket. Az objektumok automatikusan int-é konvertálódnak
+        a .value attribútum vagy int() castolás révén.
+
         Args:
             legal_actions: Az érvényes akciók indexeinek listája (0-8).
+                          Lehet plain int vagy RLCard Action Enum objektum.
 
         Returns:
             (9,) alakú bináris torch.Tensor.
@@ -470,13 +494,28 @@ class ObservationBuilder:
         num_actions: int = 9
         mask: torch.Tensor = torch.zeros(num_actions, dtype=torch.float32)
 
-        for action_idx in legal_actions:
-            if 0 <= action_idx < num_actions:
-                mask[action_idx] = 1.0
-            else:
+        for action_item in legal_actions:
+            try:
+                # RLCard Action objektumok int-é konvertálása
+                if hasattr(action_item, 'value'):
+                    # Enum-szerű objektum: .value attribútum
+                    action_idx: int = int(action_item.value)
+                else:
+                    # Plain integer vagy konvertálható objektum
+                    action_idx = int(action_item)
+
+                if 0 <= action_idx < num_actions:
+                    mask[action_idx] = 1.0
+                else:
+                    logger.warning(
+                        "Illegális akció index figyelmen kívül hagyva: %d (tartomány: 0-%d)",
+                        action_idx, num_actions - 1,
+                    )
+            except (ValueError, TypeError, AttributeError) as exc:
                 logger.warning(
-                    "Illegális akció index figyelmen kívül hagyva: %d (tartomány: 0-%d)",
-                    action_idx, num_actions - 1,
+                    "Az akció-elem nem konvertálható int-é: %r (%s). "
+                    "Típus: %s. Figyelmen kívül hagyva.",
+                    action_item, type(action_item).__name__, exc,
                 )
 
         active_count: int = int(mask.sum().item())
@@ -502,7 +541,7 @@ class ObservationBuilder:
         """Egyetlen kártyajelölést numerikus indexé alakít.
 
         Args:
-            card_str: Kétkarakteres kártyajelölés (pl. "AS" = Ász Pikk).
+            card_str: Kétkarakteres kártyajelölés (pl. "SA" = Ász Pikk, SuitRank format).
 
         Returns:
             A kártya indexe a [0, 51] tartományban.
@@ -513,8 +552,8 @@ class ObservationBuilder:
         card_str = card_str.strip().upper()
         if len(card_str) != 2:
             raise ValueError(f"Érvénytelen kártyaformátum: '{card_str}'")
-        rank_idx: int = RANK_MAP[card_str[0]]
-        suit_idx: int = SUIT_MAP[card_str[1]]
+        suit_idx: int = SUIT_MAP[card_str[0]]
+        rank_idx: int = RANK_MAP[card_str[1]]
         return rank_idx * NUM_SUITS + suit_idx
 
     @staticmethod

@@ -58,12 +58,15 @@ class NetworkConfig:
     Ezeket a config.yaml 'model' szekciójából tölti be a rendszer.
 
     Attributes:
-        observation_dim: A laposított megfigyelési vektor teljes dimenziója.
+        num_players: A játékosok száma az asztalnál (2-9).
         num_actions: Az akciótér mérete (9 a NLHE-ben).
+        max_betting_actions: Maximális licitmódosítások száma egy leosztásban.
+        action_feature_dim: Akciótípusok dimenziója a licittörténetben.
         card_input_dim: Egyetlen kártyavektor dimenziója (52).
-        context_input_dim: Környezeti metrikák dimenziója.
-        history_input_dim: Licittörténet laposított dimenziója (18 * 9).
-        position_input_dim: Pozíció one-hot vektor dimenziója.
+        context_input_dim: Környezeti metrikák dimenziója (dinamikusan számított).
+        position_input_dim: Pozíció one-hot vektor dimenziója (dinamikusan számított).
+        history_input_dim: Licittörténet laposított dimenziója (dinamikusan számított).
+        observation_dim: A laposított megfigyelési vektor teljes dimenziója.
         card_embed_dim: Kártyabeágyazás kimeneti dimenziója.
         context_embed_dim: Környezeti beágyazás kimeneti dimenziója.
         history_embed_dim: Történelem beágyazás kimeneti dimenziója.
@@ -76,12 +79,15 @@ class NetworkConfig:
         illegal_action_logit: Az illegális akciók logitjaihoz adott érték.
     """
 
-    observation_dim: int = 281
+    num_players: int = 6
     num_actions: int = 9
+    max_betting_actions: int = 18
+    action_feature_dim: int = 9
     card_input_dim: int = 52
     context_input_dim: int = 9
-    history_input_dim: int = 162
     position_input_dim: int = 6
+    history_input_dim: int = 162
+    observation_dim: int = 281
     card_embed_dim: int = 64
     context_embed_dim: int = 32
     history_embed_dim: int = 64
@@ -94,24 +100,63 @@ class NetworkConfig:
     illegal_action_logit: float = -1.0e8
 
     def __post_init__(self) -> None:
-        """Validálja a hálózat konfigurációs paramétereit."""
+        """Validálja és dinamikusan számítja a hálózat konfigurációs paramétereit."""
+        if not 2 <= self.num_players <= 9:
+            raise ValueError(f"num_players 2-9 között kell legyen: kapott {self.num_players}")
         if self.num_actions < 2:
             raise ValueError(f"num_actions legalább 2: kapott {self.num_actions}")
+        if self.max_betting_actions < 1:
+            raise ValueError(f"max_betting_actions legalább 1: kapott {self.max_betting_actions}")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError(f"dropout [0, 1) kell legyen: kapott {self.dropout}")
         if self.activation not in ("relu", "gelu", "tanh"):
             raise ValueError(f"Ismeretlen aktiváció: '{self.activation}'")
+
+        # Dinamikus dimenziók számítása num_players alapján
+        # context_input_dim = environment metrics (pot, chips, call, min_raise) + opponent stacks
+        calculated_context_dim: int = 4 + (self.num_players - 1)
+        
+        # position_input_dim = one-hot pozíció vektor mérete
+        calculated_position_dim: int = self.num_players
+        
+        # history_input_dim = licittörténet laposított dimenziója
+        calculated_history_dim: int = self.max_betting_actions * self.action_feature_dim
+        
+        # Frissítés a frozen dataclass-ban (object.__setattr__ szükséges)
+        object.__setattr__(self, "context_input_dim", calculated_context_dim)
+        object.__setattr__(self, "position_input_dim", calculated_position_dim)
+        object.__setattr__(self, "history_input_dim", calculated_history_dim)
+        
+        # Observation dimenzió számítása: kártyák + beágyazott vektorok
+        # card_embedding: (batch, card_embed_dim * 2) — hole + community
+        # context_embedding: (batch, context_embed_dim)
+        # history_embedding: (batch, history_embed_dim)
+        # Flattened total = 52 + 52 + card_embed_dim*2 + context_embed_dim + history_embed_dim
+        flattened_obs_dim: int = (
+            self.card_input_dim * 2  # hole_cards + community_cards multi-hot
+            + self.card_embed_dim * 2  # card_embedding output
+            + self.context_embed_dim  # context_embedding output
+            + self.history_embed_dim  # history_embedding output
+        )
+        object.__setattr__(self, "observation_dim", flattened_obs_dim)
+
         logger.debug(
-            "NetworkConfig: obs_dim=%d, actions=%d, actor=%s, init=%s",
-            self.observation_dim, self.num_actions,
+            "NetworkConfig inicializálva: players=%d, actions=%d, "
+            "context_dim=%d (4+%d opps), pos_dim=%d, history_dim=%d, "
+            "obs_dim=%d, actor=%s, init=%s",
+            self.num_players, self.num_actions,
+            calculated_context_dim, self.num_players - 1,
+            calculated_position_dim,
+            calculated_history_dim,
+            flattened_obs_dim,
             self.actor_hidden_layers, self.weight_init,
         )
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any], num_players: int = None) -> "NetworkConfig":
+    def from_dict(cls, data: Dict[str, Any], num_players: int | None = None) -> "NetworkConfig":
         """
         Létrehoz egy NetworkConfig instance-t egy szótárból, szigorú mező
-        szűréssel.
+        szűréssel és dinamikus dimenziók számításával.
 
         Args:
             data: A konfigurációs szótár (általában a config.yaml-ból).
@@ -495,13 +540,60 @@ class PokerActorCritic(nn.Module):
         _, value = self.forward(observation)
         return value
 
-    def save_checkpoint(self, path: str) -> None:
-        """Menti a modell súlyait a megadott útvonalra.
+    def get_action_and_value(
+        self, observation: dict[str, torch.Tensor], action: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Akció mintavételezés + érték számítás egy lépésben (rollout fázis).
+
+        Ez a metódus a rollout gyűjtéshez szükséges: az aktuális policy
+        alapján mintavételez egy akciót és kiszámítja annak log-valószínűségét,
+        az eloszlás entrópiáját és az állapotértéket.
+
+        Args:
+            observation: Batch-elt megfigyelés dict (lehet single vagy batch).
+            action: Opcionális előre megadott akció (e.g. betöltött checkpoint).
+                   Ha None, az akció a policy-ből mintavételezve lesz.
+
+        Returns:
+            Tuple: (action, log_prob, entropy, value)
+                - action: (batch,) vagy (1,) tensor, az választott akció indexei
+                - log_prob: (batch,) vagy (1,) tensor, az akciók log-valószínűsége
+                - entropy: (batch,) vagy (1,) tensor, az eloszlás entrópiája
+                - value: (batch,) vagy (1,) tensor, az állapotértékek V(s)
+        """
+        action_dist, values = self.forward(observation)
+
+        # Akció mintavételezés vagy felhasználott akció
+        if action is None:
+            action = action_dist.sample()
+        
+        # Log-valószínűség és entrópia
+        log_prob = action_dist.log_prob(action)
+        entropy = action_dist.entropy()
+
+        logger.debug(
+            "get_action_and_value: batch=%d, action_range=[%d,%d], "
+            "log_prob=[%.4f,%.4f], entropy=%.4f, value=[%.4f,%.4f]",
+            action.shape[0] if action.dim() > 0 else 1,
+            int(action.min().item()), int(action.max().item()),
+            log_prob.min().item(), log_prob.max().item(),
+            entropy.mean().item(),
+            values.min().item(), values.max().item(),
+        )
+
+        return action, log_prob, entropy, values.squeeze(-1)
+
+    def save_checkpoint(self, path: str, extra_state: dict[str, Any] | None = None) -> None:
+        """Menti a modell súlyait és opcionális extra állapotot a megadott útvonalra.
         
         Args:
             path: A mentési útvonal.
+            extra_state: Opcionális további adatok (pl. optimizer állapot, training metrik).
         """
-        torch.save(self.state_dict(), path)
+        checkpoint = {"state_dict": self.state_dict()}
+        if extra_state is not None:
+            checkpoint.update(extra_state)
+        torch.save(checkpoint, path)
         logger.info("Modell checkpoint mentve ide: %s", path)
 
     # =========================================================================
