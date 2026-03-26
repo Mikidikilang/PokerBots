@@ -201,7 +201,7 @@ def build_training_pipeline(
 
     Ez a fuggveny letrehozza es osszekapcsolja az osszes komponenst:
         - ObservationBuilder (env)
-        - ActorCriticNetwork (model)
+        - PokerActorCritic (model)
         - RolloutBuffer, PPOTrainer, Collector (training)
         - Orchestrator, Telemetry, Curriculum (orchestrator)
         - CheckpointManager, GracefulShutdownMonitor (mlops)
@@ -243,11 +243,11 @@ def build_training_pipeline(
     logger.info("ObservationBuilder: dim=%d", obs_builder.get_observation_dim())
 
     # --- Network ---
-    from src.model.networks import ActorCriticNetwork, NetworkConfig
+    from src.model.networks import PokerActorCritic, NetworkConfig
     net_config = NetworkConfig.from_dict(cfg, num_players=num_players)
-    network = ActorCriticNetwork(net_config).to(device)
+    network = PokerActorCritic(net_config).to(device)
     param_counts = network.get_param_count()
-    logger.info("ActorCriticNetwork: %s params", f"{param_counts['total']:,}")
+    logger.info("PokerActorCritic: %s params", f"{param_counts['total']:,}")
 
     # --- Training Components ---
     from src.training.buffer import RolloutBuffer, RolloutBufferConfig
