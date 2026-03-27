@@ -27,16 +27,22 @@ class TestTelemetryAnalyzer:
 
     def _fill_normal(self, ana: TelemetryAnalyzer, n: int = 500) -> None:
         """Normalis (GTO-kozeli) jatekot szimulal."""
-        for _ in range(n):
+        for i in range(n):
             ana.record_hand(HandRecord(
-                voluntarily_put_in_pot=random.random() < 0.24,
-                preflop_raised=random.random() < 0.20,
-                three_betted=random.random() < 0.09,
-                postflop_bets=random.randint(0, 3),
-                postflop_calls=random.randint(0, 2),
+                hand_id=i,
+                player_id=0,
+                position=random.randint(0, 5),
+                iteration=0,
+                reward_bb=random.gauss(0.02, 3),
+                street_reached=random.randint(0, 3),
                 went_to_showdown=random.random() < 0.30,
-                saw_flop=random.random() < 0.50,
-                reward=random.gauss(0.02, 3),
+                won_at_showdown=random.random() < 0.15,
+                vpip=random.random() < 0.24,
+                pfr=random.random() < 0.20,
+                three_bet=random.random() < 0.09,
+                total_aggressive_actions=random.randint(0, 3),
+                total_passive_actions=random.randint(0, 2),
+                total_folds=random.randint(0, 1),
             ))
 
     def test_empty_metrics(self) -> None:
@@ -71,12 +77,22 @@ class TestTelemetryAnalyzer:
     def test_detect_passivity(self) -> None:
         """Extrem passzivitas detektalasa."""
         ana = self._make_analyzer(window=5000)
-        for _ in range(5000):
+        for i in range(5000):
             ana.record_hand(HandRecord(
-                voluntarily_put_in_pot=random.random() < 0.05,  # ~5% VPIP << 16%
-                preflop_raised=random.random() < 0.02,
-                reward=random.gauss(-0.5, 2),
-                saw_flop=random.random() < 0.10,
+                hand_id=i,
+                player_id=0,
+                position=0,
+                iteration=0,
+                vpip=random.random() < 0.05,  # ~5% VPIP << 16%
+                pfr=random.random() < 0.02,
+                reward_bb=random.gauss(-0.5, 2),
+                street_reached=0 if random.random() < 0.90 else 1,
+                went_to_showdown=False,
+                won_at_showdown=False,
+                three_bet=False,
+                total_aggressive_actions=0,
+                total_passive_actions=0,
+                total_folds=1,
             ))
         m = ana.get_current_metrics()
         # Manualisan ellenorizzuk: VPIP < 16% kell legyen
@@ -89,15 +105,22 @@ class TestTelemetryAnalyzer:
     def test_detect_maniac(self) -> None:
         """Extrem agresszio detektalasa."""
         ana = self._make_analyzer(window=5000)
-        for _ in range(5000):
+        for i in range(5000):
             ana.record_hand(HandRecord(
-                voluntarily_put_in_pot=True,
-                preflop_raised=True,           # 100% PFR >> 28%
-                three_betted=random.random() < 0.5,  # ~50% 3bet >> 15%
-                postflop_bets=5,
-                postflop_calls=0,              # AF = 5/0 -> nagy
-                reward=random.gauss(0, 5),
-                saw_flop=True,
+                hand_id=i,
+                player_id=0,
+                position=0,
+                iteration=0,
+                vpip=True,
+                pfr=True,           # 100% PFR >> 28%
+                three_bet=random.random() < 0.5,  # ~50% 3bet >> 15%
+                total_aggressive_actions=5,
+                total_passive_actions=0,              # AF = 5/0 -> nagy
+                reward_bb=random.gauss(0, 5),
+                street_reached=1 if random.random() < 0.9 else 0,
+                went_to_showdown=False,
+                won_at_showdown=False,
+                total_folds=0,
             ))
         m = ana.get_current_metrics()
         assert m["pfr"] > 28.0, f"PFR={m['pfr']:.1f}% (nem eleg magas)"
@@ -318,12 +341,22 @@ class TestOrchestrator:
         orch = AutoAdaptiveOrchestrator.get_instance(orch_cfg, sample_config)
 
         # Passziv adatok injektalasa
-        for _ in range(2000):
+        for i in range(2000):
             orch.telemetry.record_hand(HandRecord(
-                voluntarily_put_in_pot=random.random() < 0.05,
-                preflop_raised=random.random() < 0.02,
-                reward=random.gauss(-0.5, 2),
-                saw_flop=random.random() < 0.05,
+                hand_id=i,
+                player_id=0,
+                position=0,
+                iteration=0,
+                vpip=random.random() < 0.05,
+                pfr=random.random() < 0.02,
+                reward_bb=random.gauss(-0.5, 2),
+                street_reached=0 if random.random() < 0.95 else 1,
+                went_to_showdown=False,
+                won_at_showdown=False,
+                three_bet=False,
+                total_aggressive_actions=0,
+                total_passive_actions=0,
+                total_folds=1,
             ))
 
         result = orch.on_iteration_callback(50, {})

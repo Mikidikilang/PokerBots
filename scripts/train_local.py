@@ -120,17 +120,37 @@ def load_config(config_path: str) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         cfg: dict[str, Any] = yaml.safe_load(f)
 
-    # Alapveto validacio
+    # Alapveto validacio (P4.2: comprehensive config validation)
     required_keys: list[str] = ["project", "environment", "model", "ppo", "orchestrator", "mlops"]
     for key in required_keys:
         if key not in cfg:
             raise ValueError(f"Hianyzo konfiguracios kulcs: '{key}' a {config_path} fajlban.")
 
+    # P4.2: Validate numeric ranges
+    try:
+        lr = cfg.get("ppo", {}).get("learning_rate", 1.0)
+        if not (1e-6 <= lr <= 0.1):
+            logger.warning(
+                "Learning rate %.2e is outside typical range [1e-6, 0.1]. "
+                "Check config for errors.", lr
+            )
+        
+        clip_eps = cfg.get("ppo", {}).get("clip_epsilon", 0.2)
+        if not (0.01 <= clip_eps <= 0.5):
+            logger.warning(
+                "PPO clip_epsilon %.3f is outside typical range [0.01, 0.5].", clip_eps
+            )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid numeric value in config: {exc}") from exc
+
+    # P4.4: Audit seed configuration
+    seed: int = cfg.get("project", {}).get("seed", 42)
     logger.info(
-        "Konfiguracio betoltve: %s (projekt: %s, v%s)",
+        "Konfiguracio betoltve: %s (projekt: %s, v%s, seed=%d)",
         config_path,
         cfg["project"]["name"],
         cfg["project"]["version"],
+        seed,
     )
 
     return cfg
@@ -226,22 +246,23 @@ def build_training_pipeline(
     from src.mlops.state_manager import StateManager
     state_manager = StateManager.from_dict(cfg)
 
-    # --- Resume Training ---
+    # --- Resume Training (P2.1: load checkpoint data) ---
     start_iteration: int = 0
     orchestrator_state: dict[str, Any] = {}
+    checkpoint_to_resume: dict[str, Any] | None = None
 
     if resume:
         if checkpoint_path:
-            result = state_manager.ckpt_mgr.load(checkpoint_path, map_location=device)
+            checkpoint_to_resume = state_manager.ckpt_mgr.load(checkpoint_path, map_location=device)
         else:
-            result = state_manager.load_training_state(map_location=str(device))
+            checkpoint_to_resume = state_manager.load_training_state(map_location=str(device))
 
-        if result is not None:
-            network.load_state_dict(result["model_state_dict"])
-            trainer.optimizer.load_state_dict(result["optimizer_state_dict"])
-            start_iteration = result.get("iteration", 0)
-            orchestrator_state = result.get("orchestrator_state", {})
+        if checkpoint_to_resume is not None:
+            network.load_state_dict(checkpoint_to_resume["model_state_dict"])
+            start_iteration = checkpoint_to_resume.get("iteration", 0)
+            orchestrator_state = checkpoint_to_resume.get("orchestrator_state", {})
             logger.info("Resume training: iter=%d", start_iteration)
+            # RNG states will be restored after runner/trainer creation
         else:
             logger.info("Nincs checkpoint, scratch-bol indulas.")
 
@@ -303,7 +324,7 @@ def build_training_pipeline(
             runner.request_stop()
 
     def on_checkpoint(iteration: int, net: Any) -> None:
-        """Checkpoint mentes + Orchestrator allapot + RNG."""
+        """Checkpoint mentes + Orchestrator allapot + RNG (P2.1)."""
         rng_states = RNGStateManager.capture_states(dl_generator)
         state_manager.save_training_state(
             network=net,
@@ -314,6 +335,7 @@ def build_training_pipeline(
             best_mean_reward=-float("inf"),  # TODO: track from orchestrator
             orchestrator_state=orchestrator.get_state(),
             config=cfg,
+            rng_states=rng_states,
             is_best=False,  # TODO: implement best selection logic
         )
 
@@ -336,6 +358,17 @@ def build_training_pipeline(
         checkpoint_dir=ckpt_cfg.get("local_checkpoint_dir", "checkpoints"),
     )
     runner.iteration = start_iteration
+    
+    # --- Resume optimizer and RNG states (P2.1, P2.4) ---
+    if checkpoint_to_resume is not None:
+        if "optimizer_state_dict" in checkpoint_to_resume:
+            runner.trainer.optimizer.load_state_dict(checkpoint_to_resume["optimizer_state_dict"])
+            logger.info("Optimizer state restored from checkpoint")
+        
+        # P2.1: Restore RNG states for deterministic resumption
+        if "rng_states" in checkpoint_to_resume and checkpoint_to_resume["rng_states"]:
+            RNGStateManager.restore_states(checkpoint_to_resume["rng_states"])
+            logger.info("RNG states restored from checkpoint (deterministic)")
     
     # Set trainer reference after runner is created
     orchestrator.set_trainer_reference(runner.trainer)

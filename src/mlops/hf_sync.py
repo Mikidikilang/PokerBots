@@ -25,10 +25,74 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 logger = logging.getLogger(__name__)
+
+# Type variable for generic retry wrapper
+T = TypeVar("T")
+
+
+# =============================================================================
+# Retry Logic (P3.4: HF Sync Robustness)
+# =============================================================================
+
+def retry_with_backoff(
+    func: Callable[..., T],
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+    backoff_factor: float = 2.0,
+    *args: Any,
+    **kwargs: Any,
+) -> T | None:
+    """Meghiv egy fuggvenyt exponencialis backoff-ot hasznalva.
+
+    Ha a fuggveny Exception-t dob, ujra proballja max_retries alkalommal.
+    A delay ketszerezodik minden ujraprobalkozas utan (exponencialis backoff).
+
+    Args:
+        func: A meghivando fuggveny.
+        max_retries: Maximalis ujraprobalkozasok szama.
+        base_delay: Alap varaksozas masodpercben.
+        max_delay: Maximalis varaksozas masodpercben.
+        backoff_factor: Szorzo az exponencialis backoff-hoz.
+        *args: Pozicional argumentumok a fuggvenynek.
+        **kwargs: Nev szerinti argumentumok a fuggvenynek.
+
+    Returns:
+        A fuggveny eredmenye, vagy None ha az osszes ujraprobalkozas sikertelen.
+    """
+    delay: float = base_delay
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            result: T = func(*args, **kwargs)
+            if attempt > 0:
+                logger.info(
+                    "%s sikeres ujraprobalkozas utan (attempt %d/%d)",
+                    func.__name__, attempt + 1, max_retries + 1,
+                )
+            return result
+        except Exception as exc:
+            last_error = exc
+            if attempt < max_retries:
+                logger.warning(
+                    "%s hiba (attempt %d/%d): %s. Ujraprobalkozas %d mp utan...",
+                    func.__name__, attempt + 1, max_retries + 1, str(exc), int(delay),
+                )
+                time.sleep(delay)
+                delay = min(delay * backoff_factor, max_delay)
+            else:
+                logger.error(
+                    "%s veglegesen sikertelen %d ujraprobalkozas utan: %s",
+                    func.__name__, max_retries + 1, str(exc),
+                )
+
+    return None
 
 
 # =============================================================================
@@ -198,16 +262,30 @@ class AsyncModelUploader:
         """Azonnali feltoltest kenyszerit ki (pl. graceful shutdown eseten).
 
         Ez a metodus blokkol amig a feltoltes befejezodik.
+        Retry logikat hasznalva (exponencialis backoff) a robusztussag javitasahoz.
         """
         if self._scheduler is None:
             logger.debug("Nincs aktiv scheduler, manual upload kihagyva.")
             return
 
-        try:
+        def _do_upload() -> None:
             self._scheduler.trigger()
+
+        # P3.4: Retry logic for robustness
+        result = retry_with_backoff(
+            _do_upload,
+            max_retries=3,
+            base_delay=2.0,
+            max_delay=30.0,
+        )
+
+        if result is None:
+            logger.warning(
+                "Manualis feltoltes sikertelen az osszes ujraprobalkozas utan: %s",
+                self.repo_id,
+            )
+        else:
             logger.info("Manualis feltoltes triggerelve: %s", self.repo_id)
-        except Exception as exc:
-            logger.error("Manualis feltoltes sikertelen: %s", exc)
 
     def shutdown(self) -> None:
         """Biztonsagos leallitas: befejezi az utolso feltoltest.
@@ -313,6 +391,8 @@ class HuggingFaceStateManager:
         A symlinkek letiltasa (local_dir_use_symlinks=False) kotelezo
         a Kaggle kornyezetben az irhato fizikai fajlok erdekeben.
 
+        P3.4: Retry logic for network robustness.
+
         Returns:
             A letoltott konyvtar eleresi utja, vagy None ha ures/sikertelen.
         """
@@ -332,20 +412,33 @@ class HuggingFaceStateManager:
 
             from huggingface_hub import snapshot_download  # type: ignore[import-untyped]
 
-            downloaded_path: str = snapshot_download(
-                repo_id=self.repo_id,
-                repo_type="model",
-                local_dir=self.local_dir,
-                local_dir_use_symlinks=False,  # KRITIKUS: Kaggle kompatibilitas
-                resume_download=True,
-                ignore_patterns=["*.md", ".gitattributes"],
+            def _do_download() -> str:
+                return snapshot_download(
+                    repo_id=self.repo_id,
+                    repo_type="model",
+                    local_dir=self.local_dir,
+                    local_dir_use_symlinks=False,  # KRITIKUS: Kaggle kompatibilitas
+                    resume_download=True,
+                    ignore_patterns=["*.md", ".gitattributes"],
+                )
+
+            # P3.4: Retry logic for robustness
+            downloaded_path = retry_with_backoff(
+                _do_download,
+                max_retries=3,
+                base_delay=2.0,
+                max_delay=30.0,
             )
 
-            logger.info(
-                "Checkpoint letoltve: %s -> %s",
-                self.repo_id, downloaded_path,
-            )
-            return downloaded_path
+            if downloaded_path:
+                logger.info(
+                    "Checkpoint letoltve: %s -> %s",
+                    self.repo_id, downloaded_path,
+                )
+                return downloaded_path
+            else:
+                logger.error("Checkpoint letoltes sikertelen (az osszes ujraprobalkozas utan): %s", self.repo_id)
+                return None
 
         except Exception as exc:
             logger.error("Checkpoint letoltes hiba: %s", exc)
@@ -361,6 +454,8 @@ class HuggingFaceStateManager:
         Normalis mukodes kozben az AsyncModelUploader (CommitScheduler) vegzi
         az aszinkron feltoltest.
 
+        P3.4: Retry logic for network robustness.
+
         Args:
             commit_message: A Git commit uzenet.
 
@@ -375,7 +470,7 @@ class HuggingFaceStateManager:
             logger.warning("Lokalis konyvtar nem letezik: %s", self.local_dir)
             return False
 
-        try:
+        def _do_upload() -> bool:
             from huggingface_hub import upload_folder  # type: ignore[import-untyped]
 
             upload_folder(
@@ -384,15 +479,24 @@ class HuggingFaceStateManager:
                 commit_message=commit_message,
                 repo_type="model",
             )
+            return True
 
+        # P3.4: Retry logic for robustness
+        result = retry_with_backoff(
+            _do_upload,
+            max_retries=3,
+            base_delay=2.0,
+            max_delay=30.0,
+        )
+
+        if result:
             logger.info(
                 "Checkpoint feltoltve: %s -> %s (%s)",
                 self.local_dir, self.repo_id, commit_message,
             )
             return True
-
-        except Exception as exc:
-            logger.error("Checkpoint feltoltes hiba: %s", exc)
+        else:
+            logger.error("Checkpoint feltoltes sikertelen: %s (az osszes ujraprobalkozas utan)", self.repo_id)
             return False
 
     def get_repo_info(self) -> dict[str, Any] | None:

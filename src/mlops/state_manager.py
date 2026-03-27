@@ -604,7 +604,7 @@ class StateManager:
         """Construct from the full ``config.yaml`` dict.
 
         Reads ``cfg["mlops"]["checkpoint"]["local_checkpoint_dir"]`` and
-        ``cfg["mlops"]["checkpoint"]["max_checkpoints"]``.
+        ``cfg["mlops"]["checkpoint"]["max_checkpoints_to_keep"]``.
 
         Args:
             cfg: Full YAML configuration dictionary.
@@ -616,7 +616,7 @@ class StateManager:
         checkpoint_cfg = mlops_cfg.get("checkpoint", {})
         return cls(
             checkpoint_dir=checkpoint_cfg.get("local_checkpoint_dir", "checkpoints"),
-            max_to_keep=int(checkpoint_cfg.get("max_checkpoints", 5)),
+            max_to_keep=int(checkpoint_cfg.get("max_checkpoints_to_keep", 5)),
         )
 
     # =========================================================================
@@ -635,6 +635,7 @@ class StateManager:
         scheduler:          Any | None   = None,
         orchestrator_state: dict | None  = None,
         config:             dict | None  = None,
+        rng_states:         dict[str, Any] | None = None,
         is_best:            bool         = False,
     ) -> Path:
         """Assemble and atomically save the complete training state.
@@ -657,6 +658,8 @@ class StateManager:
                                 ``AutoAdaptiveOrchestrator.get_state()``.
             config:             A serialisable snapshot of the full config
                                 (for reproducibility auditing).
+            rng_states:         RNG state dict from ``RNGStateManager.capture_states()``.
+                                Included in checkpoint for deterministic resumption.
             is_best:            If True, the checkpoint is also written as
                                 ``checkpoint_best.pt``.
 
@@ -673,6 +676,7 @@ class StateManager:
             "best_mean_reward":     best_mean_reward,
             "orchestrator_state":   orchestrator_state,
             "config":               config,
+            "rng_states":           rng_states,
             "phase0_fixes_version": _PHASE0_FIX_VERSION,
         }
 

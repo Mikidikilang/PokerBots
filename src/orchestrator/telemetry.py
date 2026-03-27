@@ -166,25 +166,25 @@ class TelemetryAnalyzer:
         # Ha az ablak tele van, a kiesot kivonjuk
         if len(self._window) == self.window_size:
             old: HandRecord = self._window[0]
-            self._vpip_count -= int(old.voluntarily_put_in_pot)
-            self._pfr_count -= int(old.preflop_raised)
-            self._three_bet_count -= int(old.three_betted)
-            self._postflop_bets_total -= old.postflop_bets
-            self._postflop_calls_total -= old.postflop_calls
+            self._vpip_count -= int(old.vpip)
+            self._pfr_count -= int(old.pfr)
+            self._three_bet_count -= int(old.three_bet)
+            self._postflop_bets_total -= old.total_aggressive_actions
+            self._postflop_calls_total -= old.total_passive_actions
             self._showdown_count -= int(old.went_to_showdown)
-            self._saw_flop_count -= int(old.saw_flop)
-            self._reward_sum -= old.reward
+            self._saw_flop_count -= int(old.street_reached >= 1)
+            self._reward_sum -= old.reward_bb
 
         # Uj rekord hozzaadasa
         self._window.append(record)
-        self._vpip_count += int(record.voluntarily_put_in_pot)
-        self._pfr_count += int(record.preflop_raised)
-        self._three_bet_count += int(record.three_betted)
-        self._postflop_bets_total += record.postflop_bets
-        self._postflop_calls_total += record.postflop_calls
+        self._vpip_count += int(record.vpip)
+        self._pfr_count += int(record.pfr)
+        self._three_bet_count += int(record.three_bet)
+        self._postflop_bets_total += record.total_aggressive_actions
+        self._postflop_calls_total += record.total_passive_actions
         self._showdown_count += int(record.went_to_showdown)
-        self._saw_flop_count += int(record.saw_flop)
-        self._reward_sum += record.reward
+        self._saw_flop_count += int(record.street_reached >= 1)
+        self._reward_sum += record.reward_bb
         self._total_hands += 1
 
         if self._total_hands % 10000 == 0:
@@ -193,43 +193,7 @@ class TelemetryAnalyzer:
                 self._total_hands, len(self._window), self.window_size,
             )
 
-    def record_from_actions(
-        self,
-        actions: list[tuple[int, int]],
-        reward: float,
-        reached_showdown: bool,
-    ) -> None:
-        """Nyers akcio-listabol epitkezo gyors rogzito.
-
-        Args:
-            actions: (action_index, street_phase) parok listaja.
-            reward: A leosztas jutalma.
-            reached_showdown: Eljutott-e a showdown-ig.
-        """
-        record = HandRecord(reward=reward, went_to_showdown=reached_showdown)
-        record.actions_taken = actions
-
-        for action_idx, street in actions:
-            if street == StreetPhase.PREFLOP:
-                if action_idx >= 2:  # Barmilyen emeles
-                    record.voluntarily_put_in_pot = True
-                    record.preflop_raised = True
-                elif action_idx == 1:  # Call
-                    record.voluntarily_put_in_pot = True
-                # 3-Bet: ha volt mar emeles es ujra emelunk
-                # Egyszerusitett heurisztika: ha tobbszor emelt pre-flop
-                if action_idx >= 2 and record.preflop_raised:
-                    record.three_betted = True
-                    record.preflop_raised = True  # Elso emeles is
-
-            elif street >= StreetPhase.FLOP:
-                record.saw_flop = True
-                if action_idx >= 2:
-                    record.postflop_bets += 1
-                elif action_idx == 1:
-                    record.postflop_calls += 1
-
-        self.record_hand(record)
+    # Removed: record_from_actions() was dead code with broken HandRecord construction (pre-v0.3.0).
 
     # =========================================================================
     # Metrika Szamitas
@@ -264,6 +228,7 @@ class TelemetryAnalyzer:
         af: float = self._postflop_bets_total / total_calls
 
         # WTSD: showdown / saw_flop
+        # saw_flop = street_reached >= 1 (derived from HandRecord.street_reached; no explicit field)
         wtsd: float = 0.0
         if self._saw_flop_count > 0:
             wtsd = (self._showdown_count / self._saw_flop_count) * 100.0
@@ -395,8 +360,8 @@ class TelemetryAnalyzer:
 
         recent = list(self._window)
         half = reward_window
-        recent_rewards = [r.reward for r in recent[-half:]]
-        older_rewards = [r.reward for r in recent[-2 * half:-half]]
+        recent_rewards = [r.reward_bb for r in recent[-half:]]
+        older_rewards = [r.reward_bb for r in recent[-2 * half:-half]]
 
         recent_mean: float = sum(recent_rewards) / len(recent_rewards) if recent_rewards else 0.0
         older_mean: float = sum(older_rewards) / len(older_rewards) if older_rewards else 0.0

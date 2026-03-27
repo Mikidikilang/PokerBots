@@ -50,6 +50,8 @@ class TrainerConfig:
         num_epochs: PPO epoch-ok szama egy batch-en belul.
         clip_range_vf: Value function clip range (None=nincs).
         target_kl: Korai leallitas ha a KL divergencia meghaladja.
+        learning_rate_schedule: Tanulasi rata schedule tipusa ('none', 'linear').
+        lr_warmup_steps: Warmup lepesek szama linearni schedule-hez.
     """
 
     learning_rate: float = 3.0e-4
@@ -61,6 +63,8 @@ class TrainerConfig:
     num_epochs: int = 4
     clip_range_vf: float | None = None
     target_kl: float | None = None
+    learning_rate_schedule: str = "none"
+    lr_warmup_steps: int | None = None
 
     @classmethod
     def from_dict(cls, cfg: dict[str, Any]) -> TrainerConfig:
@@ -83,6 +87,8 @@ class TrainerConfig:
             num_epochs=ppo.get("num_epochs", 4),
             clip_range_vf=ppo.get("clip_range_vf"),
             target_kl=None,
+            learning_rate_schedule=ppo.get("learning_rate_schedule", "none"),
+            lr_warmup_steps=ppo.get("lr_warmup_steps"),
         )
 
 
@@ -122,20 +128,35 @@ class PPOTrainer:
             torch.device(device) if isinstance(device, str) else device
         )
 
+        # P3.2: Move network to device before optimizer creation (device mismatch fix)
+        self.network = self.network.to(self.device)
+
         self.optimizer: torch.optim.Adam = torch.optim.Adam(
             self.network.parameters(),
             lr=config.learning_rate,
             eps=config.adam_epsilon,
         )
 
+        # P4.1: Optional learning rate scheduler
+        self.scheduler: torch.optim.lr_scheduler.LambdaLR | None = None
+        if config.learning_rate_schedule == "linear":
+            # Linear warmup then linear decay
+            def lr_lambda(step: int) -> float:
+                warmup_steps = config.lr_warmup_steps or 0
+                if step < warmup_steps:
+                    return float(step) / max(1, warmup_steps)
+                # Placeholder; actual schedule set externally if needed
+                return 1.0
+            self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+
         self._update_count: int = 0
 
         logger.info(
             "PPOTrainer inicializalva: lr=%.2e, clip_eps=%.3f, "
-            "vf_coef=%.3f, ent_coef=%.4f, epochs=%d, grad_norm=%.2f",
+            "vf_coef=%.3f, ent_coef=%.4f, epochs=%d, grad_norm=%.2f, device=%s",
             config.learning_rate, config.clip_epsilon,
             config.value_loss_coef, config.entropy_coef,
-            config.num_epochs, config.max_grad_norm,
+            config.num_epochs, config.max_grad_norm, self.device,
         )
 
     # =========================================================================
@@ -329,13 +350,18 @@ class PPOTrainer:
         self.optimizer.zero_grad()
         total_loss.backward()
 
-        # Phase 4-22: Gradient health checks — per-parameter NaN detection
+        # Phase 4-22: Gradient health checks — per-parameter NaN detection (P1.7: early abort)
+        # If ANY gradient contains NaN/Inf, abort BEFORE optimizer.step() to prevent Adam corruption
         for name, param in self.network.named_parameters():
             if param.grad is not None and not torch.isfinite(param.grad).all():
                 nan_count = (~torch.isfinite(param.grad)).sum().item()
-                logger.warning(
-                    "Gradient NaN detected in %s: %d/%d elements are NaN/Inf",
+                logger.critical(
+                    "Gradient NaN detected in %s: %d/%d elements are NaN/Inf — aborting optimizer step",
                     name, nan_count, param.grad.numel()
+                )
+                raise FloatingPointError(
+                    f"NaN/Inf gradient in {name}: {nan_count} elements NaN/Inf. "
+                    f"Aborting optimizer step to prevent Adam momentum corruption."
                 )
 
         # Gradiens norma szamitas es vagas
@@ -346,6 +372,10 @@ class PPOTrainer:
         )
 
         self.optimizer.step()
+
+        # P4.1: Update learning rate schedule if present
+        if self.scheduler is not None:
+            self.scheduler.step()
 
         # === Diagnosztika ===
         # Phase 4-23: Use strict inference_mode for better safety and performance

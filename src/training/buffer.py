@@ -255,13 +255,15 @@ class RolloutBuffer:
         else:
             self._obs_tensors = {}
         
-        # Stack all actions, log_probs, values
-        self._actions_tensor: torch.Tensor = torch.stack(self._actions, dim=0)
-        self._log_probs_tensor: torch.Tensor = torch.stack(self._log_probs, dim=0)
-        self._values_tensor: torch.Tensor = torch.stack(
+        # Stack all actions, log_probs, values and enforce 1-D shapes (P1.4 fix)
+        # Collector may attach extra batch dimensions, so we normalize to (num_steps,)
+        self._actions_tensor: torch.Tensor = torch.stack(self._actions, dim=0).view(num_steps)
+        self._log_probs_tensor: torch.Tensor = torch.stack(self._log_probs, dim=0).view(num_steps)
+        values_stacked: torch.Tensor = torch.stack(
             [v if isinstance(v, torch.Tensor) else torch.tensor(float(v))
              for v in self._values], dim=0
         )
+        self._values_tensor: torch.Tensor = values_stacked.view(num_steps)
         
         logger.debug(
             "Consolidated batching tensors allocated: "

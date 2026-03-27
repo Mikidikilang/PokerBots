@@ -175,6 +175,7 @@ class TrainingRunner:
         self._start_time: float = 0.0
         self._checkpoint_dir: str = checkpoint_dir
         self._should_stop: bool = False
+        self._nan_error_occurred: bool = False  # P1.6: Gate final checkpoint save to prevent NaN overwrite
 
         logger.info(
             "TrainingRunner inicializalva: device=%s, max_iter=%d, "
@@ -260,11 +261,12 @@ class TrainingRunner:
         except KeyboardInterrupt:
             logger.warning("KeyboardInterrupt! Graceful shutdown...")
         except FloatingPointError as exc:
-            # NaN/Inf detected — weights are corrupted, skip emergency save
+            # NaN/Inf detected — weights are corrupted, skip final checkpoint save (P1.6)
             logger.critical(
-                "FLOATINGPOINTERROR (Iter #%d): %s — Weights are corrupted, emergency save SKIPPED",
+                "FLOATINGPOINTERROR (Iter #%d): %s — Weights are corrupted, final save will be skipped",
                 self.iteration, exc, exc_info=True,
             )
+            self._nan_error_occurred = True  # Gate finally block checkpoint
             raise
         except Exception as exc:
             logger.error(
@@ -275,8 +277,9 @@ class TrainingRunner:
             self._save_checkpoint(emergency=True)
             raise
         finally:
-            # Graceful shutdown: utolso mentes
-            self._save_checkpoint(final=True)
+            # Graceful shutdown: utolso mentes (P1.6: skip if NaN error occurred)
+            if not self._nan_error_occurred:
+                self._save_checkpoint(final=True)
 
         elapsed: float = time.monotonic() - self._start_time
 
@@ -336,13 +339,16 @@ class TrainingRunner:
             )
             raise  # Nem recoverable — dimenzio/allapot hiba
 
-        # 1b. GAE Szamitasa — bootstrap last_value szukseg a returnshez
+        # 1b. GAE Szamitasa — bootstrap last_value szukseg a returnshez (P1.5 fix: batch obs)
         try:
             if self.collector._current_obs is not None:
                 from src.env.features import ObservationBuilder
                 obs_tensor = self.collector._build_obs_tensor(self.collector._current_obs)
+                # Ensure obs is batched (1, ...): network.get_value expects batch dimension
+                obs_batched = {k: v.unsqueeze(0) if v.dim() > 0 else v.unsqueeze(0)
+                               for k, v in obs_tensor.items()}
                 with torch.inference_mode():
-                    last_value_tensor = self.network.get_value(obs_tensor)
+                    last_value_tensor = self.network.get_value(obs_batched)
                     last_value = float(last_value_tensor.detach().cpu().item())
             else:
                 last_value = 0.0
@@ -411,6 +417,11 @@ class TrainingRunner:
     ) -> None:
         """Elmenti a halozat es az optimizer allapotat.
 
+        Checkpoint naming convention matches CheckpointManager (state_manager.py):
+        - Regular: checkpoint_iter_{iteration:08d}.pt
+        - Final:   final_iter_{iteration:08d}.pt
+        - Emergency: emergency_iter_{iteration:08d}.pt
+
         Args:
             emergency: True ha hibakezeles kozbeni mentes.
             final: True ha a training vegen torteno mentes.
@@ -421,7 +432,7 @@ class TrainingRunner:
         prefix: str = "emergency" if emergency else ("final" if final else "checkpoint")
         filepath: str = os.path.join(
             self._checkpoint_dir,
-            f"{prefix}_iter_{self.iteration:06d}.pt",
+            f"{prefix}_iter_{self.iteration:08d}.pt",
         )
 
         extra_state: dict[str, Any] = {
