@@ -298,6 +298,10 @@ class TrainingRunner:
     def _run_single_iteration(self) -> dict[str, float]:
         """Vegrehajt egyetlen training iteraciot.
 
+        A hibakezeles granulaltan kulonvalasztja:
+            - Matematikai hibak (NaN, Inf, dimenzio mismatch) → azonnali stop
+            - Infrastrukturalis hibak (I/O, callback) → naplozas, folytatas
+
         Lepesek:
             1. Adatgyujtes (collector)
             2. Gradiens frissites (trainer)
@@ -305,12 +309,42 @@ class TrainingRunner:
 
         Returns:
             Dict az iteracio statisztikaival.
-        """
-        # 1. Adatgyujtes
-        collect_stats: dict[str, float] = self.collector.collect_rollout()
 
-        # 2. PPO Gradiens frissites
-        train_stats: dict[str, float] = self.trainer.train_on_buffer(self.buffer)
+        Raises:
+            FloatingPointError: NaN/Inf a loss-ban.
+            RuntimeError: Dimenzio mismatch vagy matematikai inkonzisztencia.
+        """
+        # 1. Adatgyujtes — matematikai hibak itt is elofordulhatnak
+        try:
+            collect_stats: dict[str, float] = self.collector.collect_rollout()
+        except (RuntimeError, ValueError) as exc:
+            logger.error(
+                "MATEMATIKAI HIBA az adatgyujtesben (iter #%d): %s",
+                self.iteration, exc,
+            )
+            raise  # Nem recoverable — dimenzio/allapot hiba
+
+        # 2. PPO Gradiens frissites — NaN/Inf detektalas
+        try:
+            train_stats: dict[str, float] = self.trainer.train_on_buffer(self.buffer)
+
+            # NaN/Inf ellenorzes a loss ertekekben
+            for key in ("policy_loss", "value_loss", "total_loss"):
+                loss_val: float = train_stats.get(key, 0.0)
+                if loss_val != loss_val or abs(loss_val) == float("inf"):
+                    raise FloatingPointError(
+                        f"KRITIKUS: {key}={loss_val} (NaN/Inf) detektalva "
+                        f"az iteracio #{self.iteration}-ban!"
+                    )
+
+        except FloatingPointError:
+            raise  # Propagal a fo ciklusba a FaultHandler szamara
+        except (RuntimeError, ValueError) as exc:
+            logger.error(
+                "MATEMATIKAI HIBA a training lepesben (iter #%d): %s",
+                self.iteration, exc,
+            )
+            raise
 
         # 3. Osszesitett statisztikak
         iter_stats: dict[str, float] = {
@@ -320,13 +354,15 @@ class TrainingRunner:
             "elapsed_hours": (time.monotonic() - self._start_time) / 3600,
         }
 
-        # 4. Orchestrator callback
+        # 4. Orchestrator callback — infrastrukturalis hiba nem allitja le a tanulast
         if self._on_iteration_end is not None:
             try:
                 self._on_iteration_end(self.iteration, iter_stats)
             except Exception as exc:
                 logger.error(
-                    "Orchestrator callback hiba (iter #%d): %s",
+                    "Orchestrator callback hiba (iter #%d): %s — "
+                    "A training folytathato, de a curriculum logika "
+                    "az aktualis iteracioban kihagyasra kerult.",
                     self.iteration, exc,
                 )
 

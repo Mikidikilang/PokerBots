@@ -25,7 +25,7 @@ Akció Index Tábla:
 
 Hivatkozások:
     - Specifikáció: Akciótér szekció (9 diszkrét akció)
-    - Action Masking: logit -= 1e8 technika a Softmax előtt
+    - Action Masking: torch.where + torch.finfo(dtype).min (AMP-safe)
     - Libratus/Pluribus bet sizing buckets
 """
 
@@ -76,7 +76,38 @@ NUM_ACTIONS: int = 9
 """Az akciótér teljes dimenziója."""
 
 ILLEGAL_ACTION_LOGIT: float = -1.0e8
-"""Az illegális akciók logitjaihoz hozzáadott extrém negatív szám."""
+"""Az illegális akciók logitjaihoz hozzáadott extrém negatív szám.
+
+.. deprecated::
+    Használd a :func:`get_safe_mask_value` függvényt, amely dtype-aware
+    és biztonságos float16 (AMP) környezetben is.
+"""
+
+
+def get_safe_mask_value(dtype: torch.dtype = torch.float32) -> float:
+    """Visszaadja a dtype-specifikus biztonságos maszkolási értéket.
+
+    A ``torch.finfo(dtype).min`` értéket használja, amely garantáltan
+    a legkisebb véges szám az adott típusban, elkerülve a NaN propagációt
+    Automatic Mixed Precision (AMP) float16 környezetben.
+
+    +-----------+------------------+-----------------------------------+
+    | dtype     | finfo.min        | Megjegyzés                        |
+    +===========+==================+===================================+
+    | float32   | ~-3.4e38         | Bőven biztonságos                 |
+    +-----------+------------------+-----------------------------------+
+    | float16   | ~-65504          | -1e8 itt NaN-t okozna!            |
+    +-----------+------------------+-----------------------------------+
+    | bfloat16  | ~-3.39e38        | Biztonságos                       |
+    +-----------+------------------+-----------------------------------+
+
+    Args:
+        dtype: A logit tenzor adattípusa.
+
+    Returns:
+        A biztonságos minimális véges érték az adott dtype-hoz.
+    """
+    return torch.finfo(dtype).min
 
 
 # =============================================================================
@@ -333,10 +364,10 @@ class ActionMapper:
     ) -> torch.Tensor:
         """A Softmax ELŐTT alkalmazza az akció maszkot a logit vektorra.
 
-        Az illegális akciók logitjaihoz hozzáadja az ILLEGAL_ACTION_LOGIT
-        értéket (-1e8), ami garantálja, hogy a Softmax utáni valószínűségük
-        algoritmikusan nulla legyen anélkül, hogy a backward pass
-        összeomlana.
+        AMP-SAFE implementáció: ``torch.where`` + ``torch.finfo(dtype).min``
+        használatával, amely float16/bfloat16 környezetben is biztonságos.
+        A korábbi additív maszkolás (-1e8) float16-ban NaN-t okozna,
+        mivel a float16 min ~ -65504.
 
         Args:
             logits: A hálózat nyers kimeneti logitjai (9,) vagy (batch, 9).
@@ -355,21 +386,25 @@ class ActionMapper:
                 f"alakja nem egyezik."
             )
 
-        # Ahol a maszk 0 (illegális), ott -1e8-at adunk a logithoz
-        # Ahol a maszk 1 (legális), ott 0-t adunk (nem változtatunk)
-        masked_logits: torch.Tensor = logits + (1.0 - action_mask) * ILLEGAL_ACTION_LOGIT
+        # AMP-safe: dtype-specifikus minimális véges érték
+        mask_value: float = get_safe_mask_value(logits.dtype)
+        masked_logits: torch.Tensor = torch.where(
+            action_mask.bool(), logits, torch.tensor(mask_value, dtype=logits.dtype)
+        )
 
         if logger.isEnabledFor(logging.DEBUG):
             num_legal: int = int(action_mask.sum().item()) if action_mask.dim() == 1 else -1
             logger.debug(
                 "Akció maszkolás alkalmazva: %d legális akció, "
-                "logit tartomány: [%.2f, %.2f] → maszkolt: [%.2f, %.2f]",
+                "logit tartomány: [%.2f, %.2f] → maszkolt: [%.2f, %.2f], "
+                "dtype=%s, mask_value=%.2e",
                 num_legal,
                 logits.min().item(), logits.max().item(),
                 masked_logits[action_mask.bool()].min().item()
                 if action_mask.any() else float("nan"),
                 masked_logits[action_mask.bool()].max().item()
                 if action_mask.any() else float("nan"),
+                logits.dtype, mask_value,
             )
 
         return masked_logits

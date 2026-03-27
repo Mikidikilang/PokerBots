@@ -883,6 +883,43 @@ A mock-kal nem tesztelhető részek a `conftest.py`-ban dokumentálva vannak.
 - `README.md`: Produkciós dokumentáció, architektúra diagram
 - `MASTER_NOTE.md`: Fejlesztési biblia (ez a dokumentum)
 
+### v0.2.0 (2025-03-27) — Audit Remediáció
+
+**Külső audit alapján végrehajtott javítások (PokerAI-NLHE Code Audit v5):**
+
+**Milestone 1: Kritikus Matematikai Stabilizáció**
+- `action_mapper.py`: AMP-safe action masking — `torch.where` + `torch.finfo(logits.dtype).min`
+  - A korábbi `-1e8` float16-ban NaN-t okozna (min ~ -65504)
+  - Új `get_safe_mask_value(dtype)` publikus API hozzáadva
+  - `ILLEGAL_ACTION_LOGIT` konstans megtartva (deprecated, backward compat)
+- `networks.py`: Forward pass masking szintén `torch.where` + `torch.finfo`-ra cserélve
+- `config.yaml`: Value Function Clipping aktiválva (`clip_range_vf: 0.2`)
+  - A trainer.py implementáció már létezett, csak a config volt `null`
+
+**Milestone 2: Hibakezelés és Robusztusság**
+- `runner.py`: Granulált exception handling a `_run_single_iteration`-ben
+  - Matematikai hibák (NaN, Inf, dimenzió mismatch) → azonnali propagálás a FaultHandler-hez
+  - Infrastrukturális hibák (callback, I/O) → naplózás, training folytatódik
+  - Explicit `FloatingPointError` a NaN/Inf loss értékekre
+- `orchestrator.py`: Beavatkozási cooldown mechanizmus
+  - `_intervention_cooldown = 10` iteráció két beavatkozás között
+  - Megakadályozza az oszcilláló beavatkozási kaszkádot
+- `orchestrator.py`: Entrópia koefficiensz felső korlát (`_max_entropy_coef = 0.1`)
+  - A korábbi implementációban ismételt boost szorzás korlát nélkül nőhetett
+  - Most `min(current * boost, max_cap)` formulát alkalmaz
+
+**Tesztelés**
+- `conftest.py`: `torch.where` és `torch.finfo` mock hozzáadva (AMP-safe teszteléshez)
+- `test_model.py`: 3 új AMP-safety teszt (`get_safe_mask_value`, NaN-mentesség, legacy compat)
+- Összesen: 159 → **161 teszt**, mind zöld
+
+**Az audit alábbi megállapításai NEM igényeltek kódváltozást (indoklás):**
+- Singleton → Jelenlegi single-GPU architektúrában OK; DI refaktor a multi-worker fázisban
+- Mid-trajectory callback → A callback iteráció VÉGÉN fut, nem mid-rollout
+- 11.5h shutdown → A `time.monotonic()` az init UTÁN indul + SIGTERM handler már implementálva
+- GIL contention → CommitScheduler I/O-bound, a GIL elengedésre kerül socket-várakozásnál
+- RNG worker isolation → Nincs multi-worker rollout a jelenlegi architektúrában
+
 ---
 
 > **Megjegyzés a jövőbeli fejlesztőknek:**

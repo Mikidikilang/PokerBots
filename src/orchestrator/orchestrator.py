@@ -172,9 +172,12 @@ class AutoAdaptiveOrchestrator:
         # Trainer referencia (kesobb allitja be a runner)
         self._trainer_ref: Any = None
 
-        # Beavatkozas szamlalok
+        # Beavatkozas szamlalok es cooldown
         self._intervention_count: int = 0
         self._last_anomalies: list[str] = []
+        self._last_intervention_iter: int = -1000  # Cooldown: legutobbi beavatkozas iteracioja
+        self._intervention_cooldown: int = 10      # Min iteraciok ket beavatkozas kozott
+        self._max_entropy_coef: float = 0.1        # Entropia koefficiensz felso korlat
 
         logger.info(
             "AutoAdaptiveOrchestrator inicializalva: players=%d, "
@@ -262,8 +265,8 @@ class AutoAdaptiveOrchestrator:
         ):
             anomalies.append("stagnation")
 
-        # 6. Beavatkozas
-        interventions: list[str] = self._execute_interventions(anomalies, metrics)
+        # 6. Beavatkozas (cooldown-nal)
+        interventions: list[str] = self._execute_interventions(anomalies, metrics, iteration)
         result["interventions"] = interventions
 
         # 7. Fazisatmenet ellenorzes
@@ -295,8 +298,13 @@ class AutoAdaptiveOrchestrator:
         self,
         anomalies: list[str],
         metrics: dict[str, float],
+        iteration: int = 0,
     ) -> list[str]:
         """Vegrehajtja a szukseges beavatkozasokat az anomaliak alapjan.
+
+        A beavatkozasok cooldown-nal vannak vedve: ket beavatkozas kozott
+        legalabb ``_intervention_cooldown`` iteracioanak kell eltelnie,
+        megakadalyozva az oszcillalo beavatkozasi kaszkadot.
 
         A specifikacio altal definialt intervenciok:
             - passivity -> entropia noveles + agressziv botok
@@ -306,11 +314,24 @@ class AutoAdaptiveOrchestrator:
         Args:
             anomalies: A detektalt anomaliak listaja.
             metrics: Az aktualis HUD metrikak.
+            iteration: Az aktualis iteracio szama (cooldown szamitashoz).
 
         Returns:
             A vegrehajtott beavatkozasok neveinek listaja.
         """
         interventions: list[str] = []
+
+        # Cooldown ellenorzes: ne avatkozzunk be tul gyakran
+        if (iteration - self._last_intervention_iter) < self._intervention_cooldown:
+            if anomalies:
+                logger.debug(
+                    "Beavatkozas cooldown aktiv: %d/%d iteracio. "
+                    "Anomaliak (%s) figyelmen kivul hagyva.",
+                    iteration - self._last_intervention_iter,
+                    self._intervention_cooldown,
+                    anomalies,
+                )
+            return interventions
 
         if "passivity" in anomalies:
             self._intervene_passivity(metrics)
@@ -327,9 +348,11 @@ class AutoAdaptiveOrchestrator:
 
         if interventions:
             self._intervention_count += len(interventions)
+            self._last_intervention_iter = iteration
             logger.info(
-                "Beavatkozasok vegrehajtva: %s (osszes: %d)",
+                "Beavatkozasok vegrehajtva: %s (osszes: %d, cooldown=%d iter)",
                 interventions, self._intervention_count,
+                self._intervention_cooldown,
             )
 
         return interventions
@@ -337,29 +360,38 @@ class AutoAdaptiveOrchestrator:
     def _intervene_passivity(self, metrics: dict[str, float]) -> None:
         """Passzivitas korrekcios beavatkozas.
 
-        1. Entropia koefficienshez szorzo (entropy_boost_factor)
+        1. Entropia koefficienshez szorzo (entropy_boost_factor), MAX CAP-pel
         2. Agresszio bonus aktivalas a reward shaper-ben
 
         Args:
             metrics: Aktualis HUD metrikak.
         """
-        # Entropia noveles
+        # Entropia noveles (capped — megakadalyozza a vegtelen szorzodast)
         if self._trainer_ref is not None:
             current_ent: float = getattr(
                 getattr(self._trainer_ref, "config", None),
                 "entropy_coef", 0.01,
             )
             boost: float = self.reward_shaper.config.entropy_boost_factor
-            new_ent: float = current_ent * boost
+            new_ent: float = min(current_ent * boost, self._max_entropy_coef)
+
+            if new_ent >= self._max_entropy_coef:
+                logger.warning(
+                    "Entropia CAP elerve: %.4f >= %.4f max. "
+                    "Tovabbi noveles blokkolva.",
+                    new_ent, self._max_entropy_coef,
+                )
+
             self._trainer_ref.update_entropy_coef(new_ent)
             logger.info(
-                "Passzivitas intervenció: entropia %.4f -> %.4f (x%.1f)",
-                current_ent, new_ent, boost,
+                "Passzivitas intervencio: entropia %.4f -> %.4f "
+                "(x%.1f, max=%.4f)",
+                current_ent, new_ent, boost, self._max_entropy_coef,
             )
 
         # Agresszio bonus
         self.reward_shaper.update_aggression_bonus(0.1)
-        logger.info("Passzivitas intervenció: agresszio bonus aktiválva: +0.1")
+        logger.info("Passzivitas intervencio: agresszio bonus aktivalva: +0.1")
 
     def _intervene_maniac(self, metrics: dict[str, float]) -> None:
         """All-in Spam / Maniac korrekcios beavatkozas.
@@ -377,7 +409,8 @@ class AutoAdaptiveOrchestrator:
     def _intervene_stagnation(self) -> None:
         """Stagnacio korrekcios beavatkozas.
 
-        Entropia koefficienshez szorzo a feltaras (exploration) nowelesere.
+        Entropia koefficienshez szorzo a feltaras (exploration) novelesere,
+        MAX CAP-pel a vegtelen szorzodas megakadalyozasara.
         """
         if self._trainer_ref is not None:
             current_ent: float = getattr(
@@ -385,11 +418,19 @@ class AutoAdaptiveOrchestrator:
                 "entropy_coef", 0.01,
             )
             boost: float = self.reward_shaper.config.entropy_boost_factor
-            new_ent: float = current_ent * boost
+            new_ent: float = min(current_ent * boost, self._max_entropy_coef)
+
+            if new_ent >= self._max_entropy_coef:
+                logger.warning(
+                    "Stagnacio: Entropia CAP elerve: %.4f >= %.4f max.",
+                    new_ent, self._max_entropy_coef,
+                )
+
             self._trainer_ref.update_entropy_coef(new_ent)
             logger.info(
-                "Stagnacio intervenció: entropia %.4f -> %.4f (x%.1f)",
-                current_ent, new_ent, boost,
+                "Stagnacio intervencio: entropia %.4f -> %.4f "
+                "(x%.1f, max=%.4f)",
+                current_ent, new_ent, boost, self._max_entropy_coef,
             )
 
     def _on_phase_transition(self) -> None:

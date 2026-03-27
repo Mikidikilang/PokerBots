@@ -15,7 +15,7 @@ Az architektúra felépítése:
 
     3. Actor Fej (Policy Head):
        - MLP [512, 256, 128] -> 9-dimenziós logitok
-       - Action Masking: logit += (1 - mask) * -1e8
+       - Action Masking: torch.where + torch.finfo(dtype).min (AMP-safe)
        - Softmax -> Categorical eloszlás
 
     4. Critic Fej (Value Head):
@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -58,15 +58,12 @@ class NetworkConfig:
     Ezeket a config.yaml 'model' szekciójából tölti be a rendszer.
 
     Attributes:
-        num_players: A játékosok száma az asztalnál (2-9).
-        num_actions: Az akciótér mérete (9 a NLHE-ben).
-        max_betting_actions: Maximális licitmódosítások száma egy leosztásban.
-        action_feature_dim: Akciótípusok dimenziója a licittörténetben.
-        card_input_dim: Egyetlen kártyavektor dimenziója (52).
-        context_input_dim: Környezeti metrikák dimenziója (dinamikusan számított).
-        position_input_dim: Pozíció one-hot vektor dimenziója (dinamikusan számított).
-        history_input_dim: Licittörténet laposított dimenziója (dinamikusan számított).
         observation_dim: A laposított megfigyelési vektor teljes dimenziója.
+        num_actions: Az akciótér mérete (9 a NLHE-ben).
+        card_input_dim: Egyetlen kártyavektor dimenziója (52).
+        context_input_dim: Környezeti metrikák dimenziója.
+        history_input_dim: Licittörténet laposított dimenziója (18 * 9).
+        position_input_dim: Pozíció one-hot vektor dimenziója.
         card_embed_dim: Kártyabeágyazás kimeneti dimenziója.
         context_embed_dim: Környezeti beágyazás kimeneti dimenziója.
         history_embed_dim: Történelem beágyazás kimeneti dimenziója.
@@ -79,15 +76,12 @@ class NetworkConfig:
         illegal_action_logit: Az illegális akciók logitjaihoz adott érték.
     """
 
-    num_players: int = 6
+    observation_dim: int = 281
     num_actions: int = 9
-    max_betting_actions: int = 18
-    action_feature_dim: int = 9
     card_input_dim: int = 52
     context_input_dim: int = 9
-    position_input_dim: int = 6
     history_input_dim: int = 162
-    observation_dim: int = 281
+    position_input_dim: int = 6
     card_embed_dim: int = 64
     context_embed_dim: int = 32
     history_embed_dim: int = 64
@@ -97,84 +91,21 @@ class NetworkConfig:
     dropout: float = 0.1
     weight_init: str = "orthogonal"
     weight_init_gain: float = 1.0
-    illegal_action_logit: float = -1.0e8
+    illegal_action_logit: float = -1.0e8  # DEPRECATED: forward() now uses torch.finfo(dtype).min
 
     def __post_init__(self) -> None:
-        """Validálja és dinamikusan számítja a hálózat konfigurációs paramétereit."""
-        if not 2 <= self.num_players <= 9:
-            raise ValueError(f"num_players 2-9 között kell legyen: kapott {self.num_players}")
+        """Validálja a hálózat konfigurációs paramétereit."""
         if self.num_actions < 2:
             raise ValueError(f"num_actions legalább 2: kapott {self.num_actions}")
-        if self.max_betting_actions < 1:
-            raise ValueError(f"max_betting_actions legalább 1: kapott {self.max_betting_actions}")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError(f"dropout [0, 1) kell legyen: kapott {self.dropout}")
         if self.activation not in ("relu", "gelu", "tanh"):
             raise ValueError(f"Ismeretlen aktiváció: '{self.activation}'")
-
-        # Dinamikus dimenziók számítása num_players alapján
-        # context_input_dim = environment metrics (pot, chips, call, min_raise) + opponent stacks
-        calculated_context_dim: int = 4 + (self.num_players - 1)
-        
-        # position_input_dim = one-hot pozíció vektor mérete
-        calculated_position_dim: int = self.num_players
-        
-        # history_input_dim = licittörténet laposított dimenziója
-        calculated_history_dim: int = self.max_betting_actions * self.action_feature_dim
-        
-        # Frissítés a frozen dataclass-ban (object.__setattr__ szükséges)
-        object.__setattr__(self, "context_input_dim", calculated_context_dim)
-        object.__setattr__(self, "position_input_dim", calculated_position_dim)
-        object.__setattr__(self, "history_input_dim", calculated_history_dim)
-        
-        # Observation dimenzió számítása: kártyák + beágyazott vektorok
-        # card_embedding: (batch, card_embed_dim * 2) — hole + community
-        # context_embedding: (batch, context_embed_dim)
-        # history_embedding: (batch, history_embed_dim)
-        # Flattened total = 52 + 52 + card_embed_dim*2 + context_embed_dim + history_embed_dim
-        flattened_obs_dim: int = (
-            self.card_input_dim * 2  # hole_cards + community_cards multi-hot
-            + self.card_embed_dim * 2  # card_embedding output
-            + self.context_embed_dim  # context_embedding output
-            + self.history_embed_dim  # history_embedding output
-        )
-        object.__setattr__(self, "observation_dim", flattened_obs_dim)
-
         logger.debug(
-            "NetworkConfig inicializálva: players=%d, actions=%d, "
-            "context_dim=%d (4+%d opps), pos_dim=%d, history_dim=%d, "
-            "obs_dim=%d, actor=%s, init=%s",
-            self.num_players, self.num_actions,
-            calculated_context_dim, self.num_players - 1,
-            calculated_position_dim,
-            calculated_history_dim,
-            flattened_obs_dim,
+            "NetworkConfig: obs_dim=%d, actions=%d, actor=%s, init=%s",
+            self.observation_dim, self.num_actions,
             self.actor_hidden_layers, self.weight_init,
         )
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any], num_players: int | None = None) -> "NetworkConfig":
-        """
-        Létrehoz egy NetworkConfig instance-t egy szótárból, szigorú mező
-        szűréssel és dinamikus dimenziók számításával.
-
-        Args:
-            data: A konfigurációs szótár (általában a config.yaml-ból).
-            num_players: A játékosok száma, ami felülírja a szótárban
-                         található `num_players` értéket.
-
-        Returns:
-            NetworkConfig instance.
-        """
-        payload = data.copy()
-        if num_players is not None:
-            payload["num_players"] = num_players
-
-        # Csak azokat a kulcsokat tartjuk meg, amik a dataclass mezői
-        known_keys = cls.__dataclass_fields__.keys()
-        filtered_payload = {k: v for k, v in payload.items() if k in known_keys}
-
-        return cls(**filtered_payload)
 
 
 # =============================================================================
@@ -445,9 +376,12 @@ class PokerActorCritic(nn.Module):
         # 2. Fúzió
         fused: torch.Tensor = torch.cat([card_emb, ctx_emb, hist_emb], dim=-1)
 
-        # 3. Actor: logitok + Action Masking
+        # 3. Actor: logitok + Action Masking (AMP-safe: dtype-aware)
         logits: torch.Tensor = self.actor_head(fused)
-        masked_logits: torch.Tensor = logits + (1.0 - action_mask) * self.config.illegal_action_logit
+        mask_value: float = torch.finfo(logits.dtype).min
+        masked_logits: torch.Tensor = torch.where(
+            action_mask.bool(), logits, torch.tensor(mask_value, dtype=logits.dtype, device=logits.device)
+        )
 
         # Biztonsági: üres maszk -> Fold kényszerítés
         valid_count: torch.Tensor = action_mask.sum(dim=-1)
@@ -457,7 +391,9 @@ class PokerActorCritic(nn.Module):
             empty_rows: torch.Tensor = valid_count == 0
             action_mask = action_mask.clone()
             action_mask[empty_rows, 0] = 1.0
-            masked_logits = logits + (1.0 - action_mask) * self.config.illegal_action_logit
+            masked_logits = torch.where(
+                action_mask.bool(), logits, torch.tensor(mask_value, dtype=logits.dtype, device=logits.device)
+            )
 
         # Softmax -> Categorical (numerikus stabilitás)
         action_probs: torch.Tensor = torch.softmax(masked_logits, dim=-1)
@@ -540,92 +476,7 @@ class PokerActorCritic(nn.Module):
         _, value = self.forward(observation)
         return value
 
-    def get_action_and_value(
-        self, observation: dict[str, torch.Tensor], action: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Akció mintavételezés + érték számítás egy lépésben (rollout fázis).
-
-        Ez a metódus a rollout gyűjtéshez szükséges: az aktuális policy
-        alapján mintavételez egy akciót és kiszámítja annak log-valószínűségét,
-        az eloszlás entrópiáját és az állapotértéket.
-
-        Args:
-            observation: Batch-elt megfigyelés dict (lehet single vagy batch).
-            action: Opcionális előre megadott akció (e.g. betöltött checkpoint).
-                   Ha None, az akció a policy-ből mintavételezve lesz.
-
-        Returns:
-            Tuple: (action, log_prob, entropy, value)
-                - action: (batch,) vagy (1,) tensor, az választott akció indexei
-                - log_prob: (batch,) vagy (1,) tensor, az akciók log-valószínűsége
-                - entropy: (batch,) vagy (1,) tensor, az eloszlás entrópiája
-                - value: (batch,) vagy (1,) tensor, az állapotértékek V(s)
-        """
-        action_dist, values = self.forward(observation)
-
-        # Akció mintavételezés vagy felhasználott akció
-        if action is None:
-            action = action_dist.sample()
-        
-        # Log-valószínűség és entrópia
-        log_prob = action_dist.log_prob(action)
-        entropy = action_dist.entropy()
-
-        logger.debug(
-            "get_action_and_value: batch=%d, action_range=[%d,%d], "
-            "log_prob=[%.4f,%.4f], entropy=%.4f, value=[%.4f,%.4f]",
-            action.shape[0] if action.dim() > 0 else 1,
-            int(action.min().item()), int(action.max().item()),
-            log_prob.min().item(), log_prob.max().item(),
-            entropy.mean().item(),
-            values.min().item(), values.max().item(),
-        )
-
-        return action, log_prob, entropy, values.squeeze(-1)
-
-    def save_checkpoint(self, path: str, extra_state: dict[str, Any] | None = None) -> None:
-        """Menti a modell súlyait és opcionális extra állapotot a megadott útvonalra.
-        
-        Args:
-            path: A mentési útvonal.
-            extra_state: Opcionális további adatok (pl. optimizer állapot, training metrik).
-        """
-        checkpoint = {"state_dict": self.state_dict()}
-        if extra_state is not None:
-            checkpoint.update(extra_state)
-        torch.save(checkpoint, path)
-        logger.info("Modell checkpoint mentve ide: %s", path)
-
-    # =========================================================================
-    # Súlyinicializáció
-    # =========================================================================
-
-    def _initialize_weights(self) -> None:
-        """Lineáris rétegek inicializálása (orthogonal/xavier/kaiming).
-
-        A policy output réteg kisebb gain-nel (0.01) inicializálódik
-        a kezdeti exploráció elősegítésére. Bias vektorok: nulla.
-        """
-        init_method: str = self.config.weight_init
-        gain: float = self.config.weight_init_gain
-        count: int = 0
-
-        for name, module in self.named_modules():
-            if not isinstance(module, nn.Linear):
-                continue
-
-            is_policy_out: bool = "actor_head" in name and module.out_features == self.config.num_actions
-            g: float = 0.01 if is_policy_out else gain
-
-            if init_method == "orthogonal":
-                nn.init.orthogonal_(module.weight, gain=g)
-            elif init_method == "xavier":
-                nn.init.xavier_uniform_(module.weight, gain=g)
-            elif init_method == "kaiming":
-                nn.init.kaiming_uniform_(module.weight, a=math.sqrt(5))
-            else:
-                logger.warning("Ismeretlen init '%s', PyTorch default.", init_method)
-
+    
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
             count += 1

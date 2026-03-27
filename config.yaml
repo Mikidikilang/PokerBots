@@ -24,7 +24,7 @@ project:
 # Futtatási környezet (Runtime)
 # ---------------------------------------------------------------------------
 runtime:
-  platform: "local"                    # Opciók: "kaggle", "local", "cloud"
+  platform: "kaggle"                    # Opciók: "kaggle", "local", "cloud"
   device: "auto"                        # "auto" -> CUDA ha elérhető, egyébként CPU
   num_workers: 4                        # DataLoader / Rollout worker szálak száma
   log_level: "INFO"                     # Python logging szint: DEBUG, INFO, WARNING, ERROR
@@ -68,7 +68,7 @@ environment:
       6: "raise_1.5x_pot"              # Másfélszeres pot (overbet)
       7: "raise_2.0x_pot"              # Kétszeres pot (deep overbet)
       8: "all_in"                       # Teljes zsetonkészlet betolása
-    illegal_action_logit_mask: -1.0e8   # Illegális akciók Softmax előtti maszkolási értéke
+    illegal_action_logit_mask: -1.0e+8  # LEGACY fallback; a kód torch.finfo(dtype).min-t használ (AMP-safe)
 
 # ---------------------------------------------------------------------------
 # Neurális Hálózat Architektúra (Model / Actor-Critic PPO)
@@ -113,14 +113,14 @@ ppo:
 
   # --- PPO Specifikus Hiperparaméterek ---
   clip_epsilon: 0.2                     # PPO clipping paraméter (ε)
-  clip_range_vf: null                   # Value Function clip range (null = nincs)
+  clip_range_vf: 0.2                     # Value Function clip range (a Critic stabilitásához póker variancia ellen)
   entropy_coefficient: 0.01             # Entrópia reguláris együttható (c₂) - HOT-RELOADABLE
   value_loss_coefficient: 0.5           # Értékveszteség súlyozási tényező (c₁)
   gamma: 0.99                           # Diszkontálási faktor (γ)
   gae_lambda: 0.95                      # Generalized Advantage Estimation (λ)
 
   # --- Mintavételezés és Batch ---
-  rollout_steps: 20000                   # Lépések száma egy rollout-ban (adatgyűjtés)  majd vissza 10-20k-ra
+  rollout_steps: 2048                   # Lépések száma egy rollout-ban (adatgyűjtés)
   num_epochs: 4                         # PPO epoch-ok száma egy batch-en belül
   batch_size: 64                        # Mini-batch méret a gradiens frissítéshez
   num_mini_batches: 4                   # Mini-batch darabszám (rollout_steps / batch_size)
