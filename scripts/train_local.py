@@ -143,48 +143,14 @@ def load_config(config_path: str) -> dict[str, Any]:
 def create_environment(cfg: dict[str, Any]) -> Any:
     """Letrehozza a poker jatekkkornyezetet a konfig alapjan.
 
-    Tamogatott motorok:
-        - "rlcard": RLCard No-Limit Hold'em
-        - "pettingzoo": PettingZoo Texas Hold'em
-
     Args:
         cfg: Teljes YAML konfiguracio.
 
     Returns:
         A kornyezet peldany (PokerEnvironment protocol).
     """
-    logger = logging.getLogger(__name__)
-    env_cfg: dict[str, Any] = cfg.get("environment", {})
-    engine: str = env_cfg.get("game_engine", "rlcard")
-    num_players: int = env_cfg.get("num_players", 6)
-
-    logger.info("Kornyezet inicializalas: engine=%s, players=%d", engine, num_players)
-
-    try:
-        if engine == "rlcard":
-            import rlcard  # type: ignore[import-untyped]
-            env = rlcard.make(
-                "no-limit-holdem",
-                config={"game_num_players": num_players},
-            )
-            logger.info("RLCard kornyezet letrehozva: %s, %d jatekos", "no-limit-holdem", num_players)
-            return env
-
-        elif engine == "pettingzoo":
-            from pettingzoo.classic import texas_holdem_no_limit_v6  # type: ignore[import-untyped]
-            env = texas_holdem_no_limit_v6.env(num_players=num_players)
-            logger.info("PettingZoo kornyezet letrehozva: %d jatekos", num_players)
-            return env
-
-        else:
-            raise ValueError(f"Ismeretlen jatekmotor: '{engine}'. Ervenyes: rlcard, pettingzoo")
-
-    except ImportError as exc:
-        logger.error(
-            "A '%s' jatekmotor nem elerheto. Telepitsd: pip install %s. Hiba: %s",
-            engine, engine, exc,
-        )
-        raise
+    from src.env.wrappers import make_env
+    return make_env(cfg)
 
 
 # =============================================================================
@@ -259,14 +225,9 @@ def build_training_pipeline(
     collector_cfg = CollectorConfig.from_dict(cfg)
     collector = RolloutCollector(collector_cfg, env, obs_builder, network, buffer, device)
 
-    # --- Checkpoint Manager ---
-    from src.mlops.state_manager import CheckpointManager
-    mlops_cfg = cfg.get("mlops", {})
-    ckpt_cfg = mlops_cfg.get("checkpoint", {})
-    ckpt_manager = CheckpointManager(
-        checkpoint_dir=ckpt_cfg.get("local_checkpoint_dir", "checkpoints"),
-        max_checkpoints=ckpt_cfg.get("max_checkpoints_to_keep", 5),
-    )
+    # --- State Manager ---
+    from src.mlops.state_manager import StateManager
+    state_manager = StateManager.from_dict(cfg)
 
     # --- Resume Training ---
     start_iteration: int = 0
@@ -274,14 +235,13 @@ def build_training_pipeline(
 
     if resume:
         if checkpoint_path:
-            checkpoint = ckpt_manager.load_from_path(checkpoint_path, device)
+            result = state_manager.ckpt_mgr.load(checkpoint_path, map_location=device)
         else:
-            checkpoint = ckpt_manager.load_latest(device)
+            result = state_manager.load_training_state(map_location=str(device))
 
-        if checkpoint is not None:
-            result = ckpt_manager.restore_full_state(
-                checkpoint, network, trainer.optimizer, dl_generator,
-            )
+        if result is not None:
+            network.load_state_dict(result["model_state_dict"])
+            trainer.optimizer.load_state_dict(result["optimizer_state_dict"])
             start_iteration = result.get("iteration", 0)
             orchestrator_state = result.get("orchestrator_state", {})
             logger.info("Resume training: iter=%d", start_iteration)
@@ -315,6 +275,8 @@ def build_training_pipeline(
 
     # --- HF Sync (opcionalis) ---
     from src.mlops.hf_sync import AsyncModelUploader, configure_headless_auth
+    mlops_cfg = cfg.get("mlops", {})
+    ckpt_cfg = mlops_cfg.get("checkpoint", {})
     hf_repo: str = mlops_cfg.get("hf_repo_id", "")
     async_cfg = mlops_cfg.get("async_upload", {})
     uploader: AsyncModelUploader | None = None
@@ -344,17 +306,16 @@ def build_training_pipeline(
     def on_checkpoint(iteration: int, net: Any) -> None:
         """Checkpoint mentes + Orchestrator allapot + RNG."""
         rng_states = RNGStateManager.capture_states(dl_generator)
-        ckpt_manager.save(
+        state_manager.save_training_state(
             network=net,
             optimizer=trainer.optimizer,
-            rng_states=rng_states,
-            orchestrator_state=orchestrator.get_state(),
-            training_meta={
-                "total_steps": collector.get_total_steps(),
-                "total_episodes": collector.get_total_episodes(),
-            },
             iteration=iteration,
-            config_snapshot=cfg,
+            total_env_steps=collector.get_total_steps(),
+            total_hands=0,  # TODO: track total hands from orchestrator
+            best_mean_reward=-float("inf"),  # TODO: track from orchestrator
+            orchestrator_state=orchestrator.get_state(),
+            config=cfg,
+            is_best=False,  # TODO: implement best selection logic
         )
 
     # --- Runner ---
@@ -382,7 +343,7 @@ def build_training_pipeline(
         "network": network,
         "trainer": trainer,
         "orchestrator": orchestrator,
-        "ckpt_manager": ckpt_manager,
+        "state_manager": state_manager,
         "shutdown_monitor": shutdown_monitor,
         "uploader": uploader,
         "fault_handler": fault_handler,
