@@ -1,0 +1,465 @@
+"""
+Diszkretizált Akciótér Kezelő (action_mapper.py).
+
+A No-Limit Texas Hold'em definíció szerint folytonos akciótérrel rendelkezik,
+mivel bármilyen összeg emelhető a minimális emelés és az all-in között.
+A gyakorlatban és a csúcsmodell AI-k (Libratus, Pluribus) esetében a folytonos
+akciótér instabil, nehezen optimalizálható stratégiákat eredményez.
+
+Ez a modul egy 9-dimenziós diszkretizált akcióteret implementál, amely:
+    1. A hálózat Softmax kimeneti indexét szemantikai póker akcióvá fordítja
+    2. Kiszámítja a pot-relatív tétméreteket chip értékekben
+    3. Érvényesíti a legális akciók maszkját a Softmax logitok szintjén
+    4. Kezeli az edge case-eket (nem elegendő stack, minimum raise szabály)
+
+Akció Index Tábla:
+    0 = Fold (Dobás)
+    1 = Check / Call (Passz / Megadás)
+    2 = Min-Raise (Legkisebb legális emelés)
+    3 = Raise 0.5x Pot
+    4 = Raise 0.75x Pot
+    5 = Raise 1.0x Pot
+    6 = Raise 1.5x Pot (Overbet)
+    7 = Raise 2.0x Pot (Deep Overbet)
+    8 = All-in (Teljes stack betolás)
+
+Hivatkozások:
+    - Specifikáció: Akciótér szekció (9 diszkrét akció)
+    - Action Masking: torch.where + torch.finfo(dtype).min (AMP-safe)
+    - Libratus/Pluribus bet sizing buckets
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from enum import IntEnum
+from typing import NamedTuple
+
+import torch
+
+logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Akció Enumeráció
+# =============================================================================
+
+class PokerAction(IntEnum):
+    """A diszkretizált akciótér 9 lehetséges lépésének enumerációja.
+
+    Minden akció egy egyértelmű indexet kap, amelyet a Softmax kimeneti
+    réteg valószínűségi eloszlásként ad vissza.
+    """
+
+    FOLD = 0
+    CHECK_CALL = 1
+    MIN_RAISE = 2
+    RAISE_HALF_POT = 3
+    RAISE_THREE_QUARTER_POT = 4
+    RAISE_FULL_POT = 5
+    RAISE_1_5X_POT = 6
+    RAISE_2X_POT = 7
+    ALL_IN = 8
+
+
+# Pot-relatív szorzók az emelési akciókhoz
+_RAISE_MULTIPLIERS: dict[PokerAction, float] = {
+    PokerAction.RAISE_HALF_POT: 0.50,
+    PokerAction.RAISE_THREE_QUARTER_POT: 0.75,
+    PokerAction.RAISE_FULL_POT: 1.00,
+    PokerAction.RAISE_1_5X_POT: 1.50,
+    PokerAction.RAISE_2X_POT: 2.00,
+}
+
+NUM_ACTIONS: int = 9
+"""Az akciótér teljes dimenziója."""
+
+ILLEGAL_ACTION_LOGIT: float = -1.0e8
+"""Az illegális akciók logitjaihoz hozzáadott extrém negatív szám.
+
+.. deprecated::
+    Használd a :func:`get_safe_mask_value` függvényt, amely dtype-aware
+    és biztonságos float16 (AMP) környezetben is.
+"""
+
+
+def get_safe_mask_value(dtype: torch.dtype = torch.float32) -> float:
+    """Visszaadja a dtype-specifikus biztonságos maszkolási értéket.
+
+    A ``torch.finfo(dtype).min`` értéket használja, amely garantáltan
+    a legkisebb véges szám az adott típusban, elkerülve a NaN propagációt
+    Automatic Mixed Precision (AMP) float16 környezetben.
+
+    +-----------+------------------+-----------------------------------+
+    | dtype     | finfo.min        | Megjegyzés                        |
+    +===========+==================+===================================+
+    | float32   | ~-3.4e38         | Bőven biztonságos                 |
+    +-----------+------------------+-----------------------------------+
+    | float16   | ~-65504          | -1e8 itt NaN-t okozna!            |
+    +-----------+------------------+-----------------------------------+
+    | bfloat16  | ~-3.39e38        | Biztonságos                       |
+    +-----------+------------------+-----------------------------------+
+
+    Args:
+        dtype: A logit tenzor adattípusa.
+
+    Returns:
+        A biztonságos minimális véges érték az adott dtype-hoz.
+    """
+    return torch.finfo(dtype).min
+
+
+# =============================================================================
+# Adatstruktúrák
+# =============================================================================
+
+class ResolvedAction(NamedTuple):
+    """Az akció-feloldás eredménye: a szemantikai akció és a pontos chip összeg.
+
+    Attributes:
+        action: A végrehajtandó akció típusa.
+        amount: A tétméret abszolút chip értékben. Fold és Check esetén 0.
+        description: Emberi olvashatóságú leírás a lépésről.
+    """
+
+    action: PokerAction
+    amount: float
+    description: str
+
+
+@dataclass(frozen=True)
+class GameContext:
+    """Az aktuális játékszituáció kontextusa az akció-feloldáshoz.
+
+    Attributes:
+        pot_size: Az aktuális pot mérete (abszolút chip).
+        my_stack: A saját zsetonállás (abszolút chip).
+        amount_to_call: A megadandó tét összege (chip).
+        min_raise_amount: A legkisebb legális emelési méret (chip).
+        big_blind: A nagyvak mérete (chip).
+    """
+
+    pot_size: float
+    my_stack: float
+    amount_to_call: float
+    min_raise_amount: float
+    big_blind: float
+
+    def __post_init__(self) -> None:
+        """Validálja a kontextus értékeit."""
+        if self.pot_size < 0:
+            raise ValueError(f"pot_size nem lehet negatív: {self.pot_size}")
+        if self.my_stack < 0:
+            raise ValueError(f"my_stack nem lehet negatív: {self.my_stack}")
+        if self.big_blind <= 0:
+            raise ValueError(f"big_blind pozitívnak kell lennie: {self.big_blind}")
+
+
+# =============================================================================
+# Fő ActionMapper Osztály
+# =============================================================================
+
+class ActionMapper:
+    """A hálózat diszkrét akció-indexeit konkrét póker lépésekre fordítja.
+
+    Ez az osztály felelős a hálózat kimeneti rétegén a Softmax által
+    generált valószínűségi eloszlás indexeinek szemantikai és matematikai
+    feloldásáért, valamint az illegális akciók szűréséért.
+
+    Az Action Masking mechanizmus biztosítja, hogy a hálózat soha ne
+    válasszon érvénytelen lépést, anélkül hogy a backward pass
+    összeomlana.
+
+    Example:
+        >>> mapper = ActionMapper()
+        >>> ctx = GameContext(pot_size=100, my_stack=500,
+        ...                  amount_to_call=50, min_raise_amount=100, big_blind=10)
+        >>> legal = mapper.get_legal_actions(ctx)
+        >>> masked_logits = mapper.apply_action_mask(logits, legal)
+        >>> action_idx = torch.argmax(masked_logits).item()
+        >>> resolved = mapper.resolve_action(PokerAction(action_idx), ctx)
+    """
+
+    def __init__(self) -> None:
+        """Inicializálja az ActionMapper-t."""
+        self._action_names: dict[PokerAction, str] = {
+            PokerAction.FOLD: "Fold",
+            PokerAction.CHECK_CALL: "Check/Call",
+            PokerAction.MIN_RAISE: "Min-Raise",
+            PokerAction.RAISE_HALF_POT: "Raise 0.5x Pot",
+            PokerAction.RAISE_THREE_QUARTER_POT: "Raise 0.75x Pot",
+            PokerAction.RAISE_FULL_POT: "Raise 1.0x Pot",
+            PokerAction.RAISE_2X_POT: "Raise 2.0x Pot",
+            PokerAction.RAISE_1_5X_POT: "Raise 1.5x Pot",
+            PokerAction.ALL_IN: "All-in",
+        }
+        logger.info(
+            "ActionMapper inicializálva: %d diszkrét akció, "
+            "illegális logit maszk=%.0e",
+            NUM_ACTIONS, ILLEGAL_ACTION_LOGIT,
+        )
+
+    # =========================================================================
+    # Akció Feloldás (Resolution)
+    # =========================================================================
+
+    def resolve_action(
+        self, action: PokerAction, context: GameContext
+    ) -> ResolvedAction:
+        """Egy diszkrét akció-indexet konkrét chip értékű póker akcióvá old fel.
+
+        A metódus figyelembe veszi a játékszituáció kontextusát (pot méret,
+        stack méret, minimális emelés) és kiszámítja a pontos tétméretet.
+
+        Ha az emelés összege meghaladja a játékos stackjét, automatikusan
+        All-in-né konvertálódik (stack capping).
+
+        Args:
+            action: A hálózat által választott akció (PokerAction enum).
+            context: Az aktuális játékszituáció.
+
+        Returns:
+            ResolvedAction nevesített tuple a végrehajtási részletekkel.
+        """
+        logger.debug(
+            "Akció feloldása: %s | pot=%.0f, stack=%.0f, call=%.0f",
+            action.name, context.pot_size, context.my_stack, context.amount_to_call,
+        )
+
+        if action == PokerAction.FOLD:
+            return ResolvedAction(
+                action=PokerAction.FOLD,
+                amount=0.0,
+                description="Fold — A játékos feladja a leosztást.",
+            )
+
+        if action == PokerAction.CHECK_CALL:
+            call_amount: float = min(context.amount_to_call, context.my_stack)
+            verb: str = "Check" if context.amount_to_call == 0 else "Call"
+            return ResolvedAction(
+                action=PokerAction.CHECK_CALL,
+                amount=call_amount,
+                description=f"{verb} — {call_amount:.0f} chip",
+            )
+
+        if action == PokerAction.ALL_IN:
+            return ResolvedAction(
+                action=PokerAction.ALL_IN,
+                amount=context.my_stack,
+                description=f"All-in — {context.my_stack:.0f} chip (teljes stack)",
+            )
+
+        # Emelési akciók: pot-relatív méret kiszámítása
+        if action == PokerAction.MIN_RAISE:
+            raise_amount = context.min_raise_amount
+        elif action in _RAISE_MULTIPLIERS:
+            multiplier: float = _RAISE_MULTIPLIERS[action]
+            raise_amount = context.pot_size * multiplier
+        else:
+            logger.error("Ismeretlen akció: %s. Fallback: Fold.", action)
+            return ResolvedAction(
+                action=PokerAction.FOLD, amount=0.0,
+                description="Ismeretlen akció → biztonsági Fold",
+            )
+
+        # Stack capping: ha az emelés meghaladja a stacket → All-in
+        if raise_amount >= context.my_stack:
+            logger.debug(
+                "Stack capping: kívánt emelés=%.0f >= stack=%.0f → All-in",
+                raise_amount, context.my_stack,
+            )
+            return ResolvedAction(
+                action=PokerAction.ALL_IN,
+                amount=context.my_stack,
+                description=(
+                    f"All-in (stack cap) — {context.my_stack:.0f} chip "
+                    f"(kívánt: {self._action_names.get(action, '?')})"
+                ),
+            )
+
+        # Minimum raise floor: az emelés nem lehet kisebb a minimálisnál
+        raise_amount = max(raise_amount, context.min_raise_amount)
+
+        action_name: str = self._action_names.get(action, f"Action-{action.value}")
+        return ResolvedAction(
+            action=action,
+            amount=raise_amount,
+            description=f"{action_name} — {raise_amount:.0f} chip",
+        )
+
+    # =========================================================================
+    # Legális Akciók és Maszkolás
+    # =========================================================================
+
+    def get_legal_actions(self, context: GameContext) -> list[PokerAction]:
+        """Meghatározza a jelenlegi játékszituációban legális akciók listáját.
+
+        Szabályok:
+            - Fold: Mindig legális (kivéve ha Check is lehetséges, de
+              stratégiailag a hálózat dönt)
+            - Check/Call: Mindig legális
+            - Emelések: Csak ha a stack elegendő a minimális emeléshez
+            - All-in: Mindig legális, ha van chip a stackben
+
+        Args:
+            context: Az aktuális játékszituáció.
+
+        Returns:
+            A legális PokerAction értékek listája.
+        """
+        legal: list[PokerAction] = []
+
+        # Fold és Check/Call mindig elérhetők
+        legal.append(PokerAction.FOLD)
+        legal.append(PokerAction.CHECK_CALL)
+
+        # Emelések: csak ha van elég chip a minimális emeléshez
+        remaining_after_call: float = context.my_stack - context.amount_to_call
+        if remaining_after_call > 0:
+            # Min-Raise
+            if remaining_after_call >= context.min_raise_amount:
+                legal.append(PokerAction.MIN_RAISE)
+
+            # Pot-relatív emelések
+            for action, multiplier in _RAISE_MULTIPLIERS.items():
+                target_raise: float = context.pot_size * multiplier
+                if remaining_after_call >= target_raise:
+                    legal.append(action)
+
+            # All-in: mindig legális ha van bármennyi chip
+            if context.my_stack > 0:
+                legal.append(PokerAction.ALL_IN)
+
+        logger.debug(
+            "Legális akciók: %d/%d — %s",
+            len(legal), NUM_ACTIONS,
+            [a.name for a in legal],
+        )
+        return legal
+
+    def get_action_mask_tensor(self, context: GameContext) -> torch.Tensor:
+        """Bináris akció maszkot generál torch.Tensor formátumban.
+
+        Az érvényes akció pozíciókon 1.0, az érvénytelen pozíciókon 0.0.
+
+        Args:
+            context: Az aktuális játékszituáció.
+
+        Returns:
+            (9,) alakú bináris torch.Tensor (float32).
+        """
+        legal_actions: list[PokerAction] = self.get_legal_actions(context)
+        mask: torch.Tensor = torch.zeros(NUM_ACTIONS, dtype=torch.float32)
+
+        for action in legal_actions:
+            mask[action.value] = 1.0
+
+        return mask
+
+    @staticmethod
+    def apply_action_mask(
+        logits: torch.Tensor,
+        action_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """A Softmax ELŐTT alkalmazza az akció maszkot a logit vektorra.
+
+        AMP-SAFE implementáció: ``torch.where`` + ``torch.finfo(dtype).min``
+        használatával, amely float16/bfloat16 környezetben is biztonságos.
+        A korábbi additív maszkolás (-1e8) float16-ban NaN-t okozna,
+        mivel a float16 min ~ -65504.
+
+        Args:
+            logits: A hálózat nyers kimeneti logitjai (9,) vagy (batch, 9).
+            action_mask: Bináris maszk (1.0 = legális, 0.0 = illegális).
+                         Azonos alakú a logits-szal.
+
+        Returns:
+            A maszkolt logit vektor, ugyanolyan alakban mint a bemenet.
+
+        Raises:
+            ValueError: Ha a logits és action_mask alakja nem egyezik.
+        """
+        if logits.shape != action_mask.shape:
+            raise ValueError(
+                f"A logits ({logits.shape}) és action_mask ({action_mask.shape}) "
+                f"alakja nem egyezik."
+            )
+
+        # AMP-safe: dtype-specifikus minimális véges érték
+        mask_value: float = get_safe_mask_value(logits.dtype)
+        masked_logits: torch.Tensor = torch.where(
+            action_mask.bool(), logits, torch.tensor(mask_value, dtype=logits.dtype)
+        )
+
+        if logger.isEnabledFor(logging.DEBUG):
+            num_legal: int = int(action_mask.sum().item()) if action_mask.dim() == 1 else -1
+            logger.debug(
+                "Akció maszkolás alkalmazva: %d legális akció, "
+                "logit tartomány: [%.2f, %.2f] → maszkolt: [%.2f, %.2f], "
+                "dtype=%s, mask_value=%.2e",
+                num_legal,
+                logits.min().item(), logits.max().item(),
+                masked_logits[action_mask.bool()].min().item()
+                if action_mask.any() else float("nan"),
+                masked_logits[action_mask.bool()].max().item()
+                if action_mask.any() else float("nan"),
+                logits.dtype, mask_value,
+            )
+
+        return masked_logits
+
+    # =========================================================================
+    # Segédmetódusok
+    # =========================================================================
+
+    def action_index_to_name(self, index: int) -> str:
+        """Akció indexet emberi olvashatóságú névvé alakít.
+
+        Args:
+            index: Akció index (0-8).
+
+        Returns:
+            Az akció neve szövegesen.
+        """
+        try:
+            action = PokerAction(index)
+            return self._action_names.get(action, f"Unknown-{index}")
+        except ValueError:
+            return f"Invalid-{index}"
+
+    @staticmethod
+    def sample_action(
+        masked_logits: torch.Tensor,
+        deterministic: bool = False,
+    ) -> tuple[int, float]:
+        """Mintavételez egy akciót a maszkolt logitokból.
+
+        Args:
+            masked_logits: A maszkolt logit vektor (9,).
+            deterministic: Ha True, a legmagasabb valószínűségű akciót választja
+                          (greedy). Ha False, sztochasztikus mintavétel.
+
+        Returns:
+            Tuple: (kiválasztott_akció_index, az akció log-valószínűsége).
+        """
+        probs: torch.Tensor = torch.softmax(masked_logits, dim=-1)
+        distribution = torch.distributions.Categorical(probs=probs)
+
+        if deterministic:
+            action_idx: int = int(torch.argmax(probs, dim=-1).item())
+        else:
+            action_tensor: torch.Tensor = distribution.sample()
+            action_idx = int(action_tensor.item())
+
+        log_prob: float = float(distribution.log_prob(torch.tensor(action_idx)).item())
+
+        logger.debug(
+            "Akció mintavételezés: index=%d (%s), log_prob=%.4f, deterministic=%s",
+            action_idx,
+            PokerAction(action_idx).name if 0 <= action_idx < NUM_ACTIONS else "?",
+            log_prob,
+            deterministic,
+        )
+
+        return action_idx, log_prob
