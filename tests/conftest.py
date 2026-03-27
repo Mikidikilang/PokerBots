@@ -244,8 +244,8 @@ def sample_config() -> dict[str, Any]:
 def sample_raw_state() -> dict[str, Any]:
     """Egy tipikus nyers jatekallapot a features.py teszteleshez."""
     return {
-        "hand": ["AS", "KH"],
-        "public_cards": ["TC", "JD", "QS"],
+        "hand": ["SA", "HK"],
+        "public_cards": ["CT", "DJ", "SQ"],
         "pot": 150.0,
         "my_chips": 1800.0,
         "opponent_chips": [2000.0, 1500.0, 1000.0, 800.0, 2200.0],
@@ -265,7 +265,7 @@ def sample_raw_state() -> dict[str, Any]:
 def sample_preflop_state() -> dict[str, Any]:
     """Pre-flop allapot (ures board)."""
     return {
-        "hand": ["AH", "AD"],
+        "hand": ["HA", "DA"],
         "public_cards": [],
         "pot": 15.0,
         "my_chips": 2000.0,

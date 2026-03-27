@@ -117,7 +117,7 @@ class TestObservationBuilder:
         builder = ObservationBuilder(ObservationConfig(num_players=6))
         expected = builder.get_observation_dim()
         raw = {
-            "hand": ["AS", "KH"], "public_cards": [], "pot": 100.0,
+            "hand": ["SA", "HK"], "public_cards": [], "pot": 100.0,
             "my_chips": 2000.0, "opponent_chips": [2000]*5, "big_blind": 10.0,
             "amount_to_call": 0.0, "min_raise": 20.0, "position": 3,
             "betting_history": [], "legal_actions": [0, 1],
@@ -127,7 +127,7 @@ class TestObservationBuilder:
         assert flat.shape[0] == expected
 
     def test_card_roundtrip(self) -> None:
-        for card in ["AS", "2C", "TH", "KD", "7S"]:
+        for card in ["SA", "C2", "HT", "DK", "S7"]:
             idx = ObservationBuilder.card_str_to_index(card)
             back = ObservationBuilder.index_to_card_str(idx)
             assert back == card, f"Roundtrip failed: {card} -> {idx} -> {back}"
@@ -263,28 +263,28 @@ class TestEquityCalculator:
 
     def test_preflop_hand_categories(self) -> None:
         calc = EquityCalculator()
-        assert calc.get_preflop_hand_category(["AS", "AH"]) == "premium"  # AA
-        assert calc.get_preflop_hand_category(["AS", "KS"]) == "premium"  # AKs
-        assert calc.get_preflop_hand_category(["JH", "JD"]) == "strong"   # JJ
-        assert calc.get_preflop_hand_category(["5S", "5H"]) == "playable" # 55
-        assert calc.get_preflop_hand_category(["7D", "2C"]) == "trash"    # 72o
+        assert calc.get_preflop_hand_category(["SA", "HA"]) == "premium"  # AA
+        assert calc.get_preflop_hand_category(["SA", "SK"]) == "premium"  # AKs
+        assert calc.get_preflop_hand_category(["HJ", "DJ"]) == "strong"   # JJ
+        assert calc.get_preflop_hand_category(["S5", "H5"]) == "playable" # 55
+        assert calc.get_preflop_hand_category(["D7", "C2"]) == "trash"    # 72o
 
     def test_equity_range(self) -> None:
         calc = EquityCalculator()
-        eq = calc.calculate_equity(["AS", "AH"], [], num_opponents=1, iterations=300)
+        eq = calc.calculate_equity(["SA", "HA"], [], num_opponents=1, iterations=300)
         assert 0.0 <= eq <= 1.0
 
     def test_aa_beats_random(self) -> None:
         """AA-nak magasabb equity-je kell legyen mint 50% HU."""
         calc = EquityCalculator()
-        eq = calc.calculate_equity(["AS", "AH"], [], num_opponents=1, iterations=500)
+        eq = calc.calculate_equity(["SA", "HA"], [], num_opponents=1, iterations=500)
         assert eq > 0.7  # AA ~85% HU
 
     def test_made_hand_high_equity(self) -> None:
         """Royal flush board-dal kozel 100% equity."""
         calc = EquityCalculator()
         eq = calc.calculate_equity(
-            ["AS", "KS"], ["TS", "JS", "QS"],
+            ["SA", "SK"], ["ST", "SJ", "SQ"],
             num_opponents=1, iterations=300,
         )
         assert eq > 0.9
@@ -292,21 +292,21 @@ class TestEquityCalculator:
     def test_invalid_hole_cards_count(self) -> None:
         calc = EquityCalculator()
         with pytest.raises(ValueError, match="Pontosan 2"):
-            calc.calculate_equity(["AS"], [])
+            calc.calculate_equity(["SA"], [])
 
     def test_too_many_community_cards(self) -> None:
         calc = EquityCalculator()
         with pytest.raises(ValueError, match="Legfeljebb 5"):
-            calc.calculate_equity(["AS", "KH"], ["2C"]*6)
+            calc.calculate_equity(["SA", "HK"], ["C2"]*6)
 
     def test_hand_strength_requires_board(self) -> None:
         calc = EquityCalculator()
         with pytest.raises(ValueError, match="egal"):
-            calc.evaluate_hand_strength(["AS", "KH"], ["2C", "3D"])
+            calc.evaluate_hand_strength(["SA", "HK"], ["C2", "D3"])
 
     def test_hand_strength_ordering(self) -> None:
         """Az erosebb keznek alacsonyabb (jobb) score-ja van."""
         calc = EquityCalculator()
-        pair_score = calc.evaluate_hand_strength(["AS", "AH"], ["2C", "7D", "9S"])
-        high_score = calc.evaluate_hand_strength(["KH", "QD"], ["2C", "7D", "9S"])
+        pair_score = calc.evaluate_hand_strength(["SA", "HA"], ["C2", "D7", "S9"])
+        high_score = calc.evaluate_hand_strength(["HK", "DQ"], ["C2", "D7", "S9"])
         assert pair_score < high_score  # Par erosebb mint high card

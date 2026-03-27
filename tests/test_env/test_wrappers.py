@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 from src.env.wrappers import RLCardWrapper, WrapperConfig, make_env
+from src.env.features import ObservationBuilder, ObservationConfig
 
 
 class TestRLCardWrapper:
@@ -78,35 +79,73 @@ class TestRLCardWrapper:
         assert "hand" in obs
 
     def test_wrapper_multiple_steps(self) -> None:
-        """Teszt: több lépés szekvenciájában."""
+        """Teszt: több lépés szekvenciájában (csak public API)."""
         config = WrapperConfig(num_players=6, big_blind=2)
         env = RLCardWrapper(config=config)
-        env.reset()
+        obs = env.reset()
         
         step_count = 0
-        for _ in range(10):
-            legal_actions = env._latest_obs.get("legal_actions", [0])
-            action = legal_actions[0]  # Fold
+        max_steps = 10
+        
+        # Iterate while hand is not over and step limit not reached
+        while not env.is_over() and step_count < max_steps:
+            # Use legal actions from the current observation
+            legal_actions = obs.get("legal_actions", [0])
+            action = legal_actions[0]  # Fold (always legal)
+            
             obs, reward = env.step(action)
             step_count += 1
-            
-            if env.is_over():
-                break
         
         # Legalább egy lépés történt
         assert step_count >= 1
 
     def test_observation_shape_consistency(self) -> None:
-        """Teszt: megfigyelés dimenziók konzisztensek."""
+        """Teszt: megfigyelés dimenziók konzisztensek a ℝ^52 vetülethez."""
         config = WrapperConfig(num_players=6, big_blind=2)
         env = RLCardWrapper(config=config)
         
-        obs = env.reset()
+        # Step 1: Get raw observation from wrapper
+        raw_obs = env.reset()
         
-        # Kártyák (52 bináris érték)
-        assert len(obs.get("hand", [])) == 52
-        assert len(obs.get("public_cards", [])) == 52
+        # Step 2: Verify raw observation structure (black-box API)
+        assert isinstance(raw_obs, dict)
+        assert "hand" in raw_obs
+        assert "public_cards" in raw_obs
+        assert "pot" in raw_obs
+        assert "my_chips" in raw_obs
+        assert "legal_actions" in raw_obs
         
-        # Pot és chipek (skalárok vagy listák)
-        assert isinstance(obs.get("pot"), (int, float))
-        assert isinstance(obs.get("my_chips"), (int, float))
+        # Step 3: Verify raw card lists are proper format (SuitRank)
+        hand = raw_obs.get("hand", [])
+        assert isinstance(hand, list)
+        assert len(hand) == 2, "hand must contain exactly 2 cards"
+        
+        # Verify each card is SuitRank format (Suit[0], Rank[1])
+        suits = {"S", "H", "D", "C"}
+        ranks = {"2", "3", "4", "5", "6", "7", "8", "9", "T", "J", "Q", "K", "A"}
+        for card in hand:
+            assert len(card) == 2, f"Card {card} must be 2 characters"
+            assert card[0] in suits, f"Card {card} has invalid suit"
+            assert card[1] in ranks, f"Card {card} has invalid rank"
+        
+        # Step 4: Encode the raw observation using ObservationBuilder
+        builder = ObservationBuilder(ObservationConfig(num_players=6))
+        encoded_obs = builder.build(raw_obs)
+        
+        # Step 5: Verify encoded tensor dimensions match ℝ^52 requirements
+        assert "hole_cards" in encoded_obs
+        assert encoded_obs["hole_cards"].shape == (52,), \
+            f"hole_cards must be 52-dimensional, got {encoded_obs['hole_cards'].shape}"
+        
+        assert "community_cards" in encoded_obs
+        assert encoded_obs["community_cards"].shape == (52,), \
+            f"community_cards must be 52-dimensional, got {encoded_obs['community_cards'].shape}"
+        
+        # Step 6: Verify multi-hot constraints (each dimension should be 0.0 or 1.0)
+        hole_cards_sum = float(encoded_obs["hole_cards"].sum().item())
+        assert hole_cards_sum == 2.0, \
+            f"hole_cards multi-hot sum should be 2.0 (2 cards), got {hole_cards_sum}"
+        
+        community_cards_sum = float(encoded_obs["community_cards"].sum().item())
+        assert 0.0 <= community_cards_sum <= 5.0, \
+            f"community_cards multi-hot sum should be 0-5, got {community_cards_sum}"
