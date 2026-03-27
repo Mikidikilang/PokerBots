@@ -21,7 +21,6 @@ dist/
 # =========================
 .env
 .venv
-env/
 venv/
 ENV/
 
