@@ -1,0 +1,54 @@
+# =========================
+# Python / Általános
+# =========================
+# Byte-compiled / optimalizált fájlok
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C kiterjesztések
+*.so
+
+# Disztribúció / Csomagolás
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# =========================
+# Virtuális környezetek
+# =========================
+.env
+.venv
+env/
+venv/
+ENV/
+
+# =========================
+# Tesztelés / Pytest
+# =========================
+.pytest_cache/
+.coverage
+htmlcov/
+
+# =========================
+# IDE / Szerkesztő / OS fájlok
+# =========================
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# =========================
+# Projekt specifikus (PokerBots ML/AI)
+# =========================
+# Modell Checkpointok (Ezek hatalmasak tudnak lenni, nem valók Gitbe!)
+checkpoints/
+*.pt
+*.pth
+*.safetensors
+
+# Log fájlok és tréning kimenetek
+logs/
+*.log

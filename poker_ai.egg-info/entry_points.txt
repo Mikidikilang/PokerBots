@@ -1,2 +1,0 @@
-[console_scripts]
-poker-train = scripts.train_local:main
