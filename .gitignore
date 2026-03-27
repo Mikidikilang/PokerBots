@@ -22,7 +22,6 @@ dist/
 .env
 .venv
 venv/
-ENV/
 
 # =========================
 # Tesztelés / Pytest
