@@ -86,17 +86,25 @@ class GracefulShutdownMonitor:
         start_time: A futtas indulasanak idopontja (monotonic).
     """
 
-    def __init__(self, config: ShutdownConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: ShutdownConfig | None = None,
+        start_time: float | None = None,
+    ) -> None:
         """Inicializalja a shutdown monitort.
 
         Args:
             config: Shutdown konfiguracio. Alapertelmezett ha None.
+            start_time: A futtas indulasanak idopontja (monotonic vagy wall-clock).
+                       Ha None, az aktualis ido hasznalodik.
         """
         self.config: ShutdownConfig = config or ShutdownConfig()
 
         # Idozites
-        if self.config.use_monotonic_clock:
-            self.start_time: float = time.monotonic()
+        if start_time is not None:
+            self.start_time: float = start_time
+        elif self.config.use_monotonic_clock:
+            self.start_time = time.monotonic()
         else:
             self.start_time = time.time()
 

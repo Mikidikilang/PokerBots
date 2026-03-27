@@ -163,6 +163,22 @@ class PokerEnvironment(Protocol):
 
 
 # ---------------------------------------------------------------------------
+# Collector Configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CollectorConfig:
+    """Configuration for the RolloutCollector."""
+    big_blind: float = 2.0
+
+    @classmethod
+    def from_dict(cls, cfg: dict[str, Any]) -> "CollectorConfig":
+        return cls(
+            big_blind=float(cfg.get("environment", {}).get("big_blind", 2.0))
+        )
+
+
+# ---------------------------------------------------------------------------
 # Internal per-hand accumulator
 # ---------------------------------------------------------------------------
 
@@ -330,9 +346,15 @@ class RolloutCollector:
             # ── Build tensor dict and query network ───────────────────────
             obs_tensor = self._build_obs_tensor(obs_raw)
 
+            # Phase 4-21: Always add batch dimension for unified network API
+            # The network expects all inputs to be batched (batch, ...)
+            obs_batched: dict[str, torch.Tensor] = {
+                k: v.unsqueeze(0) for k, v in obs_tensor.items()
+            }
+
             with torch.inference_mode():  # Phase 1.3: was torch.no_grad()
                 action, log_prob, entropy, value = (
-                    self.network.get_action_and_value(obs_tensor)
+                    self.network.get_action_and_value(obs_batched)
                 )
 
             action_int: int = int(action.reshape(-1)[0].item())
@@ -349,19 +371,16 @@ class RolloutCollector:
             self._total_steps += 1
 
             # ── Push transition to buffer ─────────────────────────────────
-            # obs_tensor stays on device; scalars move to float/long.
-            # Buffer stores tensors; trainer will batch them.
-            self.buffer.push(
-                obs=obs_tensor,
+            # Phase 3-16: Move obs_tensor to CPU before storage to prevent VRAM fragmentation.
+            # The tensor dict is preprocessed and ready for training.
+            obs_tensor_cpu = {k: v.cpu() for k, v in obs_tensor.items()}
+            self.buffer.add(
+                observation=obs_tensor_cpu,
                 action=action.detach(),
                 log_prob=log_prob.detach(),
                 value=value.detach(),
-                reward=torch.tensor(
-                    reward, dtype=torch.float32, device=self.device
-                ),
-                done=torch.tensor(
-                    float(done), dtype=torch.float32, device=self.device
-                ),
+                reward=float(reward),
+                done=done,
             )
 
             # ── Episode termination: build HandRecord ─────────────────────
@@ -386,8 +405,12 @@ class RolloutCollector:
         # via a dedicated method if the buffer supports it.
         if not done and self._current_obs is not None:
             last_obs_tensor = self._build_obs_tensor(self._current_obs)
+            # Phase 4-21: Add batch dimension for unified network API
+            last_obs_batched: dict[str, torch.Tensor] = {
+                k: v.unsqueeze(0) for k, v in last_obs_tensor.items()
+            }
             with torch.inference_mode():
-                last_value = self.network.get_value(last_obs_tensor)
+                last_value = self.network.get_value(last_obs_batched)
             if hasattr(self.buffer, "set_last_value"):
                 self.buffer.set_last_value(last_value.detach())
 
@@ -409,6 +432,14 @@ class RolloutCollector:
             n_steps, n_episodes, mean_reward, n_telemetry,
         )
         return stats
+
+    def get_total_steps(self) -> int:
+        """Return the total number of environment steps collected so far."""
+        return self._total_steps
+
+    def get_total_episodes(self) -> int:
+        """Return the total number of episodes (hands) completed so far."""
+        return self._hand_counter
 
     # =========================================================================
     # Telemetry Bridge — Bug F Fix

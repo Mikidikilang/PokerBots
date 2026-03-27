@@ -311,9 +311,32 @@ class PPOTrainer:
             - self.config.entropy_coef * entropy_loss
         )
 
+        # === Prevent NaN Weight Corruption (check BEFORE backward/step) ===
+        if not torch.isfinite(total_loss):
+            logger.error(
+                "KRITIKUS: NaN/Inf loss detektalva MEGELOZOEN! "
+                "pl=%.4f, vl=%.4f, H=%.4f, total=%.4f",
+                policy_loss.item(), value_loss.item(),
+                entropy_loss.item(), total_loss.item(),
+            )
+            raise FloatingPointError(
+                f"NaN/Inf loss detected: policy={policy_loss.item()}, "
+                f"value={value_loss.item()}, entropy={entropy_loss.item()}, "
+                f"total={total_loss.item()} — aborting optimizer step"
+            )
+
         # === Gradiens Frissites ===
         self.optimizer.zero_grad()
         total_loss.backward()
+
+        # Phase 4-22: Gradient health checks — per-parameter NaN detection
+        for name, param in self.network.named_parameters():
+            if param.grad is not None and not torch.isfinite(param.grad).all():
+                nan_count = (~torch.isfinite(param.grad)).sum().item()
+                logger.warning(
+                    "Gradient NaN detected in %s: %d/%d elements are NaN/Inf",
+                    name, nan_count, param.grad.numel()
+                )
 
         # Gradiens norma szamitas es vagas
         grad_norm: float = float(
@@ -325,20 +348,12 @@ class PPOTrainer:
         self.optimizer.step()
 
         # === Diagnosztika ===
-        with torch.no_grad():
+        # Phase 4-23: Use strict inference_mode for better safety and performance
+        with torch.inference_mode():
             approx_kl: float = float(((ratio - 1) - log_ratio).mean().item())
             clip_fraction: float = float(
                 ((ratio - 1.0).abs() > self.config.clip_epsilon)
                 .float().mean().item()
-            )
-
-        # NaN/Inf ellenorzes
-        if not torch.isfinite(total_loss):
-            logger.error(
-                "KRITIKUS: NaN/Inf loss detektalva! "
-                "pl=%.4f, vl=%.4f, H=%.4f, total=%.4f",
-                policy_loss.item(), value_loss.item(),
-                entropy_loss.item(), total_loss.item(),
             )
 
         return {

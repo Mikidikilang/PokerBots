@@ -52,3 +52,5 @@ checkpoints/
 # Log fájlok és tréning kimenetek
 logs/
 *.log
+
+config_test.yaml

@@ -314,6 +314,8 @@ class CurriculumManager:
             opponents: list[str] = self.get_current_opponents()
             return opponents[0] if opponents else "random"
 
+        # Cache total_selections BEFORE incrementing
+        total_selections_cached: int = self._total_selections
         self._total_selections += 1
         c: float = self.mab_config.ucb_exploration_factor
 
@@ -321,7 +323,7 @@ class CurriculumManager:
         best_score: float = -float("inf")
 
         for arm in self._ucb_arms.values():
-            score: float = arm.ucb_score(self._total_selections, c)
+            score: float = arm.ucb_score(total_selections_cached, c)
             if score > best_score:
                 best_score = score
                 best_name = arm.name

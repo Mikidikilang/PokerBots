@@ -392,8 +392,10 @@ class OpponentPool:
         for snap in self.snapshots:
             if snap.snapshot_id == snapshot_id:
                 try:
+                    # Phase 3-18: Use weights_only=True for secure deserialization.
+                    # Snapshots contain only network state_dicts (weights), safe to load.
                     state_dict: dict[str, Any] = torch.load(
-                        snap.filepath, map_location="cpu", weights_only=False
+                        snap.filepath, map_location="cpu", weights_only=True
                     )
                     snap.selection_count += 1
                     logger.debug("Snapshot betoltve: %s", snapshot_id)

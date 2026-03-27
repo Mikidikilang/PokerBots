@@ -118,6 +118,12 @@ class RolloutBuffer:
         self._advantages: torch.Tensor | None = None
         self._returns: torch.Tensor | None = None
 
+        # Phase 4-20: Pre-consolidated batching tensors (allocated in compute_gae)
+        self._obs_tensors: dict[str, torch.Tensor] = {}
+        self._actions_tensor: torch.Tensor | None = None
+        self._log_probs_tensor: torch.Tensor | None = None
+        self._values_tensor: torch.Tensor | None = None
+
         logger.info(
             "RolloutBuffer inicializalva: size=%d, gamma=%.3f, "
             "gae_lambda=%.3f, mini_batches=%d",
@@ -225,6 +231,45 @@ class RolloutBuffer:
             float(self._returns.mean().item()),
         )
 
+        # Phase 4-20: Pre-allocate consolidated batching tensors (O(N) instead of O(N²))
+        self._consolidate_tensors()
+
+    def _consolidate_tensors(self) -> None:
+        """Pre-allocate consolidated tensors for O(1) mini-batch building.
+        
+        Stacks all observations, actions, log_probs, and values into single
+        tensors. This eliminates per-batch tensor construction overhead,
+        reducing get_mini_batches complexity from O(N²) to O(N).
+        """
+        num_steps: int = len(self._rewards)
+        
+        # Consolidate observations: create dict of stacked tensors
+        if self._observations:
+            first_obs = self._observations[0]
+            self._obs_tensors: dict[str, torch.Tensor] = {}
+            for key in first_obs:
+                self._obs_tensors[key] = torch.stack(
+                    [self._observations[i][key] for i in range(num_steps)],
+                    dim=0
+                )
+        else:
+            self._obs_tensors = {}
+        
+        # Stack all actions, log_probs, values
+        self._actions_tensor: torch.Tensor = torch.stack(self._actions, dim=0)
+        self._log_probs_tensor: torch.Tensor = torch.stack(self._log_probs, dim=0)
+        self._values_tensor: torch.Tensor = torch.stack(
+            [v if isinstance(v, torch.Tensor) else torch.tensor(float(v))
+             for v in self._values], dim=0
+        )
+        
+        logger.debug(
+            "Consolidated batching tensors allocated: "
+            "%d steps, obs keys=%d, actions shape=%s",
+            num_steps, len(self._obs_tensors),
+            tuple(self._actions_tensor.shape),
+        )
+
     # =========================================================================
     # Mini-Batch Mintavetelezes
     # =========================================================================
@@ -237,6 +282,8 @@ class RolloutBuffer:
         ad vissza a kovetkezo kulcsokkal:
             observations, actions, old_log_probs, advantages, returns, old_values
 
+        Phase 4-20: Uses pre-consolidated tensors for O(1) per-batch indexing.
+
         Yields:
             Dict[str, Any] mini-batch szotar.
 
@@ -247,6 +294,12 @@ class RolloutBuffer:
             raise RuntimeError(
                 "A compute_gae() meg nem lett meghivva. "
                 "Hivd meg a get_mini_batches() elott."
+            )
+
+        if not hasattr(self, '_obs_tensors'):
+            raise RuntimeError(
+                "Consolidated tensors not allocated. "
+                "This should not happen if compute_gae() was called."
             )
 
         num_steps: int = len(self._rewards)
@@ -267,29 +320,18 @@ class RolloutBuffer:
             end: int = min(start + batch_size, num_steps)
             batch_indices: np.ndarray = indices[start:end]
 
-            # Observation dict osszegyujtese
+            # Phase 4-20: Direct indexing from pre-consolidated tensors (O(1))
             batch_obs: dict[str, torch.Tensor] = {}
-            if self._observations:
-                first_obs = self._observations[0]
-                for key in first_obs:
-                    tensors = [self._observations[i][key] for i in batch_indices]
-                    batch_obs[key] = torch.stack(tensors, dim=0)
+            for key, obs_tensor in self._obs_tensors.items():
+                batch_obs[key] = obs_tensor[batch_indices]
 
             batch: dict[str, Any] = {
                 "observations": batch_obs,
-                "actions": torch.stack(
-                    [self._actions[i] for i in batch_indices], dim=0
-                ),
-                "old_log_probs": torch.stack(
-                    [self._log_probs[i] for i in batch_indices], dim=0
-                ),
+                "actions": self._actions_tensor[batch_indices],
+                "old_log_probs": self._log_probs_tensor[batch_indices],
                 "advantages": self._advantages[batch_indices],
                 "returns": self._returns[batch_indices],
-                "old_values": torch.tensor(
-                    [self._values[i].item() if isinstance(self._values[i], torch.Tensor)
-                     else float(self._values[i]) for i in batch_indices],
-                    dtype=torch.float32,
-                ),
+                "old_values": self._values_tensor[batch_indices],
             }
 
             logger.debug(
@@ -366,7 +408,9 @@ class RolloutBuffer:
         Args:
             filepath: Forras utvonal (.pt fajl).
         """
-        state: dict[str, Any] = torch.load(filepath, weights_only=False)
+        # Phase 3-18: Use weights_only=True for secure deserialization.
+        # Buffer state contains only tensors and scalars, safe to load.
+        state: dict[str, Any] = torch.load(filepath, weights_only=True)
         self._rewards = state["rewards"]
         self._dones = state["dones"]
         self.pos = state["pos"]

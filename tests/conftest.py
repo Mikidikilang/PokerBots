@@ -161,6 +161,17 @@ except ImportError:
     torch_mock.get_rng_state = lambda: FakeTensor(np.array([42]))
     torch_mock.set_rng_state = lambda s: None
     torch_mock.manual_seed = lambda s: None
+    
+    # Phase 3-19: Add torch.where and torch.finfo mocks for gradient health checks
+    torch_mock.where = lambda condition, x, y: FakeTensor(np.where(condition._data if hasattr(condition, '_data') else condition, x._data if hasattr(x, '_data') else x, y._data if hasattr(y, '_data') else y))
+    
+    class _FakeFinfo:
+        """Mock for torch.finfo to provide dtype properties."""
+        def __init__(self, dtype: Any) -> None:
+            self.max = 3.4028235e38  # float32 max
+            self.min = -3.4028235e38  # float32 min
+            self.tiny = 1.1754944e-38  # float32 tiny
+    torch_mock.finfo = _FakeFinfo
 
     class _FakeGenerator:
         _state = FakeTensor(np.array([0]))

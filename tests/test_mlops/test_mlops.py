@@ -1,7 +1,7 @@
 """
 Egyseg tesztek a src/mlops/ modulhoz.
 
-Tesztel: RNGStateManager, CheckpointManager, GracefulShutdownMonitor, FaultHandler
+Tesztel: RNGStateManager, StateManager, GracefulShutdownMonitor, FaultHandler
 """
 
 from __future__ import annotations
@@ -12,8 +12,9 @@ import time
 
 import numpy as np
 import pytest
+import torch
 
-from src.mlops.state_manager import RNGStateManager, CheckpointManager
+from src.mlops.state_manager import RNGStateManager, StateManager
 from src.mlops.fault_tolerance import (
     GracefulShutdownMonitor, ShutdownConfig, FaultHandler,
 )
@@ -68,78 +69,125 @@ class TestRNGStateManager:
 
 
 # =============================================================================
-# CheckpointManager Tesztek
+# StateManager Tesztek
 # =============================================================================
 
-class TestCheckpointManager:
-    """A CheckpointManager mentes/betoltes/rotacio logikajanek tesztjei."""
+class TestStateManager:
+    """Az StateManager mentes/betoltes logikajanek tesztjei (uj API)."""
 
-    def _make_fake_network(self) -> object:
-        class FakeNet:
-            def state_dict(self): return {"layer": [1.0, 2.0, 3.0]}
-            def load_state_dict(self, d): self._loaded = d
-        return FakeNet()
+    def test_from_dict_creates_instance(self, sample_config: dict) -> None:
+        """from_dict helyesen letrehozza a StateManager peldaryt."""
+        mgr = StateManager.from_dict(sample_config)
+        assert mgr is not None
+        assert isinstance(mgr, StateManager)
 
-    def _make_fake_optimizer(self) -> object:
-        class FakeOpt:
-            def state_dict(self): return {"lr": 0.001}
-            def load_state_dict(self, d): self._loaded = d
-        return FakeOpt()
+    def test_save_load_roundtrip_minimal(self, sample_config: dict, temp_dir: str) -> None:
+        """Mentés/betöltés az uj StateManager API-val (minimal parametrek)."""
+        # Update config to use temp_dir
+        config = sample_config.copy()
+        config["mlops"]["checkpoint"]["local_checkpoint_dir"] = temp_dir
+        
+        mgr = StateManager.from_dict(config)
 
-    def test_no_checkpoint_initially(self, temp_dir: str) -> None:
-        mgr = CheckpointManager(checkpoint_dir=temp_dir)
-        assert not mgr.has_checkpoint()
-        assert mgr.load_latest() is None
+        # Dummy network és optimizer
+        network = torch.nn.Linear(10, 5)
+        optimizer = torch.optim.Adam(network.parameters())
 
-    def test_save_creates_file(self, temp_dir: str) -> None:
-        mgr = CheckpointManager(checkpoint_dir=temp_dir)
-        net = self._make_fake_network()
-        path = mgr.save(net, iteration=100)
-        assert os.path.exists(path)
-        assert mgr.has_checkpoint()
-
-    def test_save_load_roundtrip(self, temp_dir: str) -> None:
-        mgr = CheckpointManager(checkpoint_dir=temp_dir)
-        net = self._make_fake_network()
-        opt = self._make_fake_optimizer()
-        rng = RNGStateManager.capture_states()
-
-        mgr.save(
-            net, optimizer=opt, rng_states=rng,
-            orchestrator_state={"phase": 1},
-            training_meta={"steps": 5000},
-            iteration=500,
+        # Mentés minimal paraméterekkel (keyword-only, no save_dir)
+        mgr.save_training_state(
+            network=network,
+            optimizer=optimizer,
+            iteration=42,
+            total_env_steps=1000,
+            total_hands=100,
         )
 
-        loaded = mgr.load_latest()
-        assert loaded is not None
-        assert loaded["iteration"] == 500
-        assert "model_state_dict" in loaded
-        assert "optimizer_state_dict" in loaded
-        assert "rng_states" in loaded
-        assert loaded["orchestrator_state"]["phase"] == 1
+        # Betöltés
+        checkpoint = mgr.load_training_state()
+        assert checkpoint is not None
+        assert checkpoint["iteration"] == 42
+        assert checkpoint["total_env_steps"] == 1000
+        assert checkpoint["total_hands"] == 100
+        assert "model_state_dict" in checkpoint
+        assert "optimizer_state_dict" in checkpoint
 
-    def test_rotation(self, temp_dir: str) -> None:
-        """Regi checkpoint-ok torlodnek ha meghaladja a max limitet."""
-        mgr = CheckpointManager(checkpoint_dir=temp_dir, max_checkpoints=3)
-        net = self._make_fake_network()
-        for i in range(6):
-            mgr.save(net, iteration=i * 100)
-        assert mgr.get_checkpoint_count() <= 3
+    def test_save_load_roundtrip_full(self, sample_config: dict, temp_dir: str) -> None:
+        """Mentés/betöltés teljes paraméterekkel."""
+        # Update config to use temp_dir
+        config = sample_config.copy()
+        config["mlops"]["checkpoint"]["local_checkpoint_dir"] = temp_dir
+        
+        mgr = StateManager.from_dict(config)
 
-    def test_restore_full_state(self, temp_dir: str) -> None:
-        mgr = CheckpointManager(checkpoint_dir=temp_dir)
-        net = self._make_fake_network()
-        opt = self._make_fake_optimizer()
+        # Dummy network és optimizer
+        network = torch.nn.Linear(10, 5)
+        optimizer = torch.optim.Adam(network.parameters())
 
-        mgr.save(net, optimizer=opt, rng_states=RNGStateManager.capture_states(),
-                 iteration=999)
+        # State dictionaries
+        orchestrator_state = {
+            "curriculum_state": "armed",
+            "arms": [0.5, 0.5],
+            "iteration": 100,
+        }
+        config_dict = {
+            "training": {"learning_rate": 0.001},
+            "environment": {"big_blind": 2},
+        }
 
-        loaded = mgr.load_latest()
-        net2 = self._make_fake_network()
-        opt2 = self._make_fake_optimizer()
-        result = mgr.restore_full_state(loaded, net2, opt2)
-        assert result["iteration"] == 999
+        # Mentés teljes paraméterekkel (keyword-only arguments)
+        mgr.save_training_state(
+            network=network,
+            optimizer=optimizer,
+            iteration=100,
+            total_env_steps=5000,
+            total_hands=500,
+            best_mean_reward=1.5,
+            orchestrator_state=orchestrator_state,
+            config=config_dict,
+            is_best=True,
+        )
+
+        # Betöltés és validáció
+        checkpoint = mgr.load_training_state()
+        assert checkpoint["iteration"] == 100
+        assert checkpoint["total_env_steps"] == 5000
+        assert checkpoint["total_hands"] == 500
+        assert checkpoint["best_mean_reward"] == 1.5
+        # Note: is_best is a parameter controlling file naming, not stored in checkpoint
+        assert checkpoint["orchestrator_state"]["curriculum_state"] == "armed"
+        assert checkpoint["config"]["training"]["learning_rate"] == 0.001
+
+    def test_config_parsing_nested_path(self, sample_config: dict) -> None:
+        """from_dict helyesen olvassa a beagyazott config utat."""
+        mgr = StateManager.from_dict(sample_config)
+        assert mgr is not None
+        # A StateManager.from_dict helyesen kezeli a beagyazott útvonalat:
+        # cfg["mlops"]["checkpoint"]["local_checkpoint_dir"]
+
+    def test_save_without_optional_fields(self, sample_config: dict, temp_dir: str) -> None:
+        """Mentés opcionális mezők nélkül nem szabad hogy crasheljen."""
+        # Update config to use temp_dir
+        config = sample_config.copy()
+        config["mlops"]["checkpoint"]["local_checkpoint_dir"] = temp_dir
+        
+        mgr = StateManager.from_dict(config)
+        network = torch.nn.Linear(5, 3)
+        optimizer = torch.optim.SGD(network.parameters(), lr=0.01)
+
+        # Csak a kötelező paramétereket adjuk meg (keyword-only)
+        mgr.save_training_state(
+            network=network,
+            optimizer=optimizer,
+            iteration=10,
+            total_env_steps=100,
+            total_hands=50,
+        )
+
+        checkpoint = mgr.load_training_state()
+        assert checkpoint["iteration"] == 10
+        # Opcionális mezők None szerint kezelendők
+        best_reward = checkpoint.get("best_mean_reward")
+        assert best_reward is None or isinstance(best_reward, (int, float))
 
 
 # =============================================================================

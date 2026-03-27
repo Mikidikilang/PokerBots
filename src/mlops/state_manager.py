@@ -331,12 +331,13 @@ class CheckpointManager:
         logger.info("Loading checkpoint from '%s' (map_location=%s)", filepath, map_location)
 
         try:
-            # weights_only=False is required for full training state dicts
-            # (optimizers, schedulers, custom objects).
+            # Phase 3-18: Use weights_only=True for secure deserialization.
+            # This prevents arbitrary code execution during unpickling.
+            # Requires PyTorch 2.6+ for full optimizer state support.
             checkpoint: dict[str, Any] = torch.load(
                 str(filepath),
                 map_location=map_location,
-                weights_only=False,
+                weights_only=True,
             )
         except (RuntimeError, EOFError, Exception) as exc:
             raise RuntimeError(
@@ -602,8 +603,8 @@ class StateManager:
     def from_dict(cls, cfg: dict[str, Any]) -> StateManager:
         """Construct from the full ``config.yaml`` dict.
 
-        Reads ``cfg["mlops"]["checkpoint_dir"]`` and
-        ``cfg["mlops"]["max_checkpoints"]``.
+        Reads ``cfg["mlops"]["checkpoint"]["local_checkpoint_dir"]`` and
+        ``cfg["mlops"]["checkpoint"]["max_checkpoints"]``.
 
         Args:
             cfg: Full YAML configuration dictionary.
@@ -612,9 +613,10 @@ class StateManager:
             Configured ``StateManager`` instance.
         """
         mlops_cfg = cfg.get("mlops", {})
+        checkpoint_cfg = mlops_cfg.get("checkpoint", {})
         return cls(
-            checkpoint_dir=mlops_cfg.get("checkpoint_dir", "checkpoints"),
-            max_to_keep=int(mlops_cfg.get("max_checkpoints", 5)),
+            checkpoint_dir=checkpoint_cfg.get("local_checkpoint_dir", "checkpoints"),
+            max_to_keep=int(checkpoint_cfg.get("max_checkpoints", 5)),
         )
 
     # =========================================================================

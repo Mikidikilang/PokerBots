@@ -640,15 +640,18 @@ class PokerActorCritic(nn.Module):
             3. Actor:     logitok + Action Masking (AMP-safe) + Softmax -> Categorical
             4. Critic:    trunk -> skaláris V(s)
 
+        Phase 4-21: Unified forward API always expects and returns batched tensors.
+        The collector always provides batched inputs (with batch dimension).
+
         Args:
             observation: Dict[str, Tensor] az ObservationBuilder-ből.
-                Kötelező kulcsok:
-                    "hole_cards"       (52,)   vagy (batch, 52)
-                    "community_cards"  (52,)   vagy (batch, 52)
-                    "env_metrics"      (N,)    vagy (batch, N)
-                    "position"         (P,)    vagy (batch, P)
-                    "betting_history"  (18, 9) vagy (batch, 18, 9)
-                    "action_mask"      (9,)    vagy (batch, 9)
+                Kötelező kulcsok: all (batch, ...):
+                    "hole_cards"       (batch, 52)
+                    "community_cards"  (batch, 52)
+                    "env_metrics"      (batch, N)
+                    "position"         (batch, P)
+                    "betting_history"  (batch, 18, 9)
+                    "action_mask"      (batch, 9)
 
         Returns:
             Tuple (Categorical eloszlás, (batch, 1) állapotérték tenzor).
@@ -659,16 +662,6 @@ class PokerActorCritic(nn.Module):
         position:        torch.Tensor = observation["position"]
         betting_history: torch.Tensor = observation["betting_history"]
         action_mask:     torch.Tensor = observation["action_mask"]
-
-        # Automatikus batch dim hozzáadása (egyedi megfigyelés esetén)
-        is_single: bool = hole_cards.dim() == 1
-        if is_single:
-            hole_cards      = hole_cards.unsqueeze(0)
-            community_cards = community_cards.unsqueeze(0)
-            env_metrics     = env_metrics.unsqueeze(0)
-            position        = position.unsqueeze(0)
-            betting_history = betting_history.unsqueeze(0)
-            action_mask     = action_mask.unsqueeze(0)
 
         batch_size: int = hole_cards.shape[0]
         logger.debug("Forward: batch=%d", batch_size)
@@ -712,15 +705,12 @@ class PokerActorCritic(nn.Module):
             )
 
         # Numerikusan stabil Softmax -> valószínűség eloszlás
-        action_probs: torch.Tensor = torch.softmax(masked_logits, dim=-1)
-        action_probs = action_probs.clamp(min=1e-8)
-        action_probs = action_probs / action_probs.sum(dim=-1, keepdim=True)
-        action_dist: Categorical = Categorical(probs=action_probs)
+        # Pass masked_logits directly to Categorical; let PyTorch handle
+        # the near-negative-infinity values numerically safely with log_softmax
+        action_dist: Categorical = Categorical(logits=masked_logits)
 
         # 4. Critic
         value: torch.Tensor = self.critic_head(fused)
-        if is_single:
-            value = value.squeeze(0)
 
         logger.debug(
             "Forward kész: logit_range=[%.3f, %.3f], val_mean=%.4f",
@@ -843,7 +833,8 @@ class PokerActorCritic(nn.Module):
         Returns:
             Tuple: (action_index, log_probability, state_value).
         """
-        with torch.no_grad():
+        # Phase 4-23: Use strict inference_mode for better safety and performance
+        with torch.inference_mode():
             action_dist, value = self.forward(observation)
             if deterministic:
                 action: torch.Tensor = torch.argmax(

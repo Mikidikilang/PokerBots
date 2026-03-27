@@ -162,6 +162,7 @@ def build_training_pipeline(
     device_override: str | None = None,
     resume: bool = False,
     checkpoint_path: str | None = None,
+    start_time: float | None = None,
 ) -> dict[str, Any]:
     """Osszeallitja a teljes training pipeline-t a konfig alapjan.
 
@@ -178,6 +179,8 @@ def build_training_pipeline(
         device_override: Device feluliras ("cpu", "cuda").
         resume: True ha korabbi checkpoint-bol kell folytatni.
         checkpoint_path: Specifikus checkpoint eleresi ut (opcionalis).
+        start_time: A futtas indulasanak idopontja (monotonic vagy wall-clock).
+                   Ha None, az aktualis ido hasznalodik (GracefulShutdownMonitor-ban).
 
     Returns:
         Dict a pipeline komponenseivel es a TrainingRunner-rel.
@@ -215,15 +218,9 @@ def build_training_pipeline(
     param_counts = network.get_param_count()
     logger.info("PokerActorCritic: %s params", f"{param_counts['total']:,}")
 
-    # --- Training Components ---
-    from src.training.buffer import RolloutBuffer, RolloutBufferConfig
-    from src.training.collector import RolloutCollector, CollectorConfig
-    from src.training.trainer import PPOTrainer, TrainerConfig
-
-    buffer = RolloutBuffer(RolloutBufferConfig.from_dict(cfg))
-    trainer = PPOTrainer(TrainerConfig.from_dict(cfg), network, device)
-    collector_cfg = CollectorConfig.from_dict(cfg)
-    collector = RolloutCollector(collector_cfg, env, obs_builder, network, buffer, device)
+    # --- Training Components Config (instantiated by runner) ---
+    from src.training.buffer import RolloutBufferConfig
+    from src.training.trainer import TrainerConfig
 
     # --- State Manager ---
     from src.mlops.state_manager import StateManager
@@ -264,14 +261,16 @@ def build_training_pipeline(
         enable_hot_reload=True,
     )
     orchestrator = AutoAdaptiveOrchestrator.get_instance(orch_config, cfg)
-    orchestrator.set_trainer_reference(trainer)
 
     if orchestrator_state:
         orchestrator.load_state(orchestrator_state)
 
     # --- Graceful Shutdown ---
     from src.mlops.fault_tolerance import GracefulShutdownMonitor, ShutdownConfig
-    shutdown_monitor = GracefulShutdownMonitor(ShutdownConfig.from_dict(cfg))
+    shutdown_monitor = GracefulShutdownMonitor(
+        ShutdownConfig.from_dict(cfg),
+        start_time=start_time,
+    )
 
     # --- HF Sync (opcionalis) ---
     from src.mlops.hf_sync import AsyncModelUploader, configure_headless_auth
@@ -308,9 +307,9 @@ def build_training_pipeline(
         rng_states = RNGStateManager.capture_states(dl_generator)
         state_manager.save_training_state(
             network=net,
-            optimizer=trainer.optimizer,
+            optimizer=runner.trainer.optimizer,
             iteration=iteration,
-            total_env_steps=collector.get_total_steps(),
+            total_env_steps=runner.collector.get_total_steps(),
             total_hands=0,  # TODO: track total hands from orchestrator
             best_mean_reward=-float("inf"),  # TODO: track from orchestrator
             orchestrator_state=orchestrator.get_state(),
@@ -331,17 +330,19 @@ def build_training_pipeline(
         network=network,
         trainer_config=TrainerConfig.from_dict(cfg),
         buffer_config=RolloutBufferConfig.from_dict(cfg),
-        collector_config=collector_cfg,
+        yaml_config=cfg,
         on_iteration_end=on_iteration_end,
         on_checkpoint=on_checkpoint,
         checkpoint_dir=ckpt_cfg.get("local_checkpoint_dir", "checkpoints"),
     )
     runner.iteration = start_iteration
+    
+    # Set trainer reference after runner is created
+    orchestrator.set_trainer_reference(runner.trainer)
 
     return {
         "runner": runner,
         "network": network,
-        "trainer": trainer,
         "orchestrator": orchestrator,
         "state_manager": state_manager,
         "shutdown_monitor": shutdown_monitor,

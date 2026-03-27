@@ -30,7 +30,7 @@ from typing import Any, Callable
 import torch
 
 from src.training.buffer import RolloutBuffer, RolloutBufferConfig
-from src.training.collector import RolloutCollector, CollectorConfig
+from src.training.collector import RolloutCollector
 from src.training.trainer import PPOTrainer, TrainerConfig
 
 logger = logging.getLogger(__name__)
@@ -114,7 +114,7 @@ class TrainingRunner:
         network: Any,
         trainer_config: TrainerConfig | None = None,
         buffer_config: RolloutBufferConfig | None = None,
-        collector_config: CollectorConfig | None = None,
+        yaml_config: dict[str, Any] | None = None,
         on_iteration_end: Callable[[int, dict[str, float]], None] | None = None,
         on_eval_step: Callable[[int, Any], dict[str, float] | None] | None = None,
         on_checkpoint: Callable[[int, Any], None] | None = None,
@@ -129,7 +129,7 @@ class TrainingRunner:
             network: ActorCriticNetwork peldany.
             trainer_config: PPO trainer konfiguracio.
             buffer_config: Rollout buffer konfiguracio.
-            collector_config: Collector konfiguracio.
+            yaml_config: Raw YAML configuration dictionary.
             on_iteration_end: Callback minden iteracio vegen.
                 Parameterei: (iteracio_szam, osszesitett_statisztikak).
                 Az Orchestrator telemetria feldolgozasa ide csatlakozik.
@@ -156,8 +156,13 @@ class TrainingRunner:
             network, self.device,
         )
         self.collector: RolloutCollector = RolloutCollector(
-            collector_config or CollectorConfig(),
-            env, obs_builder, network, self.buffer, self.device,
+            network=network,
+            env=env,
+            obs_builder=obs_builder,
+            buffer=self.buffer,
+            config=yaml_config or {},
+            orchestrator=None,
+            device=self.device,
         )
 
         # Callback-ek
@@ -254,12 +259,19 @@ class TrainingRunner:
 
         except KeyboardInterrupt:
             logger.warning("KeyboardInterrupt! Graceful shutdown...")
+        except FloatingPointError as exc:
+            # NaN/Inf detected — weights are corrupted, skip emergency save
+            logger.critical(
+                "FLOATINGPOINTERROR (Iter #%d): %s — Weights are corrupted, emergency save SKIPPED",
+                self.iteration, exc, exc_info=True,
+            )
+            raise
         except Exception as exc:
             logger.error(
                 "KRITIKUS HIBA az iteracioban #%d: %s",
                 self.iteration, exc, exc_info=True,
             )
-            # Mentsi kiserlet hiba eseten is
+            # Mentsi kiserlet hiba eseten is (except NaN — already handled above)
             self._save_checkpoint(emergency=True)
             raise
         finally:
@@ -316,13 +328,32 @@ class TrainingRunner:
         """
         # 1. Adatgyujtes — matematikai hibak itt is elofordulhatnak
         try:
-            collect_stats: dict[str, float] = self.collector.collect_rollout()
+            collect_stats = self.collector.collect_rollout(n_steps=self.buffer.config.buffer_size)
         except (RuntimeError, ValueError) as exc:
             logger.error(
                 "MATEMATIKAI HIBA az adatgyujtesben (iter #%d): %s",
                 self.iteration, exc,
             )
             raise  # Nem recoverable — dimenzio/allapot hiba
+
+        # 1b. GAE Szamitasa — bootstrap last_value szukseg a returnshez
+        try:
+            if self.collector._current_obs is not None:
+                from src.env.features import ObservationBuilder
+                obs_tensor = self.collector._build_obs_tensor(self.collector._current_obs)
+                with torch.inference_mode():
+                    last_value_tensor = self.network.get_value(obs_tensor)
+                    last_value = float(last_value_tensor.detach().cpu().item())
+            else:
+                last_value = 0.0
+            
+            self.buffer.compute_gae(last_value=last_value)
+        except (RuntimeError, ValueError) as exc:
+            logger.error(
+                "HIBA a GAE szamitasaban (iter #%d): %s",
+                self.iteration, exc,
+            )
+            raise
 
         # 2. PPO Gradiens frissites — NaN/Inf detektalas
         try:
@@ -349,7 +380,7 @@ class TrainingRunner:
         # 3. Osszesitett statisztikak
         iter_stats: dict[str, float] = {
             "iteration": float(self.iteration),
-            **{f"collect/{k}": v for k, v in collect_stats.items()},
+            **{f"collect/{k}": v for k, v in collect_stats._asdict().items()},
             **{f"train/{k}": v for k, v in train_stats.items()},
             "elapsed_hours": (time.monotonic() - self._start_time) / 3600,
         }
@@ -365,6 +396,9 @@ class TrainingRunner:
                     "az aktualis iteracioban kihagyasra kerult.",
                     self.iteration, exc,
                 )
+        
+        # 5. Buffer reset az elkovetkezo rollout-hoz
+        self.buffer.reset()
 
         return iter_stats
 

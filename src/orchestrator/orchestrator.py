@@ -388,6 +388,12 @@ class AutoAdaptiveOrchestrator:
                 "(x%.1f, max=%.4f)",
                 current_ent, new_ent, boost, self._max_entropy_coef,
             )
+        else:
+            logger.warning(
+                "Passzivitas intervencio hibas: self._trainer_ref is None. "
+                "Entropia koefficienshez szorzo nem alkalmazhato. "
+                "Hivas a set_trainer_reference() meghatasaban?"
+            )
 
         # Agresszio bonus
         self.reward_shaper.update_aggression_bonus(0.1)

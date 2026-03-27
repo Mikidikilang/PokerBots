@@ -60,29 +60,39 @@ class StreetPhase(IntEnum):
 
 @dataclass
 class HandRecord:
-    """Egyetlen leosztas HUD-relevans adatai.
+    """Per-hand HUD record submitted to TelemetryAnalyzer.record_hand().
 
-    Attributes:
-        voluntarily_put_in_pot: True ha az agens onkent potba fizetett pre-flop.
-        preflop_raised: True ha az agens emelt pre-flop.
-        three_betted: True ha az agens ujra-emelt pre-flop.
-        postflop_bets: Post-flop tetek es emelesek szama.
-        postflop_calls: Post-flop megadasok szama.
-        went_to_showdown: True ha a leosztas showdown-ig ment.
-        saw_flop: True ha az agens latta a flop-ot.
-        reward: A leosztas jutalma (chip EV).
-        actions_taken: Az agens altal vegzett akciok listaja (index, street).
+    All boolean fields are computed from the raw action sequence so that
+    TelemetryAnalyzer only needs to aggregate, never re-derive.
+
+    Streets are encoded as integers:
+        0 = Preflop, 1 = Flop, 2 = Turn, 3 = River
     """
+    # ── Identification ─────────────────────────────────────────────
+    hand_id: int                  # monotonically increasing hand counter
+    player_id: int                # seat index of the learning agent
+    position: int                 # 0-based position (0=BTN/SB in HU)
+    iteration: int                # training iteration this hand belongs to
 
-    voluntarily_put_in_pot: bool = False
-    preflop_raised: bool = False
-    three_betted: bool = False
-    postflop_bets: int = 0
-    postflop_calls: int = 0
-    went_to_showdown: bool = False
-    saw_flop: bool = False
-    reward: float = 0.0
-    actions_taken: list[tuple[int, int]] = field(default_factory=list)
+    # ── Outcome ────────────────────────────────────────────────────
+    reward_bb: float              # chip delta / big_blind (signed)
+    street_reached: int           # 0-3; last street with any action
+    went_to_showdown: bool        # True if river was dealt and reached SD
+    won_at_showdown: bool         # True if reward_bb > 0 at showdown
+
+    # ── VPIP / PFR / 3-Bet (preflop aggressiveness) ───────────────
+    vpip: bool                    # voluntarily put money in pot preflop
+    pfr: bool                     # made at least one preflop raise
+    three_bet: bool               # re-raised over an existing preflop raise
+
+    # ── Aggression Factor (AF = aggressive / passive) ─────────────
+    total_aggressive_actions: int  # bets + raises across all streets
+    total_passive_actions: int     # calls across all streets
+    total_folds: int               # folds
+
+    # ── Raw action sequence (for future per-street breakdown) ──────
+    actions: list[int] = field(default_factory=list)
+    action_streets: list[int] = field(default_factory=list)
 
 
 # =============================================================================
