@@ -290,9 +290,11 @@ class PPOTrainer:
         old_values: torch.Tensor = batch["old_values"].to(self.device)
 
         # Uj kiertekeles az aktualis halozattal
-        _, new_log_probs, entropy, new_values = self.network.get_action_and_value(
-            observations, action=actions.long()
-        )
+        # DDP Compatibility: Call forward() directly instead of get_action_and_value()
+        # to ensure gradient synchronization through DDP's native hooks.
+        action_dist, new_values = self.network(observations)
+        new_log_probs = action_dist.log_prob(actions.long())
+        entropy = action_dist.entropy()
         new_values = new_values.squeeze(-1)
 
         # === PPO Clipped Policy Loss ===

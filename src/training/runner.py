@@ -119,6 +119,7 @@ class TrainingRunner:
         on_eval_step: Callable[[int, Any], dict[str, float] | None] | None = None,
         on_checkpoint: Callable[[int, Any], None] | None = None,
         checkpoint_dir: str = "checkpoints",
+        orchestrator: Any | None = None,
     ) -> None:
         """Inicializalja a training runner-t.
 
@@ -138,6 +139,9 @@ class TrainingRunner:
             on_checkpoint: Callback a checkpoint menteseknel.
                 Az MLOps hf_sync ide csatlakozik.
             checkpoint_dir: Checkpoint konyvtar eleresi ut.
+            orchestrator: Optional AutoAdaptiveOrchestrator instance.
+                Ha megadva, a RolloutCollector hand records-okat jeleniti meg.
+                Ha None, a telemetria adat nem lesz gyujtve.
         """
         self.config: RunnerConfig = config
         self.network: Any = network
@@ -161,7 +165,7 @@ class TrainingRunner:
             obs_builder=obs_builder,
             buffer=self.buffer,
             config=yaml_config or {},
-            orchestrator=None,
+            orchestrator=orchestrator,
             device=self.device,
         )
 

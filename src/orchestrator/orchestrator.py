@@ -171,6 +171,12 @@ class AutoAdaptiveOrchestrator:
 
         # Trainer referencia (kesobb allitja be a runner)
         self._trainer_ref: Any = None
+        
+        # Network referencia (kesobb allitja be a runner) — FSP snapshot savehez
+        self._network_ref: Any = None
+        
+        # FSP snapshot szamlalo
+        self._fsp_snapshot_counter: int = 0
 
         # Beavatkozas szamlalok es cooldown
         self._intervention_count: int = 0
@@ -199,6 +205,15 @@ class AutoAdaptiveOrchestrator:
         """
         self._trainer_ref = trainer
         logger.debug("Trainer referencia beallitva az Orchestrator-ban.")
+    
+    def set_network_reference(self, network: Any) -> None:
+        """Beallitja a Network referenciat az FSP snapshot savehez.
+        
+        Args:
+            network: Az Actor-Critic network peldany.
+        """
+        self._network_ref = network
+        logger.debug("Network referencia beallitva az Orchestrator-ban.")
 
     # =========================================================================
     # Fo Callback (Event-Driven)
@@ -440,13 +455,68 @@ class AutoAdaptiveOrchestrator:
             )
 
     def _on_phase_transition(self) -> None:
-        """Callback a fazisatmenet utan: reward shaping reset, pool frissites."""
+        """Callback a fazisatmenet utan: reward shaping reset, FSP snapshot save, pool frissites."""
         self.reward_shaper.deactivate_all_shaping()
+        
+        # FSP snapshot save if Phase 2 (Co-Adaptive FSP)
+        if self.curriculum.current_phase.value == 2:  # PHASE_2_FSP
+            self._save_fsp_snapshot()
+        
         logger.info(
             "Fazisatmenet utomunkak: reward shaping resetelve, "
-            "uj fazis: %s", self.curriculum.current_phase.name,
+            "uj fazis: %s, opponents: %s", 
+            self.curriculum.current_phase.name,
+            self.curriculum.get_current_opponents(),
         )
 
+    # =========================================================================
+    # FSP Snapshot Menteshez
+    # =========================================================================
+    
+    def _save_fsp_snapshot(self) -> None:
+        """FSP snapshot mentes az aktualis halozatrol.
+        
+        Ez a metodus csak Phase 2 (Co-Adaptive FSP) alatt hasznalatos.
+        Az FSP snapshot-okat az opponent-pool ujarasitasara osztonze a MAB algoritmus.
+        
+        A snapshot path: checkpoints/fsp/snapshot_iter_{iteration}_{counter}.pt
+        
+        NOTE: Ez a metodus csak Rank 0 futatast szuposit (train_local.py felelos az elofordult).
+        """
+        if self._network_ref is None:
+            logger.warning("FSP snapshot save sikertelen: _network_ref is None")
+            return
+        
+        import torch
+        from pathlib import Path
+        
+        try:
+            # Snapshot ellenorzes
+            fsp_dir = Path("checkpoints/fsp")
+            fsp_dir.mkdir(parents=True, exist_ok=True)
+            
+            # State dict: DDP wrapper eltavolitasa (ha van)
+            if isinstance(self._network_ref, torch.nn.parallel.DistributedDataParallel):
+                state_dict = self._network_ref.module.state_dict()
+            else:
+                state_dict = self._network_ref.state_dict()
+            
+            self._fsp_snapshot_counter += 1
+            snapshot_path = fsp_dir / f"snapshot_{self._fsp_snapshot_counter:08d}.pt"
+            
+            torch.save(state_dict, snapshot_path)
+            
+            # Regisztracio az opponent pool-ba (MAB tracking)
+            opponent_name = f"fsp_snapshot_{self._fsp_snapshot_counter:08d}"
+            self.curriculum.register_opponent(opponent_name)
+            
+            logger.info(
+                "FSP snapshot saved: %s (counter=%d)",
+                snapshot_path, self._fsp_snapshot_counter,
+            )
+        except Exception as exc:
+            logger.error("FSP snapshot save hiba: %s", exc, exc_info=True)
+    
     # =========================================================================
     # Config Hot-Reload
     # =========================================================================

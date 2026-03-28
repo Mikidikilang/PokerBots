@@ -636,6 +636,7 @@ class StateManager:
         orchestrator_state: dict | None  = None,
         config:             dict | None  = None,
         rng_states:         dict[str, Any] | None = None,
+        wandb_run_id:       str | None   = None,
         is_best:            bool         = False,
     ) -> Path:
         """Assemble and atomically save the complete training state.
@@ -660,14 +661,21 @@ class StateManager:
                                 (for reproducibility auditing).
             rng_states:         RNG state dict from ``RNGStateManager.capture_states()``.
                                 Included in checkpoint for deterministic resumption.
+            wandb_run_id:       Optional W&B run ID for monitoring resume capability.
             is_best:            If True, the checkpoint is also written as
                                 ``checkpoint_best.pt``.
 
         Returns:
             Path to the written iteration checkpoint file.
         """
+        # DDP Compatibility: unwrap state dict if wrapped in DistributedDataParallel
+        if isinstance(network, torch.nn.parallel.DistributedDataParallel):
+            model_state = network.module.state_dict()
+        else:
+            model_state = network.state_dict()
+        
         checkpoint: dict[str, Any] = {
-            "model_state_dict":     network.state_dict(),
+            "model_state_dict":     model_state,
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
             "iteration":            iteration,
@@ -677,6 +685,7 @@ class StateManager:
             "orchestrator_state":   orchestrator_state,
             "config":               config,
             "rng_states":           rng_states,
+            "wandb_run_id":         wandb_run_id,
             "phase0_fixes_version": _PHASE0_FIX_VERSION,
         }
 
@@ -696,20 +705,38 @@ class StateManager:
     ) -> dict[str, Any] | None:
         """Load the most recent training state, or ``None`` if starting fresh.
 
+        DDP Compatibility: Automatically computes device mapping when in a distributed
+        setting to prevent all processes from loading to GPU 0 (which causes OOM).
+
         Args:
             map_location: Passed to ``torch.load``; defaults to ``"cpu"``
                           so GPU checkpoints load on CPU-only resume machines.
+                          If None and in DDP, auto-computes mapping to local GPU.
 
         Returns:
             The full checkpoint dict, or ``None`` if no checkpoint exists.
         """
+        # DDP Compatibility: compute device mapping for multi-GPU safety
+        if map_location is None and torch.distributed.is_available() and torch.distributed.is_initialized():
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            map_location = {f"cuda:0": f"cuda:{local_rank}"}
+        
         return self.ckpt_mgr.load_latest(map_location=map_location)
 
     def load_best_state(
         self,
         map_location: str | torch.device | None = "cpu",
     ) -> dict[str, Any] | None:
-        """Load the best-ever checkpoint, or ``None`` if it does not exist."""
+        """Load the best-ever checkpoint, or ``None`` if it does not exist.
+        
+        DDP Compatibility: Automatically computes device mapping when in a distributed
+        setting to prevent all processes from loading to GPU 0 (which causes OOM).
+        """
+        # DDP Compatibility: compute device mapping for multi-GPU safety
+        if map_location is None and torch.distributed.is_available() and torch.distributed.is_initialized():
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            map_location = {f"cuda:0": f"cuda:{local_rank}"}
+        
         return self.ckpt_mgr.load_best(map_location=map_location)
 
     # =========================================================================
