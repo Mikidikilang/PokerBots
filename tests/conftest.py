@@ -115,6 +115,25 @@ except ImportError:
         def to(self, *a: Any, **kw: Any) -> FakeTensor:
             return self
 
+        def clone(self) -> FakeTensor:
+            return FakeTensor(self._data.copy())
+
+        def view(self, *shape: int) -> FakeTensor:
+            return FakeTensor(self._data.reshape(shape))
+
+        def float(self) -> FakeTensor:
+            return FakeTensor(self._data.astype(np.float32))
+
+        def contiguous(self) -> FakeTensor:
+            return FakeTensor(np.ascontiguousarray(self._data))
+
+        def requires_grad_(self, requires_grad: bool = True) -> FakeTensor:
+            return self
+
+        @property
+        def grad(self) -> None:
+            return None
+
         def norm(self) -> FakeTensor:
             return FakeTensor(np.array([np.linalg.norm(self._data)]))
 
@@ -145,12 +164,17 @@ except ImportError:
         def __repr__(self) -> str:
             return f"FakeTensor(shape={self.shape})"
 
-    # Torch API mock
     torch_mock.Tensor = FakeTensor
     torch_mock.float32 = "float32"
     torch_mock.zeros = lambda *a, dtype=None: FakeTensor(np.zeros(a[0] if len(a) == 1 and isinstance(a[0], (list, tuple)) else (a[0],) if len(a) == 1 else a))
     torch_mock.tensor = lambda d, dtype=None: FakeTensor(d)
-    torch_mock.cat = lambda t, dim=0: FakeTensor(np.concatenate([x._data.flatten() for x in t]))
+    
+    def _fake_cat(tensors: list, dim: int = 0) -> FakeTensor:
+        """Concatenate tensors along specified dimension (respects dim arg)."""
+        arrays = [t._data if hasattr(t, '_data') else np.array(t) for t in tensors]
+        return FakeTensor(np.concatenate(arrays, axis=dim))
+    torch_mock.cat = _fake_cat
+    
     torch_mock.stack = lambda t, dim=0: FakeTensor(np.stack([x._data for x in t], axis=dim))
     torch_mock.randn = lambda *a: FakeTensor(np.random.randn(*a))
     torch_mock.softmax = lambda t, dim=-1: FakeTensor(np.exp(t._data - t._data.max()) / np.exp(t._data - t._data.max()).sum())
@@ -189,14 +213,43 @@ except ImportError:
     dist_mod = types.ModuleType("torch.distributions")
     class _FakeCategorical:
         def __init__(self, probs: Any = None, logits: Any = None) -> None:
-            self._p = np.ones(9) / 9
+            """Initialize categorical distribution from logits or probs with numerically stable softmax."""
+            if logits is not None:
+                # Extract numpy array from FakeTensor or convert input
+                data = logits._data if hasattr(logits, '_data') else np.array(logits, dtype=np.float32)
+                # Numerically stable softmax: subtract max before exp
+                data_shifted = data - data.max()
+                exp_data = np.exp(data_shifted)
+                self._p = exp_data / exp_data.sum()
+            elif probs is not None:
+                # Use provided probabilities (normalize if needed)
+                data = probs._data if hasattr(probs, '_data') else np.array(probs, dtype=np.float32)
+                self._p = data / data.sum()
+            else:
+                # Default uniform distribution over 9 actions
+                self._p = np.ones(9, dtype=np.float32) / 9
             self.probs = FakeTensor(self._p)
+            self.logits = logits if logits is not None else probs
+
         def sample(self) -> FakeTensor:
-            return FakeTensor(np.array([np.random.randint(0, 9)]))
+            """Sample action from the categorical distribution."""
+            action = np.random.choice(len(self._p), p=self._p)
+            return FakeTensor(np.array([float(action)]))
+
         def log_prob(self, v: Any) -> FakeTensor:
-            return FakeTensor(np.array([-1.5]))
+            """Compute log probability of action according to current distribution."""
+            action_idx = int(v.item()) if hasattr(v, 'item') else int(v)
+            if 0 <= action_idx < len(self._p):
+                log_p = np.log(np.maximum(self._p[action_idx], 1e-8))
+            else:
+                log_p = np.log(1e-8)
+            return FakeTensor(np.array([log_p]))
+
         def entropy(self) -> FakeTensor:
-            return FakeTensor(np.array([1.5]))
+            """Compute Shannon entropy of the categorical distribution."""
+            # H = -sum(p * log(p))
+            ent = -np.sum(self._p * np.log(np.maximum(self._p, 1e-8)))
+            return FakeTensor(np.array([ent]))
     dist_mod.Categorical = _FakeCategorical
     torch_mock.distributions = dist_mod
 

@@ -199,14 +199,18 @@ class _HandAccumulator:
     action_streets: list[int] = field(default_factory=list)
 
     # Preflop-specific state for 3-bet detection
-    preflop_raises_seen: int = 0   # counts raises by any player before us
+    preflop_raises_total: int = 0   # counts raises by any player
 
     def record_action(self, action: int, street: int) -> None:
         """Append one action to the trace and update preflop counters."""
         self.actions.append(action)
         self.action_streets.append(street)
         if street == 0 and action in _RAISE_ACTIONS:
-            self.preflop_raises_seen += 1
+            self.preflop_raises_total += 1
+
+    def record_env_preflop_raises(self, n_opponent_raises: int) -> None:
+        """Called before agent acts to capture prior opponent raises."""
+        self.preflop_raises_total += n_opponent_raises
 
 
 # ---------------------------------------------------------------------------
@@ -340,6 +344,9 @@ class RolloutCollector:
         for step in range(n_steps):
             obs_raw = self._current_obs
 
+            # ── Update preflop context BEFORE the action ──────────────────
+            self._update_preflop_context(self._hand_acc, obs_raw)
+
             # ── Detect street BEFORE the action ──────────────────────────
             current_street = _detect_street(obs_raw)
 
@@ -441,6 +448,24 @@ class RolloutCollector:
         """Return the total number of episodes (hands) completed so far."""
         return self._hand_counter
 
+    def get_last_bootstrap_value(self, network) -> float:
+        """Compute bootstrap value from the current observation.
+        
+        Used for GAE calculation at episode boundaries. Returns 0.0 if no
+        current observation is available.
+        """
+        if self._current_obs is None:
+            return 0.0
+        
+        import torch
+        obs_tensor = self._build_obs_tensor(self._current_obs)
+        # Ensure obs is batched (1, ...): network.get_value expects batch dimension
+        obs_batched = {k: v.unsqueeze(0) if v.dim() > 0 else v.unsqueeze(0)
+                       for k, v in obs_tensor.items()}
+        with torch.inference_mode():
+            last_value_tensor = network.get_value(obs_batched)
+            return float(last_value_tensor.detach().cpu().item())
+
     # =========================================================================
     # Telemetry Bridge — Bug F Fix
     # =========================================================================
@@ -527,6 +552,18 @@ class RolloutCollector:
     # =========================================================================
     # Observation Tensor Building
     # =========================================================================
+
+    def _update_preflop_context(self, acc: _HandAccumulator | None, obs_raw: dict[str, Any]) -> None:
+        """Extract total preflop raise count from betting history so 3-bet detection accounts for opponent action."""
+        if acc is None:
+            return
+        history = obs_raw.get("betting_history", [])
+        preflop_raises_in_history = sum(
+            1 for h in history
+            if h.get("action", -1) in _RAISE_ACTIONS
+            and h.get("player", acc.player_id) != acc.player_id
+        )
+        acc.record_env_preflop_raises(preflop_raises_in_history)
 
     def _build_obs_tensor(
         self, obs_raw: dict[str, Any]
@@ -662,19 +699,13 @@ def _build_hand_record(
     pfr = any(a in _RAISE_ACTIONS for a in preflop_actions)
 
     # ── 3-Bet ─────────────────────────────────────────────────────────────
-    # The accumulator increments preflop_raises_seen AFTER recording each
-    # raise.  So when we scan preflop actions in order, a raise is a 3-bet
-    # when at least one other raise has already been seen at that point.
-    three_bet = False
-    pf_raises_before = 0
-    for a, s in zip(actions, action_streets):
-        if s != 0:
-            break
-        if a in _RAISE_ACTIONS:
-            if pf_raises_before >= 1:        # there was at least one raise before ours
-                three_bet = True
-                break
-            pf_raises_before += 1
+    # A 3-bet is: agent raised AND at least one raise existed before agent's raise
+    pf_raises_before = acc.preflop_raises_total - sum(
+        1 for a, s in zip(actions, action_streets)
+        if s == 0 and a in _RAISE_ACTIONS
+    )
+    
+    three_bet = any(a in _RAISE_ACTIONS for a in preflop_actions) and pf_raises_before >= 1
 
     # ── Aggression Factor counts ──────────────────────────────────────────
     total_aggressive = sum(1 for a in actions if a in _RAISE_ACTIONS)

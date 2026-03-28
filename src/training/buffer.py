@@ -298,10 +298,10 @@ class RolloutBuffer:
                 "Hivd meg a get_mini_batches() elott."
             )
 
-        if not hasattr(self, '_obs_tensors'):
+        if not self._obs_tensors:
             raise RuntimeError(
-                "Consolidated tensors not allocated. "
-                "This should not happen if compute_gae() was called."
+                "Consolidated tensors not populated. "
+                "This indicates compute_gae() was not called after the last reset()."
             )
 
         num_steps: int = len(self._rewards)
@@ -358,7 +358,13 @@ class RolloutBuffer:
         self._returns = None
         self.pos = 0
         self.full = False
-        logger.debug("RolloutBuffer resetelve.")
+        
+        # Explicitly release consolidated tensors to free memory immediately
+        self._obs_tensors = {}
+        self._actions_tensor = None
+        self._log_probs_tensor = None
+        self._values_tensor = None
+        logger.debug("RolloutBuffer resetelve (konszolidalt tenzorok torolve).")
 
     def __len__(self) -> int:
         """A bufferben tarolt lepesek szama."""

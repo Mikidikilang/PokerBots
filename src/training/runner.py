@@ -118,6 +118,7 @@ class TrainingRunner:
         on_iteration_end: Callable[[int, dict[str, float]], None] | None = None,
         on_eval_step: Callable[[int, Any], dict[str, float] | None] | None = None,
         on_checkpoint: Callable[[int, Any], None] | None = None,
+        on_ddp_sync: Callable[[int], None] | None = None,
         checkpoint_dir: str = "checkpoints",
         orchestrator: Any | None = None,
     ) -> None:
@@ -138,6 +139,10 @@ class TrainingRunner:
                 Az Orchestrator curriculum logikaja ide csatlakozik.
             on_checkpoint: Callback a checkpoint menteseknel.
                 Az MLOps hf_sync ide csatlakozik.
+            on_ddp_sync: Callback a DDP szinkronizaciohoz.
+                Parametere: iteracio_szam.
+                Ez a callback NEM a try/except blokkban fut — kritikal hibak
+                el kell bukjanak a DDP deadlock elkeulesehez.
             checkpoint_dir: Checkpoint konyvtar eleresi ut.
             orchestrator: Optional AutoAdaptiveOrchestrator instance.
                 Ha megadva, a RolloutCollector hand records-okat jeleniti meg.
@@ -173,6 +178,7 @@ class TrainingRunner:
         self._on_iteration_end = on_iteration_end
         self._on_eval_step = on_eval_step
         self._on_checkpoint = on_checkpoint
+        self._on_ddp_sync = on_ddp_sync
 
         # Allapot
         self.iteration: int = 0
@@ -345,18 +351,7 @@ class TrainingRunner:
 
         # 1b. GAE Szamitasa — bootstrap last_value szukseg a returnshez (P1.5 fix: batch obs)
         try:
-            if self.collector._current_obs is not None:
-                from src.env.features import ObservationBuilder
-                obs_tensor = self.collector._build_obs_tensor(self.collector._current_obs)
-                # Ensure obs is batched (1, ...): network.get_value expects batch dimension
-                obs_batched = {k: v.unsqueeze(0) if v.dim() > 0 else v.unsqueeze(0)
-                               for k, v in obs_tensor.items()}
-                with torch.inference_mode():
-                    last_value_tensor = self.network.get_value(obs_batched)
-                    last_value = float(last_value_tensor.detach().cpu().item())
-            else:
-                last_value = 0.0
-            
+            last_value = self.collector.get_last_bootstrap_value(self.network)
             self.buffer.compute_gae(last_value=last_value)
         except (RuntimeError, ValueError) as exc:
             logger.error(
@@ -407,7 +402,11 @@ class TrainingRunner:
                     self.iteration, exc,
                 )
         
-        # 5. Buffer reset az elkovetkezo rollout-hoz
+        # 5. DDP szinkronizacio — Kritikus hiba eseten el kell bukni (nincs try/except)
+        if self._on_ddp_sync is not None:
+            self._on_ddp_sync(self.iteration)
+        
+        # 6. Buffer reset az elkovetkezo rollout-hoz
         self.buffer.reset()
 
         return iter_stats
@@ -419,49 +418,28 @@ class TrainingRunner:
     def _save_checkpoint(
         self, emergency: bool = False, final: bool = False
     ) -> None:
-        """Elmenti a halozat es az optimizer allapotat.
+        """Elmenti a halozat es az optimizer allapotat a StateManager-en keresztul."""
+        if self._on_checkpoint is None:
+            logger.warning(
+                "Nincs on_checkpoint callback konfiguralva — allapot NEM lett mentve (iter #%d)",
+                self.iteration,
+            )
+            return
 
-        Checkpoint naming convention matches CheckpointManager (state_manager.py):
-        - Regular: checkpoint_iter_{iteration:08d}.pt
-        - Final:   final_iter_{iteration:08d}.pt
-        - Emergency: emergency_iter_{iteration:08d}.pt
-
-        Args:
-            emergency: True ha hibakezeles kozbeni mentes.
-            final: True ha a training vegen torteno mentes.
-        """
-        import os
-        os.makedirs(self._checkpoint_dir, exist_ok=True)
-
-        prefix: str = "emergency" if emergency else ("final" if final else "checkpoint")
-        filepath: str = os.path.join(
-            self._checkpoint_dir,
-            f"{prefix}_iter_{self.iteration:08d}.pt",
+        save_type = "EMERGENCY" if emergency else ("FINAL" if final else "PERIODIC")
+        logger.info(
+            "%s checkpoint mentes indul (iter #%d)",
+            save_type, self.iteration,
         )
 
-        extra_state: dict[str, Any] = {
-            "optimizer_state_dict": self.trainer.get_optimizer_state(),
-            "iteration": self.iteration,
-            "total_steps": self.collector.get_total_steps(),
-            "total_episodes": self.collector.get_total_episodes(),
-            "trainer_config": self.trainer.config,
-        }
-
         try:
-            self.network.save_checkpoint(filepath, extra_state=extra_state)
-            logger.info(
-                "%s checkpoint mentve: %s (iter #%d)",
-                prefix.upper(), filepath, self.iteration,
-            )
+            self._on_checkpoint(self.iteration, self.network)
+            logger.info("%s checkpoint sikeresen mentve (iter #%d)", save_type, self.iteration)
         except Exception as exc:
-            logger.error("Checkpoint mentes sikertelen: %s", exc)
-
-        # MLOps callback (HF feltoltes)
-        if self._on_checkpoint is not None:
-            try:
-                self._on_checkpoint(self.iteration, self.network)
-            except Exception as exc:
-                logger.error("Checkpoint callback hiba: %s", exc)
+            logger.error(
+                "Checkpoint callback hiba (iter #%d): %s",
+                self.iteration, exc, exc_info=True,
+            )
 
     # =========================================================================
     # Idozites es Leallitas

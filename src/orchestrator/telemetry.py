@@ -358,10 +358,11 @@ class TelemetryAnalyzer:
         if len(self._window) < reward_window * 2:
             return False
 
-        recent = list(self._window)
+        import itertools
         half = reward_window
-        recent_rewards = [r.reward_bb for r in recent[-half:]]
-        older_rewards = [r.reward_bb for r in recent[-2 * half:-half]]
+        deque_len = len(self._window)
+        recent_rewards = [r.reward_bb for r in itertools.islice(self._window, deque_len - half, deque_len)]
+        older_rewards = [r.reward_bb for r in itertools.islice(self._window, deque_len - 2 * half, deque_len - half)]
 
         recent_mean: float = sum(recent_rewards) / len(recent_rewards) if recent_rewards else 0.0
         older_mean: float = sum(older_rewards) / len(older_rewards) if older_rewards else 0.0

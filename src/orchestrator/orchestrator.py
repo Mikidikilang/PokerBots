@@ -197,6 +197,11 @@ class AutoAdaptiveOrchestrator:
     # Trainer Referencia (Hot-Reload Celra)
     # =========================================================================
 
+    @property
+    def total_hands(self) -> int:
+        """A feldolgozott osszkes kezek szama a TelemetryAnalysis alapjan."""
+        return int(self.telemetry._total_hands)
+
     def set_trainer_reference(self, trainer: Any) -> None:
         """Beallitja a PPOTrainer referenciat a hot-reload beavatkozasokhoz.
 
@@ -335,6 +340,19 @@ class AutoAdaptiveOrchestrator:
             A vegrehajtott beavatkozasok neveinek listaja.
         """
         interventions: list[str] = []
+
+        # ── Fokozatos visszaallitas: anomaliak nincsek, csilla az interventionist ────
+        if not anomalies:
+            current_lambda = self.reward_shaper.config.bluff_penalty_lambda
+            current_bonus = self.reward_shaper.config.preflop_aggression_bonus
+            if current_lambda > 0.0 or current_bonus > 0.0:
+                # Fokozatos visszaallitas (decay)
+                self.reward_shaper.update_penalty_lambda(current_lambda * 0.5)
+                self.reward_shaper.update_aggression_bonus(current_bonus * 0.5)
+                
+                if self.reward_shaper.config.bluff_penalty_lambda < 0.01:
+                    self.reward_shaper.deactivate_all_shaping()
+            return []
 
         # Cooldown ellenorzes: ne avatkozzunk be tul gyakran
         if (iteration - self._last_intervention_iter) < self._intervention_cooldown:

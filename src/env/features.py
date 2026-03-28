@@ -366,11 +366,14 @@ class ObservationBuilder:
 
         initial_stack: float = self.config.initial_stack_bb * big_blind
 
-        # Normalizáló segédfüggvény: chip → [0, 1] tartomány
+        # Normalizáló segédfüggvény: chip → [0, 1] tartomány (deep stack: log-scale)
         def _normalize_chips(value: float) -> float:
-            """Monetáris értéket normalizál az induló stack-hez viszonyítva."""
+            """Monetáris értéket normalizál az induló stack-hez viszonyítva (log-skála deep stackhez)."""
             normalized: float = value / initial_stack if initial_stack > 0 else 0.0
-            return float(np.clip(normalized, self._norm_min, self._norm_max))
+            if normalized > 1.0:
+                return float(1.0 + np.log1p(normalized - 1.0))
+            else:
+                return float(max(0.0, normalized))
 
         pot: float = float(raw_state.get("pot", 0.0))
         my_chips: float = float(raw_state.get("my_chips", 0.0))

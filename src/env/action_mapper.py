@@ -255,13 +255,16 @@ class ActionMapper:
             raise_amount = context.min_raise_amount
         elif action in _RAISE_MULTIPLIERS:
             multiplier: float = _RAISE_MULTIPLIERS[action]
-            raise_amount = context.pot_size * multiplier
+            raise_amount = context.amount_to_call + multiplier * (context.pot_size + context.amount_to_call)
         else:
             logger.error("Ismeretlen akció: %s. Fallback: Fold.", action)
             return ResolvedAction(
                 action=PokerAction.FOLD, amount=0.0,
                 description="Ismeretlen akció → biztonsági Fold",
             )
+
+        # Minimum raise floor: az emelés nem lehet kisebb a minimálisnál
+        raise_amount = max(raise_amount, context.min_raise_amount)
 
         # Stack capping: ha az emelés meghaladja a stacket → All-in
         if raise_amount >= context.my_stack:
@@ -277,9 +280,6 @@ class ActionMapper:
                     f"(kívánt: {self._action_names.get(action, '?')})"
                 ),
             )
-
-        # Minimum raise floor: az emelés nem lehet kisebb a minimálisnál
-        raise_amount = max(raise_amount, context.min_raise_amount)
 
         action_name: str = self._action_names.get(action, f"Action-{action.value}")
         return ResolvedAction(

@@ -506,6 +506,16 @@ def build_training_pipeline(
                 # Log to W&B with iteration as step
                 monitor.log_metrics(step=iteration, metrics=combined_metrics)
 
+        # Only rank 0 monitors shutdown
+        if rank == 0 and shutdown_monitor is not None:
+            if shutdown_monitor.should_shutdown():
+                logger.warning("Shutdown monitor trigger! Training leallitasa...")
+                runner.request_stop()
+
+    def on_ddp_sync(iteration: int) -> None:
+        """DDP szinkronizacio: Rank 0 broadcast, all ranks receive (Phase 9+)."""
+        nonlocal phase_transition_state
+        
         # ===== COMPONENT 2: DDP BROADCAST (Multi-GPU Only) =====
         if world_size > 1:
             import torch
@@ -530,12 +540,6 @@ def build_training_pipeline(
             )
             # Note: Actual opponent loading happens in runner/collector
             # (Not implemented in this first pass, but infrastructure is here)
-
-        # Only rank 0 monitors shutdown
-        if rank == 0 and shutdown_monitor is not None:
-            if shutdown_monitor.should_shutdown():
-                logger.warning("Shutdown monitor trigger! Training leallitasa...")
-                runner.request_stop()
 
 
     def on_checkpoint(iteration: int, net: Any) -> None:
@@ -575,6 +579,7 @@ def build_training_pipeline(
         yaml_config=cfg,
         on_iteration_end=on_iteration_end,
         on_checkpoint=on_checkpoint,
+        on_ddp_sync=on_ddp_sync,
         checkpoint_dir=ckpt_cfg.get("local_checkpoint_dir", "checkpoints"),
         orchestrator=orchestrator,
     )
