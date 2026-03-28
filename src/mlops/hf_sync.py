@@ -147,7 +147,7 @@ class AsyncModelUploader:
         repo_id: str,
         checkpoint_dir: str,
         sync_interval_minutes: int = 15,
-        path_in_repo: str = "checkpoints",
+        path_in_repo: str = "",
         enabled: bool = True,
     ) -> None:
         self.repo_id:   str  = repo_id
@@ -306,6 +306,31 @@ class HuggingFaceStateManager:
             )
 
             if downloaded_path:
+                # [FIX] Check if files landed in a nested "checkpoints/" subfolder
+                # (can happen if uploaded with path_in_repo="checkpoints")
+                from pathlib import Path
+                base_path = Path(downloaded_path)
+                checkpoints_subdir = base_path / "checkpoints"
+                
+                if checkpoints_subdir.exists() and list(checkpoints_subdir.glob("checkpoint_iter_*.pt")):
+                    logger.warning(
+                        "[RESUME PATH ISSUE] Files found in nested path: %s/checkpoints/. "
+                        "This indicates the remote repo was uploaded with path_in_repo='checkpoints'. "
+                        "Moving files to root and updating checkpoint_dir.",
+                        base_path,
+                    )
+                    # Move files from checkpoints_subdir to base_path
+                    import shutil
+                    for pt_file in checkpoints_subdir.glob("checkpoint_iter_*.pt"):
+                        dest = base_path / pt_file.name
+                        shutil.move(str(pt_file), str(dest))
+                        logger.info("Moved checkpoint: %s -> %s", pt_file.name, dest)
+                    # Remove empty subdir if possible
+                    try:
+                        checkpoints_subdir.rmdir()
+                    except OSError:
+                        pass
+                
                 logger.info("Checkpoint downloaded: %s -> %s", self.repo_id, downloaded_path)
                 return downloaded_path
             else:

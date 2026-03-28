@@ -37,6 +37,14 @@ from typing import Any
 
 import yaml
 
+# Load environment variables from .env file (for WANDB_API_KEY, etc.)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent.parent / ".env")
+except ImportError:
+    # dotenv not installed; continue without .env support
+    pass
+
 import torch
 import torch.distributed as dist
 
@@ -252,29 +260,62 @@ def build_training_pipeline(
     checkpoint_to_resume: dict[str, Any] | None = None
 
     if resume:
+        logger.info("Resume mode enabled. Attempting to load checkpoint...")
+        
         if checkpoint_path:
+            logger.info("Resume: explicit checkpoint path provided: %s", checkpoint_path)
             checkpoint_to_resume = state_manager.ckpt_mgr.load(
                 checkpoint_path, map_location=device
             )
         else:
+            # Check if checkpoints exist before loading
+            ckpt_list = state_manager.list_checkpoints()
+            if ckpt_list:
+                logger.info(
+                    "Resume: found %d checkpoints in %s. Latest: %s",
+                    len(ckpt_list),
+                    state_manager.ckpt_mgr.checkpoint_dir,
+                    ckpt_list[-1].name,
+                )
+            else:
+                logger.warning(
+                    "Resume: NO checkpoints found in %s. "
+                    "If you expected a checkpoint, check the path or HF download logs.",
+                    state_manager.ckpt_mgr.checkpoint_dir,
+                )
+            
             checkpoint_to_resume = state_manager.load_training_state(
                 map_location=str(device)
             )
 
         if checkpoint_to_resume is not None:
             model_state_dict = checkpoint_to_resume["model_state_dict"]
+            resumed_iteration = checkpoint_to_resume.get("iteration", 0)
+            
             if world_size > 1:
                 if not any(k.startswith("module.") for k in model_state_dict.keys()):
                     logger.info("DDP: adding 'module.' prefix to checkpoint keys.")
                     model_state_dict = {
                         f"module.{k}": v for k, v in model_state_dict.items()
                     }
+            
             network.load_state_dict(model_state_dict)
-            start_iteration  = checkpoint_to_resume.get("iteration", 0)
+            start_iteration = resumed_iteration
             orchestrator_state = checkpoint_to_resume.get("orchestrator_state", {})
-            logger.info("Resume: iter=%d", start_iteration)
+            
+            logger.info(
+                "✓ RESUME SUCCESSFUL: iteration=%d, model_params=%s, "
+                "optim_state=%s, scheduler_state=%s",
+                start_iteration,
+                "loaded" if model_state_dict else "MISSING",
+                "loaded" if checkpoint_to_resume.get("optimizer_state_dict") else "MISSING",
+                "loaded" if checkpoint_to_resume.get("scheduler_state_dict") else "MISSING",
+            )
         else:
-            logger.info("No checkpoint found — cold start.")
+            logger.warning(
+                "✗ RESUME FAILED: no checkpoint could be loaded. "
+                "Starting from iteration 0 (cold start)."
+            )
 
     # --- Orchestrator (rank 0 only) ---
     from src.orchestrator.orchestrator import (
