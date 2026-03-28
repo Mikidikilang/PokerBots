@@ -428,7 +428,11 @@ def create_archetype(name: str, **kwargs: Any) -> OpponentAgent:
             f"Ismeretlen archetipus: '{name}'. "
             f"Elerheto: {list(_ARCHETYPE_REGISTRY.keys()) + list(_SFT_BOTS.keys())}"
         )
-    agent = _ARCHETYPE_REGISTRY[name](**kwargs)
+    # Csak a bot-specifikus kwargs szűrése (pl. play_frequency a TightPassiveBot-hoz)
+    # SFT kwargs (network_config, obs_builder, device) már feldolgozva vannak az SFT ágban
+    _BOT_KWARGS: set[str] = {"play_frequency"}
+    bot_kwargs: dict[str, Any] = {k: v for k, v in kwargs.items() if k in _BOT_KWARGS}
+    agent = _ARCHETYPE_REGISTRY[name](**bot_kwargs)
     logger.debug("Archetipus letrehozva: %s", name)
     return agent
 
