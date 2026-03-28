@@ -263,13 +263,19 @@ class AsyncModelUploader:
 
         Ez a metodus blokkol amig a feltoltes befejezodik.
         Retry logikat hasznalva (exponencialis backoff) a robusztussag javitasahoz.
+        
+        [FIX L4] Az eredeti _do_upload() None-t adott vissza (a self._scheduler.trigger()
+        void fuggveny). A retry_with_backoff() None visszaterest sikertelennek
+        ertelmezte. Az "Manualis feltoltes triggerelve" info log sohasem jelent meg.
+        A javitas: _do_upload() explicit True-t ad vissza.
         """
         if self._scheduler is None:
             logger.debug("Nincs aktiv scheduler, manual upload kihagyva.")
             return
 
-        def _do_upload() -> None:
+        def _do_upload() -> bool:  # [FIX L4] Explicit bool visszateresi tipus
             self._scheduler.trigger()
+            return True  # [FIX L4] True = siker jelzese a retry_with_backoff-nak
 
         # P3.4: Retry logic for robustness
         result = retry_with_backoff(
@@ -279,13 +285,15 @@ class AsyncModelUploader:
             max_delay=30.0,
         )
 
+        # [FIX L4] result is None CSAK ha az osszes kiserlet is meghibasodott
+        # Siker eseten result == True (nem None)
         if result is None:
             logger.warning(
                 "Manualis feltoltes sikertelen az osszes ujraprobalkozas utan: %s",
                 self.repo_id,
             )
         else:
-            logger.info("Manualis feltoltes triggerelve: %s", self.repo_id)
+            logger.info("Manualis feltoltes sikeresen triggerelve: %s", self.repo_id)
 
     def shutdown(self) -> None:
         """Biztonsagos leallitas: befejezi az utolso feltoltest.

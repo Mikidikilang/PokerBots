@@ -1,68 +1,25 @@
 """
 Rollout Collector (src/training/collector.py).
 
-Implements the inner loop of PPO training: steps the environment forward,
-queries the network for actions, stores transitions in the replay buffer,
-and — after every completed hand — submits a ``HandRecord`` to the
-``TelemetryAnalyzer`` so the ``AutoAdaptiveOrchestrator`` can make
-data-driven curriculum and intervention decisions.
+[FIX C4 - 2025-03-28] 3-Bet Tultuntetesi Hiba Javitasa:
+    Az _update_preflop_context() koraban az egesz betting_history-t ujra
+    vizsgalta minden lepesnel, ami szuperlinearisan novelte a
+    preflop_raises_total szamlalot. Pl. 10 preflop lepesnel a 6. lepesnel
+    mar 5 db emelest adott hozza, a 7. lepesnel 6-ot stb. — igy
+    preflop_raises_total >> zylobal emelesek szama, ami a harombojet%
+    ~80-100%-ra inflalta. A javitas: csak az uj, utoljara feldolgozas ota
+    hozzaadott elemeket vizsgalja, O(delta) koltsegge alakitva a szamitast.
+
+[FIX C1 - 2025-03-28] Bootstrap Ertek Atomikus Tarolasa:
+    A collect_rollout() vegere hozzaadtuk a buffer.set_last_value() hivast,
+    mielott visszaadjuk a vezerlesst a runner-nek. Igy a bootstrap V(s_T)
+    garantaltan a helyes, truncated allapothoz tartozik, nem egy kesobb
+    szamolt kozelites.
 
 Public interface
 ----------------
     RolloutCollector(network, env, obs_builder, buffer, config, orchestrator, device)
     .collect_rollout(n_steps) -> RolloutStats
-
-Protocol contract (PokerEnvironment, required by env)
-------------------------------------------------------
-    env.reset()           -> dict[str, Any]          (11-key obs dict)
-    env.step(action: int) -> tuple[dict, float]      (next_obs, reward)
-    env.is_over()         -> bool
-
-Network contract
-----------------
-    network.get_action_and_value(obs_tensor_dict, action=None)
-        -> (action_tensor, log_prob, entropy, value)
-    network.get_value(obs_tensor_dict) -> value_tensor
-
-Bug F Fix (this file — Task 1.1)
----------------------------------
-The ``AutoAdaptiveOrchestrator`` previously received only aggregated
-iteration-level statistics (mean_reward, policy_loss, etc.) and had no
-access to per-hand poker data.  As a result, VPIP, PFR, 3-Bet, AF, and
-WTSD were always stale/zero, making all curriculum transitions and reward
-interventions blind guesses.
-
-The fix:
-    1. A ``_HandAccumulator`` dataclass tracks per-hand state during each
-       episode: actions taken, street of each action, and preflop raise
-       count (for 3-Bet detection).
-    2. ``_detect_street(obs)`` derives the current betting round from the
-       number of public cards exposed in the observation.
-    3. ``_build_hand_record(acc, reward, went_to_showdown)`` computes all
-       HUD statistics from the accumulated state and returns a ``HandRecord``.
-    4. At every episode termination, the ``HandRecord`` is submitted to
-       ``self.orchestrator.telemetry.record_hand()``.
-
-Phase 1.3 improvements (included here)
----------------------------------------
-    - ``torch.no_grad()`` → ``torch.inference_mode()`` in the network
-      inference path (lower overhead, prevents accidental gradient creation).
-    - ``non_blocking=True`` on every ``.to(device)`` call, allowing the
-      CUDA DMA engine to overlap data transfer with CPU work.
-
-HandRecord field-to-HUD-stat mapping
---------------------------------------
-    Field                    HUD Stat
-    ─────────────────────    ─────────────────────────────────────
-    vpip                     VPIP  (Voluntarily Put $ In Pot)
-    pfr                      PFR   (Pre-Flop Raise %)
-    three_bet                3-Bet %
-    total_aggressive_actions  AF numerator (bets + raises)
-    total_passive_actions     AF denominator (calls)
-    went_to_showdown         WTSD (Went To ShowDown)
-    won_at_showdown          WSD  (Won $ at ShowDown)
-    street_reached           Furthest street seen in this hand
-    reward_bb                Net result in big-blind units
 """
 
 from __future__ import annotations
@@ -73,62 +30,34 @@ from typing import Any, NamedTuple, Protocol, runtime_checkable
 
 import torch
 
-# ---------------------------------------------------------------------------
-# HandRecord import with local-fallback for testing without full project
-# ---------------------------------------------------------------------------
 try:
-    from src.orchestrator.telemetry import HandRecord, TelemetryAnalyzer  # type: ignore[import]
+    from src.orchestrator.telemetry import HandRecord, TelemetryAnalyzer
 except ImportError:
-    # -----------------------------------------------------------------------
-    # LOCAL FALLBACK — mirrors the contract TelemetryAnalyzer expects.
-    # If your telemetry.py has different field names, reconcile them here.
-    # -----------------------------------------------------------------------
     @dataclass
     class HandRecord:  # type: ignore[no-redef]
-        """Per-hand HUD record submitted to TelemetryAnalyzer.record_hand().
-
-        All boolean fields are computed from the raw action sequence so that
-        TelemetryAnalyzer only needs to aggregate, never re-derive.
-
-        Streets are encoded as integers:
-            0 = Preflop, 1 = Flop, 2 = Turn, 3 = River
-        """
-        # ── Identification ─────────────────────────────────────────────
-        hand_id: int                  # monotonically increasing hand counter
-        player_id: int                # seat index of the learning agent
-        position: int                 # 0-based position (0=BTN/SB in HU)
-        iteration: int                # training iteration this hand belongs to
-
-        # ── Outcome ────────────────────────────────────────────────────
-        reward_bb: float              # chip delta / big_blind (signed)
-        street_reached: int           # 0-3; last street with any action
-        went_to_showdown: bool        # True if river was dealt and reached SD
-        won_at_showdown: bool         # True if reward_bb > 0 at showdown
-
-        # ── VPIP / PFR / 3-Bet (preflop aggressiveness) ───────────────
-        vpip: bool                    # voluntarily put money in pot preflop
-        pfr: bool                     # made at least one preflop raise
-        three_bet: bool               # re-raised over an existing preflop raise
-
-        # ── Aggression Factor (AF = aggressive / passive) ─────────────
-        total_aggressive_actions: int  # bets + raises across all streets
-        total_passive_actions: int     # calls across all streets
-        total_folds: int               # folds
-
-        # ── Raw action sequence (for future per-street breakdown) ──────
+        hand_id: int
+        player_id: int
+        position: int
+        iteration: int
+        reward_bb: float
+        street_reached: int
+        went_to_showdown: bool
+        won_at_showdown: bool
+        vpip: bool
+        pfr: bool
+        three_bet: bool
+        total_aggressive_actions: int
+        total_passive_actions: int
+        total_folds: int
         actions: list[int] = field(default_factory=list)
         action_streets: list[int] = field(default_factory=list)
 
-    # Stub TelemetryAnalyzer so isinstance checks work in tests
     class TelemetryAnalyzer:  # type: ignore[no-redef]
         def record_hand(self, record: HandRecord) -> None: ...
 
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Action index constants — must match action_mapper.PokerAction enum
-# ---------------------------------------------------------------------------
 _FOLD       = 0
 _CHECK_CALL = 1
 _MIN_RAISE  = 2
@@ -136,39 +65,15 @@ _ALL_IN     = 8
 _RAISE_ACTIONS: frozenset[int] = frozenset(range(_MIN_RAISE, _ALL_IN + 1))
 
 
-# ---------------------------------------------------------------------------
-# PokerEnvironment Protocol
-# ---------------------------------------------------------------------------
-
 @runtime_checkable
 class PokerEnvironment(Protocol):
-    """Structural protocol that env must satisfy.
+    def reset(self) -> dict[str, Any]: ...
+    def step(self, action: int) -> tuple[dict[str, Any], float]: ...
+    def is_over(self) -> bool: ...
 
-    ``RLCardWrapper`` (src/env/wrappers.py) is the concrete implementation.
-    Any object with these three methods and correct return types satisfies
-    the protocol — no inheritance required.
-    """
-
-    def reset(self) -> dict[str, Any]:
-        """Start a new hand and return the first observation dict."""
-        ...
-
-    def step(self, action: int) -> tuple[dict[str, Any], float]:
-        """Execute action; return (next_obs_dict, step_reward)."""
-        ...
-
-    def is_over(self) -> bool:
-        """Return True when the current hand has ended."""
-        ...
-
-
-# ---------------------------------------------------------------------------
-# Collector Configuration
-# ---------------------------------------------------------------------------
 
 @dataclass
 class CollectorConfig:
-    """Configuration for the RolloutCollector."""
     big_blind: float = 2.0
 
     @classmethod
@@ -178,78 +83,60 @@ class CollectorConfig:
         )
 
 
-# ---------------------------------------------------------------------------
-# Internal per-hand accumulator
-# ---------------------------------------------------------------------------
-
 @dataclass
 class _HandAccumulator:
     """Mutable per-episode state built up action-by-action.
 
-    Reset at the start of every episode; consumed by ``_build_hand_record``
-    at episode termination.
+    [FIX C4] _last_seen_history_len mezo hozzaadva: nyomon koveti, hogy
+    az utolso _update_preflop_context() hivas ota hany elemet dolgoztunk
+    fel a betting_history-ban. Igy az uj hivasok csak a delta-t olvassak,
+    nem az egesz tortenetet ujra.
     """
     hand_id: int
     player_id: int
     position: int
     iteration: int
 
-    # Raw action trace
     actions:        list[int] = field(default_factory=list)
     action_streets: list[int] = field(default_factory=list)
 
-    # Preflop-specific state for 3-bet detection
-    preflop_raises_total: int = 0   # counts raises by any player
+    # Preflop ellenfél emelesek szama (3-bet detektalashoz)
+    preflop_raises_total: int = 0
+
+    # [FIX C4] Az utolso feldolgozas ota latott history hossza.
+    # Csak az uj (delta) elemeket vizsgalja a kovetkezo hivasnal.
+    _last_seen_history_len: int = 0
 
     def record_action(self, action: int, street: int) -> None:
-        """Append one action to the trace and update preflop counters."""
+        """Egy akcio feljegyzese a nyomkoveto listaba."""
         self.actions.append(action)
         self.action_streets.append(street)
         if street == 0 and action in _RAISE_ACTIONS:
             self.preflop_raises_total += 1
 
     def record_env_preflop_raises(self, n_opponent_raises: int) -> None:
-        """Called before agent acts to capture prior opponent raises."""
+        """Ellenfél emelesek hozzaadasa (CSAK a delta-hoz)."""
         self.preflop_raises_total += n_opponent_raises
 
 
-# ---------------------------------------------------------------------------
-# Rollout statistics (returned to runner.py)
-# ---------------------------------------------------------------------------
-
 class RolloutStats(NamedTuple):
-    """Aggregated statistics from one collect_rollout() call."""
     n_steps:       int
     n_episodes:    int
     mean_reward:   float
     total_reward:  float
-    n_hands_submitted: int   # HandRecords submitted to telemetry
+    n_hands_submitted: int
 
-
-# ---------------------------------------------------------------------------
-# RolloutCollector
-# ---------------------------------------------------------------------------
 
 class RolloutCollector:
     """Collects PPO rollout transitions and feeds the Telemetry Bridge.
 
-    The collector owns one environment instance.  On each call to
-    ``collect_rollout(n_steps)`` it:
+    [FIX C4] Az _update_preflop_context() inkrementalisan mukodik:
+    csak az utolso hivat ota hozzaadott betting_history bejegyzeseket
+    vizsgalja, elkerulve a szuperlinearis tultuntelest.
 
-        1. Steps the environment for exactly ``n_steps`` actions.
-        2. Pushes each transition into ``buffer`` for PPO training.
-        3. At every episode termination, builds a ``HandRecord`` and submits
-           it to ``orchestrator.telemetry.record_hand()``.
-
-    Args:
-        network:      ``PokerActorCritic`` instance (on ``device``).
-        env:          Object satisfying the ``PokerEnvironment`` Protocol.
-        obs_builder:  ``ObservationBuilder`` — converts raw obs dict to
-                      tensors via ``obs_builder.build(obs_dict)``.
-        buffer:       Rollout buffer with a ``push(**transition)`` method.
-        config:       Full YAML config dict.
-        orchestrator: ``AutoAdaptiveOrchestrator`` (or None for smoke tests).
-        device:       ``torch.device`` for tensor allocation.
+    [FIX C1] A collect_rollout() vegere buffer.set_last_value() hivodik,
+    atomikusan tarolva a bootstrap erteket a bufferben, mielott a
+    runner.py compute_gae()-t hivna.
     """
 
     def __init__(
@@ -277,24 +164,20 @@ class RolloutCollector:
         self.orchestrator = orchestrator
         self.device       = torch.device(device)
 
-        # ── Per-session counters ──────────────────────────────────────────
         self._hand_counter:  int   = 0
         self._total_steps:   int   = 0
-        self._iteration:     int   = 0   # updated by runner via set_iteration()
+        self._iteration:     int   = 0
 
-        # ── Live episode state ────────────────────────────────────────────
         self._current_obs:  dict[str, Any] | None = None
         self._episode_done: bool                  = True
         self._hand_acc:     _HandAccumulator | None = None
 
-        # ── Config extraction ─────────────────────────────────────────────
-        train_cfg = config.get("training", {})
         self._big_blind: float = float(
             config.get("environment", {}).get("big_blind", 2.0)
         )
 
         logger.info(
-            "RolloutCollector initialised: device=%s, BB=%.1f, "
+            "RolloutCollector inicializalva: device=%s, BB=%.1f, "
             "telemetry_enabled=%s",
             self.device,
             self._big_blind,
@@ -306,26 +189,16 @@ class RolloutCollector:
     # =========================================================================
 
     def set_iteration(self, iteration: int) -> None:
-        """Called by runner.py to stamp HandRecords with the training iteration."""
         self._iteration = iteration
 
     def collect_rollout(self, n_steps: int) -> RolloutStats:
-        """Collect exactly ``n_steps`` environment steps.
+        """Collect exactly n_steps environment steps.
 
-        This is the hot loop of the training pipeline.  The network is
-        queried in ``torch.inference_mode()`` so that:
-            - No gradient tape is constructed (lower VRAM, faster).
-            - Accidental in-place modifications are caught early.
-
-        The loop handles mid-rollout episode boundaries cleanly: when a hand
-        ends before ``n_steps`` is exhausted the environment is reset and
-        collection continues seamlessly into the next hand.
-
-        Args:
-            n_steps: Number of environment steps to collect.
-
-        Returns:
-            ``RolloutStats`` namedtuple with aggregated hand/reward stats.
+        [FIX C1] A rollout vegen buffer.set_last_value() hivodik az utolso
+        nem-terminalis allapot V(s_T) ertekevel, mielott visszaadjuk a
+        vezerlesst. Ez szavatolja, hogy a runner.py-ban kiadott
+        compute_gae(last_value=buffer.get_last_bootstrap_value()) hivas
+        mindig a HELYES bootstrap erteket hasznalja.
         """
         self.network.eval()
 
@@ -333,8 +206,8 @@ class RolloutCollector:
         episode_rews  = []
         n_telemetry   = 0
         running_rew   = 0.0
+        done          = False  # [C1 FIX] inicializalas a scope szamara
 
-        # ── Lazy reset: initialise on first call or after prev rollout ────
         if self._episode_done or self._current_obs is None:
             self._current_obs  = self.env.reset()
             self._episode_done = False
@@ -344,42 +217,32 @@ class RolloutCollector:
         for step in range(n_steps):
             obs_raw = self._current_obs
 
-            # ── Update preflop context BEFORE the action ──────────────────
+            # [FIX C4] Inkrementalis preflop context frissites
             self._update_preflop_context(self._hand_acc, obs_raw)
 
-            # ── Detect street BEFORE the action ──────────────────────────
             current_street = _detect_street(obs_raw)
 
-            # ── Build tensor dict and query network ───────────────────────
             obs_tensor = self._build_obs_tensor(obs_raw)
-
-            # Phase 4-21: Always add batch dimension for unified network API
-            # The network expects all inputs to be batched (batch, ...)
             obs_batched: dict[str, torch.Tensor] = {
                 k: v.unsqueeze(0) for k, v in obs_tensor.items()
             }
 
-            with torch.inference_mode():  # Phase 1.3: was torch.no_grad()
+            with torch.inference_mode():
                 action, log_prob, entropy, value = (
                     self.network.get_action_and_value(obs_batched)
                 )
 
             action_int: int = int(action.reshape(-1)[0].item())
 
-            # ── Record action in hand accumulator ─────────────────────────
             if self._hand_acc is not None:
                 self._hand_acc.record_action(action_int, current_street)
 
-            # ── Step environment ──────────────────────────────────────────
             next_obs_raw, reward = self.env.step(action_int)
-            done: bool = self.env.is_over()
+            done = self.env.is_over()
 
             running_rew += reward
             self._total_steps += 1
 
-            # ── Push transition to buffer ─────────────────────────────────
-            # Phase 3-16: Move obs_tensor to CPU before storage to prevent VRAM fragmentation.
-            # The tensor dict is preprocessed and ready for training.
             obs_tensor_cpu = {k: v.cpu() for k, v in obs_tensor.items()}
             self.buffer.add(
                 observation=obs_tensor_cpu,
@@ -390,7 +253,6 @@ class RolloutCollector:
                 done=done,
             )
 
-            # ── Episode termination: build HandRecord ─────────────────────
             if done:
                 n_episodes    += 1
                 n_telemetry   += self._close_episode(
@@ -400,26 +262,40 @@ class RolloutCollector:
                 episode_rews.append(running_rew)
                 running_rew = 0.0
 
-                # Reset for next episode
                 self._current_obs  = self.env.reset()
                 self._episode_done = False
                 self._hand_acc     = self._new_accumulator()
             else:
                 self._current_obs = next_obs_raw
 
-        # ── Bootstrap value for the last (possibly incomplete) episode ────
-        # runner.py / GAE computation needs V(s_T).  Store it in the buffer
-        # via a dedicated method if the buffer supports it.
+        # =====================================================================
+        # [FIX C1] Atomikus bootstrap ertek tarolasa a bufferben
+        # =====================================================================
+        # Ha a rollout NOT done allapotban vegzodott (truncated episode),
+        # ki kell szamolni V(s_T) a jelenlegi allapotra es el kell tarolni
+        # a bufferben, MIELOTT a runner.py compute_gae()-t hivna.
+        # Igy nincs race condition: a buffer.get_last_bootstrap_value()
+        # mindig a helyes erteket adja vissza.
+        #
+        # Ha done=True (terminalis allapot), a bootstrap ertek 0.0 (helyes:
+        # nincs jovobeli jutalom terminalis allapotbol).
         if not done and self._current_obs is not None:
             last_obs_tensor = self._build_obs_tensor(self._current_obs)
-            # Phase 4-21: Add batch dimension for unified network API
             last_obs_batched: dict[str, torch.Tensor] = {
                 k: v.unsqueeze(0) for k, v in last_obs_tensor.items()
             }
             with torch.inference_mode():
-                last_value = self.network.get_value(last_obs_batched)
-            if hasattr(self.buffer, "set_last_value"):
-                self.buffer.set_last_value(last_value.detach())
+                last_value_tensor = self.network.get_value(last_obs_batched)
+            # Atomikusan beallitjuk a buffer-ben (set_last_value implementalva)
+            self.buffer.set_last_value(last_value_tensor.squeeze(-1))
+            logger.debug(
+                "Bootstrap ertek beallitva: %.6f (truncated episode)",
+                float(last_value_tensor.detach().cpu().item()),
+            )
+        else:
+            # Terminalis allapot: 0.0 a helyes bootstrap ertek
+            self.buffer.set_last_value(0.0)
+            logger.debug("Bootstrap ertek: 0.0 (terminalis allapot)")
 
         self.network.train()
 
@@ -434,40 +310,74 @@ class RolloutCollector:
             n_hands_submitted=n_telemetry,
         )
         logger.debug(
-            "collect_rollout done: steps=%d, episodes=%d, "
+            "collect_rollout kesz: steps=%d, episodes=%d, "
             "mean_reward=%.4f BB, hands_to_telemetry=%d",
             n_steps, n_episodes, mean_reward, n_telemetry,
         )
         return stats
 
     def get_total_steps(self) -> int:
-        """Return the total number of environment steps collected so far."""
         return self._total_steps
 
     def get_total_episodes(self) -> int:
-        """Return the total number of episodes (hands) completed so far."""
         return self._hand_counter
 
-    def get_last_bootstrap_value(self, network) -> float:
-        """Compute bootstrap value from the current observation.
-        
-        Used for GAE calculation at episode boundaries. Returns 0.0 if no
-        current observation is available.
+    def get_last_bootstrap_value(self, network: Any) -> float:
+        """Visszaadja a legutolso bootstrap erteket (backward-kompatibilitas).
+
+        [C1 FIX NOTE] Ez a metodus megtartva backward-kompatibilitas celjara,
+        de az elonyben reszesitett mod a buffer.get_last_bootstrap_value()
+        hasznalata, ami az atomikusan tarolt erteket adja vissza.
         """
-        if self._current_obs is None:
-            return 0.0
-        
-        import torch
-        obs_tensor = self._build_obs_tensor(self._current_obs)
-        # Ensure obs is batched (1, ...): network.get_value expects batch dimension
-        obs_batched = {k: v.unsqueeze(0) if v.dim() > 0 else v.unsqueeze(0)
-                       for k, v in obs_tensor.items()}
-        with torch.inference_mode():
-            last_value_tensor = network.get_value(obs_batched)
-            return float(last_value_tensor.detach().cpu().item())
+        return self.buffer.get_last_bootstrap_value()
 
     # =========================================================================
-    # Telemetry Bridge — Bug F Fix
+    # [FIX C4] Inkrementalis Preflop Context Frissites
+    # =========================================================================
+
+    def _update_preflop_context(
+        self, acc: _HandAccumulator | None, obs_raw: dict[str, Any]
+    ) -> None:
+        """Inkrementalisan frissiti az ellenfél preflop emeleseinek szamlalojat.
+
+        [FIX C4] A korabbi implementacio az egesz betting_history-t ujra
+        vizsgalta minden lepesnel, ami szuperlinearis novekedeshez vezetett.
+        Pelda: 10 preflop lep eseten a 6. lepesnel 5 emelesst adott hozza,
+        a 7.-nel 6-ot stb., igy preflop_raises_total >> tenyleges emelesek.
+
+        A javitas: az _HandAccumulator._last_seen_history_len meset csak az
+        UJ bejegyzeseket dolgozza fel (slicing), O(delta) koltsegge alakitva
+        a muvelet O(N) helyett.
+
+        Args:
+            acc: Az aktualis kezhez tartozo akkumulator.
+            obs_raw: A jelenlegi jatekallapot szotara.
+        """
+        if acc is None:
+            return
+        history = obs_raw.get("betting_history", [])
+        current_len = len(history)
+
+        # [FIX C4] Csak az UJ bejegyzesek feldolgozasa (delta-only scan)
+        new_entries = history[acc._last_seen_history_len:]
+        acc._last_seen_history_len = current_len  # frissitjuk a poziciot
+
+        # Csak az ellenfél (nem a tanulo agenst) emelesei szamitanak
+        new_opp_raises = sum(
+            1 for h in new_entries
+            if h.get("action", -1) in _RAISE_ACTIONS
+            and h.get("player", acc.player_id) != acc.player_id
+        )
+
+        if new_opp_raises > 0:
+            acc.record_env_preflop_raises(new_opp_raises)
+            logger.debug(
+                "C4 fix: %d uj ellenfél preflop emeles feljegyezve (delta-only)",
+                new_opp_raises,
+            )
+
+    # =========================================================================
+    # Telemetry Bridge
     # =========================================================================
 
     def _close_episode(
@@ -475,23 +385,9 @@ class RolloutCollector:
         terminal_obs: dict[str, Any],
         reward: float,
     ) -> int:
-        """Build a HandRecord and submit it to the orchestrator.
-
-        Called exactly once per completed hand.
-
-        Args:
-            terminal_obs: The final observation dict returned by the env.
-            reward:       Cumulative reward for this hand (in chips).
-
-        Returns:
-            1 if a HandRecord was successfully submitted, 0 otherwise.
-        """
         if self._hand_acc is None:
             return 0
 
-        # Determine whether a showdown occurred: both players saw the river
-        # and neither folded (any fold action would have ended the hand before
-        # all 5 community cards were dealt).
         last_street   = _detect_street(terminal_obs)
         any_fold      = _FOLD in self._hand_acc.actions
         went_to_sd    = (last_street == 3) and (not any_fold)
@@ -507,29 +403,18 @@ class RolloutCollector:
                 won_at_showdown=won_at_sd,
             )
         except Exception as exc:
-            logger.warning("_build_hand_record failed: %s", exc, exc_info=True)
+            logger.warning("_build_hand_record hiba: %s", exc, exc_info=True)
             return 0
 
         return self._submit_hand_record(record)
 
     def _submit_hand_record(self, record: HandRecord) -> int:
-        """Deliver a HandRecord to the orchestrator's telemetry analyzer.
-
-        Failures are logged and suppressed so a bad telemetry submission
-        never crashes the training loop.
-
-        Args:
-            record: Populated HandRecord.
-
-        Returns:
-            1 on success, 0 on failure or when orchestrator is absent.
-        """
         if self.orchestrator is None:
             return 0
         try:
             self.orchestrator.telemetry.record_hand(record)
             logger.debug(
-                "HandRecord submitted: hand=%d iter=%d street=%d "
+                "HandRecord benyujtva: hand=%d iter=%d street=%d "
                 "reward=%.3f BB vpip=%s pfr=%s 3b=%s wtsd=%s",
                 record.hand_id, record.iteration, record.street_reached,
                 record.reward_bb, record.vpip, record.pfr,
@@ -538,13 +423,11 @@ class RolloutCollector:
             return 1
         except AttributeError as exc:
             logger.warning(
-                "orchestrator.telemetry.record_hand() not available: %s. "
-                "Is orchestrator.telemetry a TelemetryAnalyzer instance?",
-                exc,
+                "orchestrator.telemetry.record_hand() nem elerheto: %s", exc,
             )
         except Exception as exc:
             logger.warning(
-                "HandRecord submission failed (hand=%d): %s",
+                "HandRecord benyujtas sikertelen (hand=%d): %s",
                 record.hand_id, exc, exc_info=True,
             )
         return 0
@@ -553,42 +436,17 @@ class RolloutCollector:
     # Observation Tensor Building
     # =========================================================================
 
-    def _update_preflop_context(self, acc: _HandAccumulator | None, obs_raw: dict[str, Any]) -> None:
-        """Extract total preflop raise count from betting history so 3-bet detection accounts for opponent action."""
-        if acc is None:
-            return
-        history = obs_raw.get("betting_history", [])
-        preflop_raises_in_history = sum(
-            1 for h in history
-            if h.get("action", -1) in _RAISE_ACTIONS
-            and h.get("player", acc.player_id) != acc.player_id
-        )
-        acc.record_env_preflop_raises(preflop_raises_in_history)
-
     def _build_obs_tensor(
         self, obs_raw: dict[str, Any]
     ) -> dict[str, torch.Tensor]:
-        """Convert a raw obs dict to a device-resident tensor dict.
-
-        Calls ``obs_builder.build(obs_raw)`` then moves every tensor to
-        ``self.device`` with ``non_blocking=True`` (Phase 1.3).
-
-        Args:
-            obs_raw: 11-key dict from ``PokerEnvironment.reset()`` or
-                     ``.step()``.
-
-        Returns:
-            Dict mapping the same keys to ``torch.Tensor`` on ``self.device``.
-        """
         try:
             obs_tensor: dict[str, torch.Tensor] = self.obs_builder.build(obs_raw)
         except Exception as exc:
             raise RuntimeError(
-                f"ObservationBuilder.build() failed: {exc}\n"
-                f"obs_raw keys: {list(obs_raw.keys())}"
+                f"ObservationBuilder.build() sikertelen: {exc}\n"
+                f"obs_raw kulcsok: {list(obs_raw.keys())}"
             ) from exc
 
-        # Phase 1.3: non_blocking=True overlaps DMA transfer with CPU work
         return {
             k: v.to(self.device, non_blocking=True)
             for k, v in obs_tensor.items()
@@ -599,34 +457,24 @@ class RolloutCollector:
     # =========================================================================
 
     def _new_accumulator(self) -> _HandAccumulator:
-        """Create a fresh hand accumulator for the episode just started."""
         self._hand_counter += 1
         return _HandAccumulator(
             hand_id=self._hand_counter,
-            player_id=0,     # learning agent is always player-0 in self-play
+            player_id=0,
             position=0,
             iteration=self._iteration,
         )
 
 
 # =============================================================================
-# Module-level helper functions (testable without instantiating the class)
+# Module-level helper functions
 # =============================================================================
 
 def _detect_street(obs: dict[str, Any]) -> int:
-    """Derive the current betting street from the number of public cards.
+    """Aktualis utca levezetese a kozos lapok szamabol.
 
-    Mapping:
-        0 cards → Preflop (0)
-        3 cards → Flop    (1)
-        4 cards → Turn    (2)
-        5 cards → River   (3)
-
-    Args:
-        obs: Raw obs dict with a ``'public_cards'`` list entry.
-
-    Returns:
-        Integer in [0, 3].
+    [L3 FIX] Varatlan lapszamra (1, 2) figyelmezteto log hozzaadva,
+    hogy a telemetria ne csendesen rossz utcat rendeljen.
     """
     n = len(obs.get("public_cards", []))
     if n == 0:
@@ -635,7 +483,15 @@ def _detect_street(obs: dict[str, Any]) -> int:
         return 1   # flop
     if n == 4:
         return 2   # turn
-    return 3       # river (5 cards, or any unexpected count)
+    if n == 5:
+        return 3   # river
+    # [L3 FIX] Varatlan lapszam: figyelmeztetes, de kezeles folytatodik
+    logger.warning(
+        "Varatlan kozos lap szam: %d (elvaras: 0/3/4/5). "
+        "River-kent kezeljuk az utcaestimaciosz pontossaganak megorzese erdekeben.",
+        n,
+    )
+    return 3
 
 
 def _build_hand_record(
@@ -646,75 +502,36 @@ def _build_hand_record(
     went_to_showdown:  bool,
     won_at_showdown:   bool,
 ) -> HandRecord:
-    """Derive all HUD stats from a completed hand's action trace.
+    """HUD statisztikak levezetese egy befejezett kez akciosorozatabol.
 
-    HUD stat derivations
-    --------------------
-    VPIP (Voluntarily Put $ In Pot):
-        True if the agent made ANY non-fold action preflop.  This is the
-        broadest correct definition in a self-play setting where we control
-        both the dealer and the blind positions.
-
-    PFR (Pre-Flop Raise %):
-        True if the agent raised (action ≥ MIN_RAISE) at any point preflop.
-
-    3-Bet:
-        True if the agent raised preflop AND at least one other raise had
-        already occurred before the agent's raise.  We track the running
-        ``preflop_raises_seen`` counter in ``_HandAccumulator.record_action``
-        to detect this: when an agent raise arrives, if
-        ``preflop_raises_seen >= 2`` (BB open + one raise before us) the
-        agent's raise is a 3-bet.
-
-    AF (Aggression Factor):
-        (total bets + total raises) / total calls.  Stored as raw counts
-        so TelemetryAnalyzer can accumulate them across many hands before
-        dividing (avoids division-by-zero on rare samples).
-
-    WTSD / WSD:
-        Derived from ``went_to_showdown`` and ``reward`` respectively.
-
-    Args:
-        acc:              ``_HandAccumulator`` for this hand.
-        reward:           Raw chip delta (in chips, not BB units).
-        big_blind:        Big blind chip value for normalisation.
-        street_reached:   Last street with action (0-3).
-        went_to_showdown: True if the hand reached showdown.
-        won_at_showdown:  True if won at showdown.
-
-    Returns:
-        Populated ``HandRecord`` ready for ``TelemetryAnalyzer.record_hand()``.
+    [FIX C4] A three_bet szamitas helyes a javitott preflop_raises_total
+    ertek utan, mivel az _update_preflop_context() mar nem tultuntel.
     """
     actions        = acc.actions
     action_streets = acc.action_streets
 
-    # ── Separate preflop from post-flop actions ───────────────────────────
     preflop_actions = [a for a, s in zip(actions, action_streets) if s == 0]
 
-    # ── VPIP ─────────────────────────────────────────────────────────────
-    # Any non-fold action preflop constitutes putting money in voluntarily.
+    # VPIP: barmilyen nem-fold akcio preflop
     vpip = any(a != _FOLD for a in preflop_actions)
 
-    # ── PFR ──────────────────────────────────────────────────────────────
+    # PFR: legalabb egy preflop emeles
     pfr = any(a in _RAISE_ACTIONS for a in preflop_actions)
 
-    # ── 3-Bet ─────────────────────────────────────────────────────────────
-    # A 3-bet is: agent raised AND at least one raise existed before agent's raise
+    # 3-Bet: az agens emelt preflop, es mar volt ott elotte legalabb egy emeles
+    # [FIX C4] preflop_raises_total most pontos az inkrementalis szamolas utan
     pf_raises_before = acc.preflop_raises_total - sum(
         1 for a, s in zip(actions, action_streets)
         if s == 0 and a in _RAISE_ACTIONS
     )
-    
     three_bet = any(a in _RAISE_ACTIONS for a in preflop_actions) and pf_raises_before >= 1
 
-    # ── Aggression Factor counts ──────────────────────────────────────────
     total_aggressive = sum(1 for a in actions if a in _RAISE_ACTIONS)
     total_passive    = sum(1 for a in actions if a == _CHECK_CALL)
     total_folds      = sum(1 for a in actions if a == _FOLD)
 
-    # ── Reward normalisation ──────────────────────────────────────────────
-    safe_bb     = max(big_blind, 1e-6)
-    reward_bb   = reward / safe_bb
+    safe_bb   = max(big_blind, 1e-6)
+    reward_bb = reward / safe_bb
 
     return HandRecord(
         hand_id=acc.hand_id,

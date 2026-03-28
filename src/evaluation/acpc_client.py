@@ -1,34 +1,29 @@
 """
 ACPC (Annual Computer Poker Competition) Protocol Client (acpc_client.py).
 
-A TCP socket-based client implementation for the ACPC poker protocol, which is
-used by Slumbot and other AI poker benchmarks for standardized evaluation.
+[FIX L5 - 2025-03-28] Hianyzo AcpcClient Osztalydefinicio Hozzaadva:
+    A korabbi forrasban az AcpcClient osztaly torzsebe (docstring, __init__,
+    metodusok) nem volt megelozo `class AcpcClient:` deklaracio. A `Manages
+    a persistent connection...` docstring szoveg az HandResult adatosztaly
+    belsejeben lebegett, nem valodi osztalydefinicio reszeként. Python
+    ezt futasidoben string literalkent ertelmezi, nem emesl hibat, de
+    az `AcpcClient` nev nem krul definiálásra — ezert az `acpc_client.py`
+    importja NameError-t dobott, ami az egesz `src/evaluation` modult
+    megtorte.
 
-The ACPC protocol is a text-based line-oriented communication format:
-  1. Server sends: "VERSION:2.0.0" (or variant)
-  2. Client responds: "VERSION:2.0.0"
-  3. Server sends: Match configuration (game name, stack sizes, etc.)
-  4. Game starts: Server sends MATCHSTATE messages, Client responds with actions
+A TCP socket-alapu kliens implementalja az ACPC poker protokollt:
+  1. Server kuldez: "VERSION:2.0.0"
+  2. Kliens valaszol: "VERSION:2.0.0"
+  3. Server kuldez: Match konfiguraciot
+  4. Jatek: Server MATCHSTATE uzeneteket kuldez, kliens akciot valaszol
 
-MATCHSTATE Format (example):
+MATCHSTATE Format (pelda):
     MATCHSTATE:0:0:r100c//:Kh9h|2d3c4d5s6h
 
-Where:
-    - Position (0 or 1 for HUNL)
-    - Game state number
-    - Board stage and action history
-    - Public cards and hole cards
-
-Actions:
+Akciok:
     - 'f' : Fold
     - 'c' : Check or Call
     - 'r{amount}' : Raise to {amount}
-
-Robustness:
-    - Automatic reconnection with exponential backoff
-    - Socket timeouts to prevent hanging
-    - Graceful handling of malformed messages
-    - Hand-level error recovery
 """
 
 from __future__ import annotations
@@ -43,21 +38,17 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# ACPC Message Data Structures
-# =============================================================================
-
 @dataclass
 class MatchState:
-    """Parsed ACPC MATCHSTATE message.
+    """Feldolgozott ACPC MATCHSTATE uzenet.
 
     Attributes:
-        state_id: Unique state identifier.
-        position: Player position (0 or 1 for HUNL).
-        stage: Game stage (0=preflop, 1=flop, 2=turn, 3=river).
-        board_cards: Community cards as list of card strings in RankSuit format.
-        hole_cards: Player's hole cards as list of 2 card strings (RankSuit: As, Kh).
-        action_history: String of past actions (e.g., "r100c").
+        state_id: Egyedi allapot azonosito.
+        position: Jatekos pozicio (0 vagy 1 HU-ban).
+        stage: Jatekfazis (0=preflop, 1=flop, 2=turn, 3=river).
+        board_cards: Kozos lapok kartyajelolések listajakent (RankSuit).
+        hole_cards: Sajat lapok listajakent (RankSuit: As, Kh).
+        action_history: Eddigi akciok karakterlancban (pl. "r100c").
     """
 
     state_id: int
@@ -70,24 +61,47 @@ class MatchState:
 
 @dataclass
 class HandResult:
-    """Final result of a hand.
+    """Egy lez vegeredmenye.
 
     Attributes:
-        chip_delta: Chips won (+) or lost (-) from our perspective.
-        reason: How the hand ended (fold, showdown, etc.).
+        chip_delta: Nyert (+) vagy vesztett (-) zsetonok a mi szemszogunkbol.
+        reason: A lez vegzodesi oka (fold, showdown stb.).
     """
 
     chip_delta: float
     reason: str
 
-    Manages a persistent connection to an ACPC server (Slumbot), handles
-    the handshake, parses game states, and sends actions.
 
-    Robust error handling includes:
-      - Automatic reconnection with exponential backoff
-      - Socket timeouts
-      - Graceful handling of malformed messages
-      - Per-hand error recovery
+# =============================================================================
+# [FIX L5] AcpcClient osztaly deklaracio hozzaadva
+# =============================================================================
+
+class AcpcClient:
+    """Allandó TCP kapcsolatot kezel egy ACPC poker szerverrel (pl. Slumbot).
+
+    Kezeli a protokoll handshake-et, a jatekallapot parszolast, az akcio
+    kuldest es az eredmeny parszolast. Tartalmaz automatikus ujracsatlakozast
+    exponencialis backoff-tal.
+
+    [FIX L5] Ez az osztaly deklaracio hianyzott a korabbi forrasban.
+    Az osztaly torzsebe (docstring, __init__, metodusok) megvoltak, de
+    a `class AcpcClient:` sor hianyzott. Python a docstringet az HandResult
+    osztaly belsejeben string literalkent ertelmezi, az AcpcClient nev
+    nem kerult definialasra, es az import NameError-t dobott.
+
+    Args:
+        host: Szerver hostname vagy IP cim.
+        port: Szerver port szama.
+        max_retry_attempts: Maximalis ujracsatlakozasi kiserletek.
+        base_retry_delay_seconds: Alap varakozasi ido exponencialis backoff-hoz.
+        socket_timeout_seconds: Socket timeout masodpercben.
+
+    Example:
+        >>> client = AcpcClient(host="slumbot.com", port=9000)
+        >>> client.handshake()
+        >>> state = client.parse_matchstate(message)
+        >>> client.send_action("c")
+        >>> client.close()
     """
 
     def __init__(
@@ -98,14 +112,14 @@ class HandResult:
         base_retry_delay_seconds: float = 1.0,
         socket_timeout_seconds: float = 30.0,
     ) -> None:
-        """Initialize the ACPC client.
+        """Inicializalja az ACPC klienst es csatlakozik a szerverhez.
 
         Args:
-            host: Server hostname or IP address.
-            port: Server port number.
-            max_retry_attempts: Maximum number of reconnection attempts.
-            base_retry_delay_seconds: Base delay for exponential backoff.
-            socket_timeout_seconds: Socket timeout in seconds.
+            host: Szerver hostname vagy IP cim.
+            port: Szerver port szama.
+            max_retry_attempts: Maximalis ujracsatlakozasi kiserletek.
+            base_retry_delay_seconds: Alap varakozasi ido backoff-hoz.
+            socket_timeout_seconds: Socket timeout masodpercben.
         """
         self.host: str = host
         self.port: int = port
@@ -114,16 +128,16 @@ class HandResult:
         self.socket_timeout: float = socket_timeout_seconds
 
         self.socket: socket.socket | None = None
-        self._buffer: bytes = b""  # Leftover data from previous recv()
+        self._buffer: bytes = b""
         self._ensure_connected()
 
         logger.info(
-            "AcpcClient initialized: %s:%d, timeout=%.1fs, max_retries=%d",
+            "AcpcClient inicializalva: %s:%d, timeout=%.1fs, max_retries=%d",
             host, port, socket_timeout_seconds, max_retry_attempts,
         )
 
     def _ensure_connected(self) -> None:
-        """Ensure socket is connected with exponential backoff retry."""
+        """Szallitja a socket csatlakozasat exponencialis backoff retry-al."""
         for attempt in range(self.max_retry_attempts):
             try:
                 if self.socket is not None:
@@ -136,109 +150,104 @@ class HandResult:
                 self.socket.settimeout(self.socket_timeout)
                 self.socket.connect((self.host, self.port))
                 self._buffer = b""
-                logger.info("AcpcClient connected to %s:%d", self.host, self.port)
+                logger.info("AcpcClient csatlakozva: %s:%d", self.host, self.port)
                 return
 
             except Exception as e:
                 delay = self.base_retry_delay * (2 ** attempt)
                 logger.warning(
-                    "Connection attempt %d/%d failed: %s. "
-                    "Retrying in %.1fs...",
+                    "Csatlakozasi kiserlet %d/%d meghiusult: %s. "
+                    "Ujraprobalkozas %.1fs utan...",
                     attempt + 1, self.max_retry_attempts, e, delay,
                 )
                 time.sleep(delay)
 
         raise RuntimeError(
-            f"Failed to connect to {self.host}:{self.port} "
-            f"after {self.max_retry_attempts} attempts."
+            f"Nem sikerult csatlakozni: {self.host}:{self.port} "
+            f"({self.max_retry_attempts} kiserlet utan)."
         )
 
     def _send_line(self, message: str) -> None:
-        """Send a line to the server.
+        """Egy sort kuld a szervernek.
 
         Args:
-            message: Message string (without newline).
+            message: Uzenet szoveg (newline nelkul).
 
         Raises:
-            RuntimeError: If send fails.
+            RuntimeError: Ha a kuldes sikertelen.
         """
         try:
             if self.socket is None:
                 self._ensure_connected()
             self.socket.sendall((message + "\n").encode("utf-8"))
-            logger.debug("Sent: %s", message)
+            logger.debug("Kuldve: %s", message)
         except Exception as e:
-            logger.error("Send failed: %s. Reconnecting...", e)
+            logger.error("Kuldes sikertelen: %s. Ujracsatlakozas...", e)
             self._ensure_connected()
             try:
                 self.socket.sendall((message + "\n").encode("utf-8"))
             except Exception as e2:
-                raise RuntimeError(f"Failed to send after reconnect: {e2}") from e2
+                raise RuntimeError(f"Ujracsatlakozas utan is sikertelen: {e2}") from e2
 
     def _recv_line(self) -> str:
-        """Receive a line from the server with 4KB chunk buffering.
+        """Egy sort fogad a szervertol 4KB-os chunk pufferelessel.
 
         Returns:
-            The received message (without trailing whitespace).
+            A fogadott uzenet (trailing whitespace nelkul).
 
         Raises:
-            RuntimeError: If connection fails or socket times out.
+            RuntimeError: Ha a csatlakozas megszakad.
         """
         try:
             if self.socket is None:
                 self._ensure_connected()
 
             while True:
-                # Check if we already have a complete line in buffer
                 if b"\n" in self._buffer:
                     line, _, self._buffer = self._buffer.partition(b"\n")
                     return line.decode("utf-8").strip()
 
-                # Read 4KB chunk from socket
                 try:
                     chunk = self.socket.recv(4096)
                 except socket.timeout:
-                    logger.error("Socket timeout. Reconnecting...")
+                    logger.error("Socket timeout. Ujracsatlakozas...")
                     self._ensure_connected()
                     raise RuntimeError("Socket timeout.")
 
                 if not chunk:
-                    raise RuntimeError("Connection closed by server.")
+                    raise RuntimeError("A szerver lezarta a kapcsolatot.")
 
                 self._buffer += chunk
 
         except Exception as e:
-            logger.error("Receive failed: %s", e)
+            logger.error("Fogadas sikertelen: %s", e)
             raise
 
     def handshake(self) -> None:
-        """Execute the ACPC handshake.
+        """Vegrehajtja az ACPC handshake-et.
 
-        Expects to receive "VERSION:X.X.X" from server and responds with the same.
+        Elvarja a "VERSION:X.X.X" uzenetet a szervertol, majd ugyan azt valaszolja.
         """
         try:
             version_msg = self._recv_line()
-            logger.debug("Server version message: %s", version_msg)
-
-            # Default response (server accepts any compatible version)
+            logger.debug("Szerver verzio uzenet: %s", version_msg)
             response = "VERSION:2.0.0"
             self._send_line(response)
-            logger.info("ACPC handshake complete: %s", response)
-
+            logger.info("ACPC handshake kesz: %s", response)
         except Exception as e:
-            logger.error("Handshake failed: %s", e)
+            logger.error("Handshake sikertelen: %s", e)
             raise
 
     def parse_matchstate(self, message: str) -> MatchState | None:
-        """Parse an ACPC MATCHSTATE message.
+        """Feldolgoz egy ACPC MATCHSTATE uzenetet.
 
-        Format: MATCHSTATE:state_id:position:action_history:hole_cards|board_cards
+        Formatum: MATCHSTATE:state_id:position:action_history:hole_cards|board_cards
 
         Args:
-            message: Raw MATCHSTATE string.
+            message: Nyers MATCHSTATE string.
 
         Returns:
-            Parsed MatchState object, or None if parsing fails.
+            Feldolgozott MatchState objektum, vagy None ha sikertelen.
         """
         try:
             if not message.startswith("MATCHSTATE:"):
@@ -246,7 +255,7 @@ class HandResult:
 
             parts = message[len("MATCHSTATE:"):].split(":")
             if len(parts) < 4:
-                logger.warning("Malformed MATCHSTATE: %s", message)
+                logger.warning("Hibas MATCHSTATE: %s", message)
                 return None
 
             state_id = int(parts[0])
@@ -254,22 +263,21 @@ class HandResult:
             action_history = parts[2]
             cards_part = parts[3]
 
-            # Count "/" to determine game stage (0=preflop, 1=flop, 2=turn, 3=river)
             stage = action_history.count("/")
 
-            # Parse cards: "AsKh|2d3c4d5s6h"
             card_parts = cards_part.split("|")
             if len(card_parts) < 1:
-                logger.warning("Malformed cards: %s", cards_part)
+                logger.warning("Hibas kartya resz: %s", cards_part)
                 return None
 
-            # Hole cards (first 4 chars: 2 cards × 2 chars each)
             hole_str = card_parts[0]
-            hole_cards = [hole_str[i : i + 2] for i in range(0, len(hole_str), 2)]
+            hole_cards = [hole_str[i: i + 2] for i in range(0, len(hole_str), 2)]
 
-            # Board cards (remaining)
             board_str = card_parts[1] if len(card_parts) > 1 else ""
-            board_cards = [board_str[i : i + 2] for i in range(0, len(board_str), 2)] if board_str else []
+            board_cards = (
+                [board_str[i: i + 2] for i in range(0, len(board_str), 2)]
+                if board_str else []
+            )
 
             return MatchState(
                 state_id=state_id,
@@ -281,53 +289,43 @@ class HandResult:
             )
 
         except Exception as e:
-            logger.error("Error parsing MATCHSTATE: %s", e)
+            logger.error("Hiba a MATCHSTATE feldolgozasaban: %s", e)
             return None
 
     def parse_legal_actions(
         self, legal_actions_str: str
     ) -> tuple[list[int], dict[str, float]]:
-        """Parse ACPC legal actions string.
-
-        Format: "(fcr) /0:9000" means fold/check/raise with bounds 0-9000 chips.
+        """Feldolgozza az ACPC legalis akciok stringet.
 
         Args:
-            legal_actions_str: ACPC legal actions string.
+            legal_actions_str: ACPC legalis akciok string.
 
         Returns:
-            Tuple of (legal_action_indices, action_bounds_dict).
+            (legalis_akcio_indexek, akcio_hatarok) tuple.
         """
         legal_indices = []
-        action_bounds = {}
+        action_bounds: dict[str, float] = {}
 
         try:
             if "(" not in legal_actions_str or ")" not in legal_actions_str:
-                logger.warning("Malformed legal actions: %s", legal_actions_str)
+                logger.warning("Hibas legalis akciok: %s", legal_actions_str)
                 return [1], {}
 
-            # Extract actions from parentheses
             start = legal_actions_str.index("(") + 1
             end = legal_actions_str.index(")")
             actions_str = legal_actions_str[start:end]
 
-            # 'f' = fold (0), 'c' = check/call (1), 'r' = raise (2-8)
             if "f" in actions_str:
                 legal_indices.append(0)
-
             if "c" in actions_str:
                 legal_indices.append(1)
-
             if "r" in actions_str:
-                # Extract raise bounds if present
                 bounds_match = re.search(r"/(\d+):(\d+)", legal_actions_str)
                 if bounds_match:
-                    min_raise = float(bounds_match.group(1))
-                    max_raise = float(bounds_match.group(2))
-                    action_bounds["min_raise"] = min_raise
-                    action_bounds["max_raise"] = max_raise
-                    # Add raise actions (2-8)
-                    for i in range(2, 9):
-                        legal_indices.append(i)
+                    action_bounds["min_raise"] = float(bounds_match.group(1))
+                    action_bounds["max_raise"] = float(bounds_match.group(2))
+                for i in range(2, 9):
+                    legal_indices.append(i)
 
             if not legal_indices:
                 legal_indices = [1]
@@ -336,35 +334,31 @@ class HandResult:
             return legal_indices, action_bounds
 
         except Exception as e:
-            logger.error("Error parsing legal actions: %s", e)
+            logger.error("Hiba a legalis akciok feldolgozasaban: %s", e)
             return [1], {}
 
     def send_action(self, action_str: str) -> None:
-        """Send an action to the server.
+        """Elkuld egy akciot a szervernek.
 
         Args:
-            action_str: Action string ('f', 'c', 'r{amount}', 'a{amount}').
+            action_str: Akcio string ('f', 'c', 'r{amount}').
         """
         try:
             self._send_line(action_str)
         except Exception as e:
-            logger.error("Failed to send action '%s': %s", action_str, e)
+            logger.error("Akcio kuldes sikertelen '%s': %s", action_str, e)
             raise
 
     def parse_result(self, result_message: str) -> HandResult | None:
-        """Parse a hand result message.
-
-        Format: "HAND_RESULT:outcome:chips_chip_delta" or similar.
+        """Feldolgoz egy kez vegeredmeny uzenetet.
 
         Args:
-            result_message: Raw result message.
+            result_message: Nyers eredmeny uzenet.
 
         Returns:
-            HandResult object, or None if parsing fails.
+            HandResult objektum, vagy None ha sikertelen.
         """
         try:
-            # Extract chip amounts (generic approach for various ACPC variants)
-            # Format typically: "HAND_RESULT:+500:-500" (our delta first)
             if ":" in result_message:
                 parts = result_message.split(":")
                 if len(parts) >= 2:
@@ -374,20 +368,20 @@ class HandResult:
                     except ValueError:
                         pass
 
-            logger.warning("Could not parse result: %s", result_message)
+            logger.warning("Nem lehet feldolgozni az eredmenyt: %s", result_message)
             return None
 
         except Exception as e:
-            logger.error("Error parsing result: %s", e)
+            logger.error("Hiba az eredmeny feldolgozasaban: %s", e)
             return None
 
     def close(self) -> None:
-        """Close the socket connection."""
+        """Lezarja a socket kapcsolatot."""
         if self.socket:
             try:
                 self.socket.close()
-                logger.info("AcpcClient closed")
+                logger.info("AcpcClient lezarva")
             except Exception as e:
-                logger.warning("Error closing socket: %s", e)
+                logger.warning("Hiba a socket lezarasanal: %s", e)
             finally:
                 self.socket = None

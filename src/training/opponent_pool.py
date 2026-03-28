@@ -574,8 +574,19 @@ class OpponentPool:
         snapshot_id: str = f"snapshot_iter_{iteration:06d}"
         filepath: str = str(self.snapshot_dir / f"{snapshot_id}.pt")
 
-        # Mentes diszkre
-        torch.save(model_state_dict, filepath)
+        # [FIX M2] Atomikus mentes: temp fajl → rename (SIGKILL-stabil)
+        import os
+        tmp_filepath = filepath + ".tmp"
+        try:
+            torch.save(model_state_dict, tmp_filepath)
+            os.replace(tmp_filepath, filepath)
+        except Exception as save_exc:
+            if os.path.exists(tmp_filepath):
+                try:
+                    os.remove(tmp_filepath)
+                except OSError:
+                    pass
+            raise save_exc
 
         snapshot = PoolSnapshot(
             snapshot_id=snapshot_id,

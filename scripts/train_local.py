@@ -552,6 +552,7 @@ def build_training_pipeline(
         state_manager.save_training_state(
             network=net,
             optimizer=runner.trainer.optimizer,
+            scheduler=runner.trainer.scheduler,  # [FIX H4] HOZZAADVA
             iteration=iteration,
             total_env_steps=runner.collector.get_total_steps(),
             total_hands=0,  # TODO: track total hands from orchestrator
@@ -590,6 +591,11 @@ def build_training_pipeline(
         if "optimizer_state_dict" in checkpoint_to_resume:
             runner.trainer.optimizer.load_state_dict(checkpoint_to_resume["optimizer_state_dict"])
             logger.info("Optimizer state restored from checkpoint")
+        
+        # [FIX H4] Scheduler state restoration
+        if "scheduler_state_dict" in checkpoint_to_resume:
+            runner.trainer.scheduler.load_state_dict(checkpoint_to_resume["scheduler_state_dict"])
+            logger.info("Scheduler state restored from checkpoint")
         
         # P2.1: Restore RNG states for deterministic resumption
         if "rng_states" in checkpoint_to_resume and checkpoint_to_resume["rng_states"]:

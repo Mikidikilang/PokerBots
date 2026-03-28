@@ -1,10 +1,13 @@
 """
 Event-Driven Vegrehajto Ciklus (runner.py).
 
-A teljes RL training pipeline fo vezerlo modulja. Nem a klasszikus
-model.learn(total_timesteps) megkozelitest alkalmazza, hanem egy
-sajat, iterativ, esemenyvezrelt ciklust, amely minden lepesnel
-lehetoseget ad az Orchestratornak a beavatkozasra.
+[FIX C1 - 2025-03-28] Bootstrap Ertek Timing Javitasa:
+    A _run_single_iteration() tobbe nem hivja a collector.get_last_bootstrap_value()-t
+    a compute_gae() elott. A bootstrap erteket most a collector.collect_rollout()
+    atomikusan tarolja a bufferben (buffer.set_last_value()), igy a runner
+    onnan olvassa ki: self.buffer.compute_gae(last_value=self.buffer.get_last_bootstrap_value()).
+    Ez megszunteti a race conditiont: az ertek garantaltan a HELYES, truncated
+    allapothoz tartozik, nem egy lepessessel kesobb szamolt kozelites.
 
 A ciklus felepitese:
     1. Bootstrapping: Kornyezet, halozat, buffer, trainer inicializalasa
@@ -14,10 +17,6 @@ A ciklus felepitese:
         c) Telemetria feldolgozas (orchestrator callback)
         d) Checkpoint mentes (periodikus)
     3. Graceful Shutdown: Utolso mentes, HF feltoltes
-
-Hivatkozasok:
-    - Specifikacio: runner.py — event-driven loop
-    - Curriculum doc: A runner.py integracioja es vegrehajtasi ciklusa
 """
 
 from __future__ import annotations
@@ -38,17 +37,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class RunnerConfig:
-    """A fo vegrehajtasi ciklus konfiguracioja.
-
-    Attributes:
-        max_iterations: Maximalis iteracioszam (0=vegtelen).
-        log_interval: Logolasos iteraciok gyakorisaga.
-        eval_interval: Kiertekelo iteraciok gyakorisaga.
-        save_interval: Checkpoint mentes gyakorisaga (iteraciokent).
-        buffer_save_interval: Buffer mentes gyakorisaga.
-        max_runtime_hours: Maximalis futasi ido oraban (graceful shutdown).
-        device: Szamitasi eszkoz ("cpu", "cuda", "auto").
-    """
+    """A fo vegrehajtasi ciklus konfiguracioja."""
 
     max_iterations: int = 0
     log_interval: int = 10
@@ -60,14 +49,6 @@ class RunnerConfig:
 
     @classmethod
     def from_dict(cls, cfg: dict[str, Any]) -> RunnerConfig:
-        """YAML config szotarbol peldanyosit.
-
-        Args:
-            cfg: Teljes YAML konfiguracio.
-
-        Returns:
-            RunnerConfig peldany.
-        """
         orch = cfg.get("orchestrator", {})
         tel = orch.get("telemetry", {})
         mlops = cfg.get("mlops", {})
@@ -87,23 +68,12 @@ class RunnerConfig:
 class TrainingRunner:
     """A teljes RL training pipeline fo vezerlo osztalya.
 
-    Egyetlen peldany vezrel az egesz betanitasi folyamatot:
-    a kornyezet inicializalasatol a graceful shutdown-ig.
-
-    Az Orchestrator es MLOps modulok callback-eken keresztul
-    csatlakoznak a ciklushoz (opcionalis).
-
-    Example:
-        >>> runner = TrainingRunner(cfg, env, network, ...)
-        >>> runner.run()
-
-    Attributes:
-        config: Runner konfiguracio.
-        network: Az Actor-Critic halozat.
-        trainer: A PPO trainer.
-        collector: Az adatgyujto.
-        buffer: A rollout buffer.
-        iteration: Az aktualis iteracio szama.
+    [FIX C1] A _run_single_iteration() a compute_gae() hivast a buffer-ben
+    tarolt bootstrap ertek alapjan vegzi:
+        self.buffer.compute_gae(last_value=self.buffer.get_last_bootstrap_value())
+    A korabbi self.collector.get_last_bootstrap_value(self.network) hivast
+    eltavolitottuk, mert az egy lepessessel kesob szamolt, versenyfutasi
+    allapotot (race condition) okozva episode hatarokon.
     """
 
     def __init__(
@@ -122,41 +92,13 @@ class TrainingRunner:
         checkpoint_dir: str = "checkpoints",
         orchestrator: Any | None = None,
     ) -> None:
-        """Inicializalja a training runner-t.
-
-        Args:
-            config: Runner konfiguracio.
-            env: Poker kornyezet peldany.
-            obs_builder: ObservationBuilder peldany.
-            network: ActorCriticNetwork peldany.
-            trainer_config: PPO trainer konfiguracio.
-            buffer_config: Rollout buffer konfiguracio.
-            yaml_config: Raw YAML configuration dictionary.
-            on_iteration_end: Callback minden iteracio vegen.
-                Parameterei: (iteracio_szam, osszesitett_statisztikak).
-                Az Orchestrator telemetria feldolgozasa ide csatlakozik.
-            on_eval_step: Callback a kiertekelo lepeseknel.
-                Az Orchestrator curriculum logikaja ide csatlakozik.
-            on_checkpoint: Callback a checkpoint menteseknel.
-                Az MLOps hf_sync ide csatlakozik.
-            on_ddp_sync: Callback a DDP szinkronizaciohoz.
-                Parametere: iteracio_szam.
-                Ez a callback NEM a try/except blokkban fut — kritikal hibak
-                el kell bukjanak a DDP deadlock elkeulesehez.
-            checkpoint_dir: Checkpoint konyvtar eleresi ut.
-            orchestrator: Optional AutoAdaptiveOrchestrator instance.
-                Ha megadva, a RolloutCollector hand records-okat jeleniti meg.
-                Ha None, a telemetria adat nem lesz gyujtve.
-        """
         self.config: RunnerConfig = config
         self.network: Any = network
         self.env: Any = env
         self.obs_builder: Any = obs_builder
 
-        # Device feloldas
         self.device: torch.device = self._resolve_device(config.device)
 
-        # Komponensek inicializalasa
         self.buffer: RolloutBuffer = RolloutBuffer(
             buffer_config or RolloutBufferConfig()
         )
@@ -174,18 +116,16 @@ class TrainingRunner:
             device=self.device,
         )
 
-        # Callback-ek
         self._on_iteration_end = on_iteration_end
         self._on_eval_step = on_eval_step
         self._on_checkpoint = on_checkpoint
         self._on_ddp_sync = on_ddp_sync
 
-        # Allapot
         self.iteration: int = 0
         self._start_time: float = 0.0
         self._checkpoint_dir: str = checkpoint_dir
         self._should_stop: bool = False
-        self._nan_error_occurred: bool = False  # P1.6: Gate final checkpoint save to prevent NaN overwrite
+        self._nan_error_occurred: bool = False
 
         logger.info(
             "TrainingRunner inicializalva: device=%s, max_iter=%d, "
@@ -199,16 +139,7 @@ class TrainingRunner:
     # =========================================================================
 
     def run(self) -> dict[str, Any]:
-        """Elindítja es futtatja a teljes training ciklust.
-
-        A ciklus addig fut, amig:
-            - Eleri a max_iterations-t (ha > 0)
-            - A graceful shutdown idozito lejr
-            - Kulso leallitasi jelet kap (request_stop())
-
-        Returns:
-            Dict az osszesitett training eredmenyekkel.
-        """
+        """Elindítja es futtatja a teljes training ciklust."""
         self._start_time = time.monotonic()
         self._should_stop = False
 
@@ -230,7 +161,6 @@ class TrainingRunner:
             while not self._should_stop:
                 self.iteration += 1
 
-                # --- Idokorlat ellenorzes ---
                 if self._check_time_limit():
                     logger.warning(
                         "Idokorlat elerve (%.1f ora). Graceful shutdown...",
@@ -238,7 +168,6 @@ class TrainingRunner:
                     )
                     break
 
-                # --- Iteracioszam korlat ---
                 if (self.config.max_iterations > 0
                         and self.iteration > self.config.max_iterations):
                     logger.info(
@@ -247,15 +176,12 @@ class TrainingRunner:
                     )
                     break
 
-                # --- EGY ITERACIO ---
                 iter_stats: dict[str, float] = self._run_single_iteration()
                 all_stats.append(iter_stats)
 
-                # --- Periodikus logolas ---
                 if self.iteration % self.config.log_interval == 0:
                     self._log_iteration(iter_stats)
 
-                # --- Kiertekeles (Orchestrator callback) ---
                 if self.iteration % self.config.eval_interval == 0:
                     if self._on_eval_step is not None:
                         eval_result = self._on_eval_step(self.iteration, self.network)
@@ -264,30 +190,27 @@ class TrainingRunner:
                                 "Eval iter #%d: %s", self.iteration, eval_result
                             )
 
-                # --- Checkpoint mentes ---
                 if self.iteration % self.config.save_interval == 0:
                     self._save_checkpoint()
 
         except KeyboardInterrupt:
             logger.warning("KeyboardInterrupt! Graceful shutdown...")
         except FloatingPointError as exc:
-            # NaN/Inf detected — weights are corrupted, skip final checkpoint save (P1.6)
             logger.critical(
-                "FLOATINGPOINTERROR (Iter #%d): %s — Weights are corrupted, final save will be skipped",
+                "FLOATINGPOINTERROR (Iter #%d): %s — Sulyszennyezodes, "
+                "vegso checkpoint mentes kihagyva.",
                 self.iteration, exc, exc_info=True,
             )
-            self._nan_error_occurred = True  # Gate finally block checkpoint
+            self._nan_error_occurred = True
             raise
         except Exception as exc:
             logger.error(
                 "KRITIKUS HIBA az iteracioban #%d: %s",
                 self.iteration, exc, exc_info=True,
             )
-            # Mentsi kiserlet hiba eseten is (except NaN — already handled above)
             self._save_checkpoint(emergency=True)
             raise
         finally:
-            # Graceful shutdown: utolso mentes (P1.6: skip if NaN error occurred)
             if not self._nan_error_occurred:
                 self._save_checkpoint(final=True)
 
@@ -323,14 +246,17 @@ class TrainingRunner:
     def _run_single_iteration(self) -> dict[str, float]:
         """Vegrehajt egyetlen training iteraciot.
 
-        A hibakezeles granulaltan kulonvalasztja:
-            - Matematikai hibak (NaN, Inf, dimenzio mismatch) → azonnali stop
-            - Infrastrukturalis hibak (I/O, callback) → naplozas, folytatas
-
-        Lepesek:
-            1. Adatgyujtes (collector)
-            2. Gradiens frissites (trainer)
-            3. Callback az Orchestratornak
+        [FIX C1] A bootstrap ertek szamitasanak javitasa:
+            REGI (eltavolitott):
+                last_value = self.collector.get_last_bootstrap_value(self.network)
+                self.buffer.compute_gae(last_value=last_value)
+            ÚJ (helyes):
+                # A collector.collect_rollout() mar atomikusan beallitotta
+                # a buffer._last_bootstrap_value-t a rollout vegen.
+                self.buffer.compute_gae(last_value=self.buffer.get_last_bootstrap_value())
+            Ez megszunteti a race conditiont: a buffer garantaltan a HELYES,
+            truncated allapothoz tartozo V(s_T)-t tarolja, nem egy lepessessel
+            kesobb szamolt kozelitest.
 
         Returns:
             Dict az iteracio statisztikaival.
@@ -341,18 +267,26 @@ class TrainingRunner:
         """
         # 1. Adatgyujtes — matematikai hibak itt is elofordulhatnak
         try:
-            collect_stats = self.collector.collect_rollout(n_steps=self.buffer.config.buffer_size)
+            collect_stats = self.collector.collect_rollout(
+                n_steps=self.buffer.config.buffer_size
+            )
         except (RuntimeError, ValueError) as exc:
             logger.error(
                 "MATEMATIKAI HIBA az adatgyujtesben (iter #%d): %s",
                 self.iteration, exc,
             )
-            raise  # Nem recoverable — dimenzio/allapot hiba
+            raise
 
-        # 1b. GAE Szamitasa — bootstrap last_value szukseg a returnshez (P1.5 fix: batch obs)
+        # 2. GAE szamitasa — [FIX C1] a buffer-bol olvassuk a bootstrap erteket
         try:
-            last_value = self.collector.get_last_bootstrap_value(self.network)
-            self.buffer.compute_gae(last_value=last_value)
+            # A bootstrap erteket a collector.collect_rollout() mar atomikusan
+            # tarolta a bufferben. Nincs szukseg ujra-szamolasra.
+            bootstrap_value = self.buffer.get_last_bootstrap_value()
+            logger.debug(
+                "GAE szamitas indul: bootstrap_value=%.6f (iter #%d)",
+                bootstrap_value, self.iteration,
+            )
+            self.buffer.compute_gae(last_value=bootstrap_value)
         except (RuntimeError, ValueError) as exc:
             logger.error(
                 "HIBA a GAE szamitasaban (iter #%d): %s",
@@ -360,11 +294,10 @@ class TrainingRunner:
             )
             raise
 
-        # 2. PPO Gradiens frissites — NaN/Inf detektalas
+        # 3. PPO Gradiens frissites — NaN/Inf detektalas
         try:
             train_stats: dict[str, float] = self.trainer.train_on_buffer(self.buffer)
 
-            # NaN/Inf ellenorzes a loss ertekekben
             for key in ("policy_loss", "value_loss", "total_loss"):
                 loss_val: float = train_stats.get(key, 0.0)
                 if loss_val != loss_val or abs(loss_val) == float("inf"):
@@ -374,7 +307,7 @@ class TrainingRunner:
                     )
 
         except FloatingPointError:
-            raise  # Propagal a fo ciklusba a FaultHandler szamara
+            raise
         except (RuntimeError, ValueError) as exc:
             logger.error(
                 "MATEMATIKAI HIBA a training lepesben (iter #%d): %s",
@@ -382,15 +315,16 @@ class TrainingRunner:
             )
             raise
 
-        # 3. Osszesitett statisztikak
+        # 4. Osszesitett statisztikak
         iter_stats: dict[str, float] = {
             "iteration": float(self.iteration),
             **{f"collect/{k}": v for k, v in collect_stats._asdict().items()},
             **{f"train/{k}": v for k, v in train_stats.items()},
             "elapsed_hours": (time.monotonic() - self._start_time) / 3600,
+            "bootstrap_value": bootstrap_value,  # diagnosztika
         }
 
-        # 4. Orchestrator callback — infrastrukturalis hiba nem allitja le a tanulast
+        # 5. Orchestrator callback
         if self._on_iteration_end is not None:
             try:
                 self._on_iteration_end(self.iteration, iter_stats)
@@ -401,12 +335,12 @@ class TrainingRunner:
                     "az aktualis iteracioban kihagyasra kerult.",
                     self.iteration, exc,
                 )
-        
-        # 5. DDP szinkronizacio — Kritikus hiba eseten el kell bukni (nincs try/except)
+
+        # 6. DDP szinkronizacio
         if self._on_ddp_sync is not None:
             self._on_ddp_sync(self.iteration)
-        
-        # 6. Buffer reset az elkovetkezo rollout-hoz
+
+        # 7. Buffer reset
         self.buffer.reset()
 
         return iter_stats
@@ -418,7 +352,6 @@ class TrainingRunner:
     def _save_checkpoint(
         self, emergency: bool = False, final: bool = False
     ) -> None:
-        """Elmenti a halozat es az optimizer allapotat a StateManager-en keresztul."""
         if self._on_checkpoint is None:
             logger.warning(
                 "Nincs on_checkpoint callback konfiguralva — allapot NEM lett mentve (iter #%d)",
@@ -427,10 +360,7 @@ class TrainingRunner:
             return
 
         save_type = "EMERGENCY" if emergency else ("FINAL" if final else "PERIODIC")
-        logger.info(
-            "%s checkpoint mentes indul (iter #%d)",
-            save_type, self.iteration,
-        )
+        logger.info("%s checkpoint mentes indul (iter #%d)", save_type, self.iteration)
 
         try:
             self._on_checkpoint(self.iteration, self.network)
@@ -446,30 +376,14 @@ class TrainingRunner:
     # =========================================================================
 
     def _check_time_limit(self) -> bool:
-        """Ellenorzi, hogy a futasido megkozelitette-e az idokorlatot.
-
-        A time.monotonic()-t hasznalja az NTP ugrasok elkerulese erdekeben.
-
-        Returns:
-            True ha a futasido meghaladta a max_runtime_hours-t.
-        """
         elapsed_hours: float = (time.monotonic() - self._start_time) / 3600
         return elapsed_hours >= self.config.max_runtime_hours
 
     def request_stop(self) -> None:
-        """Kulso leallitasi keres (thread-safe flag beallitas).
-
-        A kovetkezo iteracio elejen a ciklus leall.
-        """
         self._should_stop = True
         logger.info("Leallitasi keres fogadva. A ciklus a kovetkezo iteracional leall.")
 
     def get_elapsed_hours(self) -> float:
-        """Visszaadja az eltelt idot oraban.
-
-        Returns:
-            Eltelt ido oraban.
-        """
         if self._start_time == 0:
             return 0.0
         return (time.monotonic() - self._start_time) / 3600
@@ -479,22 +393,18 @@ class TrainingRunner:
     # =========================================================================
 
     def _log_iteration(self, stats: dict[str, float]) -> None:
-        """Reszletes logolast vegez egy iteraciorol.
-
-        Args:
-            stats: Az iteracio statisztikai szotarja.
-        """
         logger.info(
             "Iter #%d | rew=%.4f | pl=%.4f vl=%.4f H=%.4f | "
-            "kl=%.4f clip=%.1f%% | eps=%d | %.2fh",
+            "kl=%.4f clip=%.1f%% | eps=%d | boot=%.4f | %.2fh",
             self.iteration,
-            stats.get("collect/mean_episode_reward", 0.0),
+            stats.get("collect/mean_reward", 0.0),
             stats.get("train/policy_loss", 0.0),
             stats.get("train/value_loss", 0.0),
             stats.get("train/entropy_loss", 0.0),
             stats.get("train/approx_kl", 0.0),
             stats.get("train/clip_fraction", 0.0) * 100,
-            int(stats.get("collect/episodes_completed", 0)),
+            int(stats.get("collect/n_episodes", 0)),
+            stats.get("bootstrap_value", 0.0),  # [C1 diagnosztika]
             stats.get("elapsed_hours", 0.0),
         )
 
@@ -504,14 +414,6 @@ class TrainingRunner:
 
     @staticmethod
     def _resolve_device(device_str: str) -> torch.device:
-        """Az "auto" device-ot feloldja CUDA-ra ha elerheto, egyebkent CPU.
-
-        Args:
-            device_str: "auto", "cpu", vagy "cuda".
-
-        Returns:
-            torch.device peldany.
-        """
         if device_str == "auto":
             if torch.cuda.is_available():
                 device = torch.device("cuda")

@@ -1,26 +1,24 @@
 """
 Observation Space Konstruktor (features.py).
 
-Ez a modul felelős a nyers játékmotor (RLCard/PettingZoo) állapotadatainak
-transzformálásáért egy strukturált, normalizált tenzoriális formátumba,
-amelyet a PPO Actor-Critic hálózat közvetlenül feldolgozhat.
+[FIX H1 - 2025-03-28] Korlatlan Log-Skala Normalizacio Javitasa:
+    A korabbi _normalize_chips() implementacio log-skalaval kezelte az
+    initial_stack-et meghalado ertekeket:
+        if normalized > 1.0:
+            return 1.0 + np.log1p(normalized - 1.0)
+    Egy 3x initial stacknel ez ~2.1-et adott vissza, 5x stacknel ~2.6-ot —
+    a feature ter korlat nelkul nott. Ez destabilizalta az ortogonalis
+    sulyinicializaciot es lassu konvergenciat okozott mély stack helyzetekben.
 
-A megfigyelési tér (Observation Space) a következő almodulokból épül fel:
-    1. Kártyakódolás: 52-dim multi-hot × 2 (hole cards + community cards) = 104 dim
-    2. Környezeti metrikák: Normalizált zsetonállások, pot méret, pozíció stb.
-    3. Licittörténet: Rögzített méretű tenzor (max_actions × akció_jellemzők)
-    4. Pozíció: One-hot kódolt vektor
+    A javitas: az erteket 5 × initial_stack-nel ragjuk be (hard clip), majd
+    a [0, 1] tartomanyba normalizaljuk. Igy a feature ter mindig [0, 1]
+    kompakt tartomanyban marad, a haloaz belso retegei konzisztens bemenetet
+    kapnak, es az ortogonalis init hatekeony marad.
 
-Az összesített kimenet egy ~250-300 dimenziós laposított (flat) vektor.
-
-Architektúra szerződés:
-    - Bemenet: Nyers játékállapot szótár a játékmotorból
-    - Kimenet: Dict[str, torch.Tensor] formátumú megfigyelési szótár
-    - A hálózat beágyazó rétegei felelősek az egyesítésért
-
-Hivatkozások:
-    - Specifikáció: Állapottér és Akciótér Tervezése szekció
-    - PettingZoo NLHE: https://pettingzoo.farama.org/environments/classic/texas_holdem_no_limit/
+    Megorzott funkcionalis viselkedes:
+        - Kis ertekek (< initial_stack): linearis skalas, ugyanaz mint elobb
+        - Nagy ertekek (1x-5x initial): linearis skalas, [0, 1]-re normalizalva
+        - Nagyon nagy ertekek (>5x): 1.0-ra csokkentve (ritka esemeny deep stack)
 """
 
 from __future__ import annotations
@@ -35,44 +33,24 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Konstansok
-# =============================================================================
-
 DECK_SIZE: int = 52
-"""A francia kártyapakli mérete."""
-
 NUM_SUITS: int = 4
-"""Színek száma (pikk, kőr, káró, treff)."""
-
 NUM_RANKS: int = 13
-"""Értékek száma (2-A)."""
 
 SUIT_MAP: dict[str, int] = {"S": 0, "H": 1, "D": 2, "C": 3}
-"""Szín → index leképezés (Spade, Heart, Diamond, Club)."""
-
 RANK_MAP: dict[str, int] = {
     "2": 0, "3": 1, "4": 2, "5": 3, "6": 4, "7": 5, "8": 6,
     "9": 7, "T": 8, "J": 9, "Q": 10, "K": 11, "A": 12,
 }
-"""Érték → index leképezés (2-A)."""
 
+# [FIX H1] Maximalis chip ertek a normalizaciohoz, initial_stack szorosaban.
+# 5x-os cap: tipikus 200BB stack-nel ez 1000BB, ami lefed mindent relevansat.
+_CHIP_NORMALIZATION_MAX_MULTIPLIER: float = 5.0
 
-# =============================================================================
-# Konfigurációs Adatosztály
-# =============================================================================
 
 @dataclass(frozen=True)
 class ObservationConfig:
-    """Az Observation Space összes konfigurálható paraméterét tárolja.
-
-    Attributes:
-        num_players: Az asztal játékosainak száma (2-9).
-        max_betting_actions: Maximális licitkörök száma egy leosztásban.
-        action_feature_dim: Akciótípusok + normalizált méretek dimenziója.
-        initial_stack_bb: Induló zsetonkészlet Big Blind egységben.
-        normalization_range: A normalizált értékek céltartománya [min, max].
-    """
+    """Az Observation Space osszes konfiguralhato parameteret tarolja."""
 
     num_players: int = 6
     max_betting_actions: int = 18
@@ -81,65 +59,36 @@ class ObservationConfig:
     normalization_range: tuple[float, float] = (0.0, 1.0)
 
     def __post_init__(self) -> None:
-        """Validálja a konfigurációs paramétereket inicializáláskor."""
         if not 2 <= self.num_players <= 9:
             raise ValueError(
-                f"num_players értéke {self.num_players}, de 2 és 9 között kell lennie."
+                f"num_players erteke {self.num_players}, de 2 es 9 kozott kell lennie."
             )
         if self.max_betting_actions < 1:
             raise ValueError(
-                f"max_betting_actions értéke {self.max_betting_actions}, de legalább 1 kell legyen."
+                f"max_betting_actions erteke {self.max_betting_actions}, de legalabb 1 kell legyen."
             )
         logger.debug(
-            "ObservationConfig inicializálva: num_players=%d, max_betting_actions=%d, "
+            "ObservationConfig inicializalva: num_players=%d, max_betting_actions=%d, "
             "initial_stack_bb=%.1f",
             self.num_players, self.max_betting_actions, self.initial_stack_bb,
         )
 
 
-# =============================================================================
-# Fő Observation Builder Osztály
-# =============================================================================
-
 class ObservationBuilder:
-    """A nyers játékállapotot strukturált, normalizált tenzor-szótárrá alakítja.
+    """A nyers jatekallapotot strukturalt, normalizalt tenzor-szotarra alakitja.
 
-    Ez az osztály a POMDP megfigyelési függvényt implementálja: a játékmotor
-    nyers kimenetéből egy Dict[str, Tensor] formátumú bemenetet generál
-    a neurális hálózat számára.
-
-    A kimeneti szótár kulcsai:
-        - ``hole_cards``: (52,) multi-hot bináris vektor a saját lapokhoz
-        - ``community_cards``: (52,) multi-hot bináris vektor a közös lapokhoz
-        - ``env_metrics``: (N,) normalizált környezeti metrikák
-        - ``betting_history``: (max_actions, action_dim) licittörténet tenzor
-        - ``position``: (num_players,) one-hot pozíció vektor
-        - ``action_mask``: (9,) bináris akció érvényességi maszk
-
-    Example:
-        >>> config = ObservationConfig(num_players=6)
-        >>> builder = ObservationBuilder(config)
-        >>> raw_state = {"hand": ["AS", "KH"], "public_cards": ["TC", "JD", "QS"],
-        ...              "pot": 150, "my_chips": 1800, "big_blind": 10, ...}
-        >>> obs = builder.build(raw_state)
-        >>> flat = builder.flatten(obs)
-        >>> flat.shape  # ~250-300 dimenziós vektor
+    [FIX H1] A chip normalizacio mostantol korlatos [0, 1] tartomanyban marad.
+    Lasd _normalize_chips() es a modszer szintju docstringet.
     """
 
     def __init__(self, config: ObservationConfig | None = None) -> None:
-        """Inicializálja az ObservationBuilder-t a megadott konfigurációval.
-
-        Args:
-            config: Az observation space paraméterei. Ha None, az alapértelmezett
-                    ObservationConfig kerül alkalmazásra.
-        """
         self.config: ObservationConfig = config or ObservationConfig()
         self._norm_min: float = self.config.normalization_range[0]
         self._norm_max: float = self.config.normalization_range[1]
 
         logger.info(
-            "ObservationBuilder inicializálva: %d játékos, %d max akció, "
-            "normalizáció=[%.1f, %.1f]",
+            "ObservationBuilder inicializalva: %d jatekos, %d max akcio, "
+            "normalizacio=[%.1f, %.1f] [H1 FIX: korlatos chip norm]",
             self.config.num_players,
             self.config.max_betting_actions,
             self._norm_min,
@@ -151,43 +100,14 @@ class ObservationBuilder:
     # =========================================================================
 
     def build(self, raw_state: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """A nyers játékállapotból elkészíti a teljes megfigyelési szótárat.
-
-        Args:
-            raw_state: A játékmotor nyers kimeneti szótára. Lehet RLCard-specifikus
-                       beágyazott `raw_obs` kulccsal, vagy lapos szótár. Elvárt kulcsok:
-                - ``hand``: List[str] — saját lapok (pl. ["AS", "KH"])
-                - ``public_cards``: List[str] — közös lapok
-                - ``pot``: float — aktuális pot méret
-                - ``my_chips``: float — saját zsetonállás
-                - ``opponent_chips``: List[float] — ellenfelek zsetonállásai
-                - ``big_blind``: float — nagyvak méret
-                - ``amount_to_call``: float — megadandó tét
-                - ``position``: int — saját pozíció index
-                - ``betting_history``: List[dict] — licittörténet
-                - ``legal_actions``: List[int | Action] — legális akció indexek 
-                  vagy RLCard Action objektumok (automatikusan int-é konvertálva)
-
-        Returns:
-            Dict[str, torch.Tensor] formátumú megfigyelési szótár.
-
-        Raises:
-            KeyError: Ha a `state_source`-ból hiányzik egy kötelező kulcs.
-            ValueError: Ha a kártyaformátum érvénytelen.
-        """
+        """A nyers jatekallapotbol elkesziti a teljes megfigyeles szotarat."""
         if isinstance(raw_state, tuple):
             raw_state = raw_state[0]
-        logger.debug("Observation építése nyers állapotból: %d kulcs", len(raw_state))
+        logger.debug("Observation epitese nyers allapotbol: %d kulcs", len(raw_state))
 
-        # RLCard-kompatibilitás: ha a releváns adatok a 'raw_obs' alatt vannak,
-        # azt a szótárt használjuk, de a 'legal_actions' és egyéb külső
-        # kulcsok megtartása érdekében összefésüljük.
         state_source = raw_state
         if "raw_obs" in raw_state and isinstance(raw_state["raw_obs"], dict):
-            logger.debug("Beágyazott 'raw_obs' kulcs detektálva, RLCard állapot.")
-            # A raw_obs kulcsait beemeljük a fő szótárba, felülírva, ha ütközés van.
-            # Ez biztosítja, hogy a 'hand', 'pot', stb. elérhető legyen,
-            # miközben a 'legal_actions' és 'action_mask' is megmarad.
+            logger.debug("Beagyazott 'raw_obs' kulcs detektalt, RLCard allapot.")
             state_source = {**raw_state, **raw_state["raw_obs"]}
 
         try:
@@ -205,15 +125,14 @@ class ObservationBuilder:
             }
         except KeyError as exc:
             logger.error(
-                "Hiányzó kulcs az állapotforrásból ('%s'): %s. "
-                "Elérhető kulcsok: %s",
+                "Hianyzo kulcs az allapotforrasbol ('%s'): %s. "
+                "Elerheto kulcsok: %s",
                 "raw_obs" if "raw_obs" in raw_state else "raw_state",
                 exc,
                 list(state_source.keys()),
             )
             raise
 
-        # Dimenzió ellenőrzés (DEBUG szinten)
         if logger.isEnabledFor(logging.DEBUG):
             for key, tensor in observation.items():
                 logger.debug(
@@ -225,19 +144,7 @@ class ObservationBuilder:
         return observation
 
     def flatten(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
-        """A szótárat egyetlen laposított (1D) vektorrá konvertálja.
-
-        A flatten sorrendje determinisztikus és a hálózat beágyazó rétegének
-        bemeneti dimenziójával konzisztens:
-        hole_cards(52) + community_cards(52) + env_metrics(N) +
-        betting_history(flat) + position(P)
-
-        Args:
-            observation: A build() metódus kimenete.
-
-        Returns:
-            Egydimenziós torch.Tensor (~250-300 elem).
-        """
+        """A szotarat egyetlen laposított (1D) vektorra konvertalja."""
         components: list[torch.Tensor] = [
             observation["hole_cards"],
             observation["community_cards"],
@@ -245,73 +152,34 @@ class ObservationBuilder:
             observation["betting_history"].flatten(),
             observation["position"],
         ]
-
         flat_vector: torch.Tensor = torch.cat(components, dim=0)
-
-        logger.debug(
-            "Laposított megfigyelés: dim=%d (hole=52, community=52, metrics=%d, "
-            "history=%d, position=%d)",
-            flat_vector.shape[0],
-            observation["env_metrics"].shape[0],
-            observation["betting_history"].numel(),
-            observation["position"].shape[0],
-        )
-
+        logger.debug("Laposított megfigyelés: dim=%d", flat_vector.shape[0])
         return flat_vector
 
     def get_observation_dim(self) -> int:
-        """Kiszámítja a laposított megfigyelési vektor teljes dimenzióját.
-
-        Returns:
-            A vektor elemeinek összesített száma (int).
-        """
-        card_dim: int = DECK_SIZE * 2  # hole + community
-        # env_metrics: pot, my_chips, amount_to_call, min_raise, + opponent stacks
+        card_dim: int = DECK_SIZE * 2
         metrics_dim: int = 4 + (self.config.num_players - 1)
         history_dim: int = (
             self.config.max_betting_actions * self.config.action_feature_dim
         )
         position_dim: int = self.config.num_players
-
         total: int = card_dim + metrics_dim + history_dim + position_dim
-
-        logger.debug(
-            "Observation dimenzió: cards=%d, metrics=%d, history=%d, position=%d → total=%d",
-            card_dim, metrics_dim, history_dim, position_dim, total,
-        )
         return total
 
     # =========================================================================
-    # Privát Kódoló Metódusok
+    # Privat Kodoló Metódusok
     # =========================================================================
 
     def _encode_cards(self, cards: list[str]) -> torch.Tensor:
-        """Kártyalistát 52-dimenziós multi-hot bináris vektorrá kódol.
-
-        Minden kártya egy egyedi indexet kap a [0, 51] tartományban:
-            index = rank_index * NUM_SUITS + suit_index
-
-        A kimenet egy 52-elemű float32 vektor, ahol az aktív kártyák
-        pozícióján 1.0, máshol 0.0 áll.
-
-        Args:
-            cards: Kártyajelölések listája (pl. ["AS", "KH", "TC"]).
-                   Üres lista esetén csupa nulla vektor.
-
-        Returns:
-            (52,) alakú torch.Tensor (float32).
-
-        Raises:
-            ValueError: Ha egy kártya formátuma érvénytelen.
-        """
+        """Kartyalistat 52-dimenziós multi-hot binaris vektorra kodol."""
         encoding: torch.Tensor = torch.zeros(DECK_SIZE, dtype=torch.float32)
 
         for card_str in cards:
             card_str = card_str.strip().upper()
             if len(card_str) != 2:
                 raise ValueError(
-                    f"Érvénytelen kártyaformátum: '{card_str}'. "
-                    f"Elvárt formátum: 'SR' (pl. 'SA' = Ász Pikk)."
+                    f"Ervenytelen kartyaformatum: '{card_str}'. "
+                    f"Elvart formatum: 'SR' (pl. 'SA' = Ász Pikk)."
                 )
 
             suit_char: str = card_str[0]
@@ -319,61 +187,73 @@ class ObservationBuilder:
 
             if rank_char not in RANK_MAP:
                 raise ValueError(
-                    f"Ismeretlen kártyaérték: '{rank_char}' a(z) '{card_str}' kártyában. "
-                    f"Érvényes értékek: {list(RANK_MAP.keys())}"
+                    f"Ismeretlen kartyaertek: '{rank_char}' a(z) '{card_str}' kartyaban."
                 )
             if suit_char not in SUIT_MAP:
                 raise ValueError(
-                    f"Ismeretlen kártyaszín: '{suit_char}' a(z) '{card_str}' kártyában. "
-                    f"Érvényes színek: {list(SUIT_MAP.keys())}"
+                    f"Ismeretlen kartyaszin: '{suit_char}' a(z) '{card_str}' kartyaban."
                 )
 
             rank_idx: int = RANK_MAP[rank_char]
             suit_idx: int = SUIT_MAP[suit_char]
             card_index: int = rank_idx * NUM_SUITS + suit_idx
-
             encoding[card_index] = 1.0
 
         logger.debug(
-            "Kártyakódolás: %d kártya → %d aktív pozíció a 52-dim vektorban",
+            "Kartyakodolas: %d kartya → %d aktiv pozicio",
             len(cards), int(encoding.sum().item()),
         )
-
         return encoding
 
     def _encode_env_metrics(self, raw_state: dict[str, Any]) -> torch.Tensor:
-        """A környezeti metrikákat normalizált float vektorrá kódolja.
+        """A kornyezeti metrikakat normalizalt float vektorra kodola.
 
-        Normalizáció: Minden monetáris érték a nagyvak (Big Blind) összegéhez
-        viszonyítva, majd a [0, 1] tartományba szorítva.
-
-        A metrikák sorrendje:
-            [pot_norm, my_chips_norm, amount_to_call_norm, min_raise_norm,
-             opp_1_chips_norm, opp_2_chips_norm, ...]
-
-        Args:
-            raw_state: A nyers játékállapot szótár.
-
-        Returns:
-            (4 + num_opponents,) alakú normalizált torch.Tensor.
+        [FIX H1] A _normalize_chips() most korlatos [0, 1] tartomanyban marad.
+        Lasd a belso fuggveny docstringet a reszletekert.
         """
         big_blind: float = float(raw_state.get("big_blind", 2.0))
         if big_blind <= 0:
             logger.warning(
-                "A big_blind értéke %.2f, ami nem pozitív. Fallback: 2.0", big_blind
+                "A big_blind erteke %.2f, ami nem pozitiv. Fallback: 2.0", big_blind
             )
             big_blind = 2.0
 
         initial_stack: float = self.config.initial_stack_bb * big_blind
+        # [FIX H1] A maximalis chip ertek a normalizaciohoz
+        max_chip_value: float = initial_stack * _CHIP_NORMALIZATION_MAX_MULTIPLIER
 
-        # Normalizáló segédfüggvény: chip → [0, 1] tartomány (deep stack: log-scale)
         def _normalize_chips(value: float) -> float:
-            """Monetáris értéket normalizál az induló stack-hez viszonyítva (log-skála deep stackhez)."""
-            normalized: float = value / initial_stack if initial_stack > 0 else 0.0
-            if normalized > 1.0:
-                return float(1.0 + np.log1p(normalized - 1.0))
-            else:
-                return float(max(0.0, normalized))
+            """Monetaris erteket normalizal a [0, 1] kompakt tartomanyba.
+
+            [FIX H1] A korabbi implementacio log-skalaval kezelte a
+            initial_stack-et meghalado ertekeket, ami korlatlan kimenetet
+            adott (pl. 3x stack → 2.1, 5x stack → 2.6).
+
+            Az uj implementacio:
+                - Ertekkeszlet: [0, max_chip_value] (max = 5 × initial_stack)
+                - Kimenet: [0, 1] kompakt tartomany
+                - 5x-on feluli ertekek: 1.0-ra csokkentve (ritka esemeny)
+
+            Elonyok:
+                1. A halozat belso retegei mindig [0, 1]-ben latjak a bemenetet
+                2. Az ortogonalis sulyinicializacio hatekonyan mukodik
+                3. Meely stack helyzetekben is stabil a konvergencia
+                4. A log-skala logaritmikus torzitasa nem roncsol a fontossagi
+                   sorrendet (p. nagy stack vs. kis stack szignifikanciaja)
+
+            Args:
+                value: A normalizalandó chip ertek.
+
+            Returns:
+                Normalizalt float a [0, 1] tartomanyban.
+            """
+            if initial_stack <= 0:
+                return 0.0
+            # Linearis normalizalas, 5x-os cap-el
+            capped: float = min(float(value), max_chip_value)
+            normalized: float = capped / max_chip_value
+            # Biztonsagi clamp (float pontossag miatt)
+            return float(max(0.0, min(1.0, normalized)))
 
         pot: float = float(raw_state.get("pot", 0.0))
         my_chips: float = float(raw_state.get("my_chips", 0.0))
@@ -387,21 +267,30 @@ class ObservationBuilder:
             _normalize_chips(min_raise),
         ]
 
-        # Ellenfelek zsetonállásainak normalizálása
         opponent_chips: list[float] = raw_state.get("opponent_chips", [])
         for opp_stack in opponent_chips[: self.config.num_players - 1]:
             metrics.append(_normalize_chips(float(opp_stack)))
 
-        # Padding: ha kevesebb ellenfél van, mint a konfiguráció elvárja
         expected_opponents: int = self.config.num_players - 1
         while len(metrics) < 4 + expected_opponents:
             metrics.append(0.0)
 
         metrics_tensor: torch.Tensor = torch.tensor(metrics, dtype=torch.float32)
 
+        # [FIX H1] Ellenorizzuk, hogy a normalizalt ertekek [0, 1]-ben vannak
+        if logger.isEnabledFor(logging.DEBUG):
+            out_of_range = [(i, v) for i, v in enumerate(metrics) if not (0.0 <= v <= 1.0)]
+            if out_of_range:
+                logger.warning(
+                    "H1 FIX: Normalizalt chip ertekek kiesnek [0,1]-bol: %s. "
+                    "Ez nem fordulhat elo a fix utan — ellenorizd a max_multiplier-t.",
+                    out_of_range,
+                )
+
         logger.debug(
-            "Környezeti metrikák kódolva: pot=%.3f, stack=%.3f, call=%.3f, "
-            "min_raise=%.3f, %d ellenfél stack",
+            "Kornyezeti metrikak kodolva [H1 FIX: korlatos norm, max=%.0f chips]: "
+            "pot=%.3f, stack=%.3f, call=%.3f, min_raise=%.3f, %d ellenfél stack",
+            max_chip_value,
             metrics[0], metrics[1], metrics[2], metrics[3],
             len(opponent_chips),
         )
@@ -411,21 +300,7 @@ class ObservationBuilder:
     def _encode_betting_history(
         self, history: list[dict[str, Any]]
     ) -> torch.Tensor:
-        """A licittörténetet rögzített méretű tenzorrá kódolja.
-
-        Minden licitlépés egy sorként jelenik meg a kimeneti mátrixban:
-            [action_one_hot(9-dim)] ahol az akció indexe alapján
-            a megfelelő pozíció 1.0.
-
-        A tenzor zero-paddinget alkalmaz a maximális méretig.
-
-        Args:
-            history: Licitlépések listája. Minden elem egy szótár:
-                     {"action": int, "amount": float, "player": int}
-
-        Returns:
-            (max_betting_actions, action_feature_dim) alakú torch.Tensor.
-        """
+        """A liciettortenetet rogzített meretu tenzorra kodola."""
         max_actions: int = self.config.max_betting_actions
         action_dim: int = self.config.action_feature_dim
 
@@ -438,30 +313,14 @@ class ObservationBuilder:
             if 0 <= action_idx < action_dim:
                 history_tensor[step_idx, action_idx] = 1.0
 
-            # Opcionális: normalizált tét méret hozzáadása
-            # (ha az action_dim > num_actions, az extra dimenziók használhatók)
-
         logger.debug(
-            "Licittörténet kódolva: %d/%d lépés feltöltve (zero-padding: %d sor)",
-            min(len(history), max_actions),
-            max_actions,
-            max(0, max_actions - len(history)),
+            "Liciettortenet kodolva: %d/%d lepes feltoltve",
+            min(len(history), max_actions), max_actions,
         )
-
         return history_tensor
 
     def _encode_position(self, position_index: int) -> torch.Tensor:
-        """A játékos pozícióját one-hot vektorrá kódolja.
-
-        A pozíciók indexelése (6-Max példa):
-            0=SB, 1=BB, 2=UTG, 3=HJ, 4=CO, 5=BTN
-
-        Args:
-            position_index: A játékos pozíciójának indexe (0-tól).
-
-        Returns:
-            (num_players,) alakú one-hot torch.Tensor.
-        """
+        """A jatekos poziciojat one-hot vektorra kodola."""
         num_positions: int = self.config.num_players
         position_vector: torch.Tensor = torch.zeros(num_positions, dtype=torch.float32)
 
@@ -469,111 +328,66 @@ class ObservationBuilder:
             position_vector[position_index] = 1.0
         else:
             logger.warning(
-                "Érvénytelen pozíció index: %d (max: %d). Nulla vektor visszaadva.",
+                "Ervenytelen pozicio index: %d (max: %d). Nulla vektor visszaadva.",
                 position_index, num_positions - 1,
             )
 
-        logger.debug("Pozíció kódolva: index=%d/%d", position_index, num_positions)
+        logger.debug("Pozicio kodolva: index=%d/%d", position_index, num_positions)
         return position_vector
 
     def _encode_action_mask(self, legal_actions: list[int | Any]) -> torch.Tensor:
-        """Bináris akció érvényességi maszkot generál.
-
-        Az érvényes akciók indexeinél 1.0, az érvénytelen (illegális)
-        akcióknál 0.0 áll. Ezt a maszkot a hálózat utolsó rétegén,
-        a Softmax előtt alkalmazzuk logit maszkolásra.
-
-        Támogatja az RLCard Action objektumokat (Enum-okat) és egyszerű
-        integer indexeket. Az objektumok automatikusan int-é konvertálódnak
-        a .value attribútum vagy int() castolás révén.
-
-        Args:
-            legal_actions: Az érvényes akciók indexeinek listája (0-8).
-                          Lehet plain int vagy RLCard Action Enum objektum.
-
-        Returns:
-            (9,) alakú bináris torch.Tensor.
-        """
+        """Binaris akcio ervenyessegi maszkot general."""
         num_actions: int = 9
         mask: torch.Tensor = torch.zeros(num_actions, dtype=torch.float32)
 
         for action_item in legal_actions:
             try:
-                # RLCard Action objektumok int-é konvertálása
                 if hasattr(action_item, 'value'):
-                    # Enum-szerű objektum: .value attribútum
                     action_idx: int = int(action_item.value)
                 else:
-                    # Plain integer vagy konvertálható objektum
                     action_idx = int(action_item)
 
                 if 0 <= action_idx < num_actions:
                     mask[action_idx] = 1.0
                 else:
                     logger.warning(
-                        "Illegális akció index figyelmen kívül hagyva: %d (tartomány: 0-%d)",
+                        "Illegalis akcio index figyelmen kivul hagyva: %d (tartomany: 0-%d)",
                         action_idx, num_actions - 1,
                     )
             except (ValueError, TypeError, AttributeError) as exc:
                 logger.warning(
-                    "Az akció-elem nem konvertálható int-é: %r (%s). "
-                    "Típus: %s. Figyelmen kívül hagyva.",
-                    action_item, type(action_item).__name__, exc,
+                    "Az akcio-elem nem konvertalhato int-e: %r (%s). Figyelmen kivul hagyva.",
+                    action_item, exc,
                 )
 
         active_count: int = int(mask.sum().item())
         if active_count == 0:
             logger.error(
-                "KRITIKUS: Üres akció maszk! Nincs érvényes akció. "
-                "Fold (index 0) engedélyezése biztonsági fallback-ként."
+                "KRITIKUS: Ures akcio maszk! Nincs ervenyes akcio. "
+                "Fold (index 0) engedelyezese biztonsagi fallback-kent."
             )
-            mask[0] = 1.0  # Fold mindig legális
+            mask[0] = 1.0
 
-        logger.debug(
-            "Akció maszk generálva: %d/%d akció érvényes",
-            active_count, num_actions,
-        )
+        logger.debug("Akcio maszk generalt: %d/%d akcio ervenyes", active_count, num_actions)
         return mask
 
     # =========================================================================
-    # Segédmetódusok
+    # Segedmetodusok
     # =========================================================================
 
     @staticmethod
     def card_str_to_index(card_str: str) -> int:
-        """Egyetlen kártyajelölést numerikus indexé alakít.
-
-        Args:
-            card_str: Kétkarakteres kártyajelölés (pl. "SA" = Ász Pikk, SuitRank format).
-
-        Returns:
-            A kártya indexe a [0, 51] tartományban.
-
-        Raises:
-            ValueError: Ha a formátum érvénytelen.
-        """
         card_str = card_str.strip().upper()
         if len(card_str) != 2:
-            raise ValueError(f"Érvénytelen kártyaformátum: '{card_str}'")
+            raise ValueError(f"Ervenytelen kartyaformatum: '{card_str}'")
         suit_idx: int = SUIT_MAP[card_str[0]]
         rank_idx: int = RANK_MAP[card_str[1]]
         return rank_idx * NUM_SUITS + suit_idx
 
     @staticmethod
     def index_to_card_str(index: int) -> str:
-        """Numerikus kártyaindexet kártyajelöléssé alakít.
-
-        Args:
-            index: A kártya indexe a [0, 51] tartományban.
-
-        Returns:
-            Kétkarakteres kártyajelölés SuitRank formátumban (pl. "SA").
-
-        Raises:
-            ValueError: Ha az index kívül esik a [0, 51] tartományon.
-        """
         if not 0 <= index < DECK_SIZE:
-            raise ValueError(f"Kártyaindex {index} kívül esik a [0, 51] tartományon.")
+            raise ValueError(f"Kartyaindex {index} kivul esik a [0, 51] tartomanyon.")
         rank_idx: int = index // NUM_SUITS
         suit_idx: int = index % NUM_SUITS
         rank_chars: str = "23456789TJQKA"

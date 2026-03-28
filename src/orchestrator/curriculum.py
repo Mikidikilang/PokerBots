@@ -318,12 +318,15 @@ class CurriculumManager:
         total_selections_cached: int = self._total_selections
         self._total_selections += 1
         c: float = self.mab_config.ucb_exploration_factor
+        # [FIX M4] Ha total_selections_cached == 0 (elso hivas), az UCB1
+        # log(0) = -inf-et adna. A total_rounds-t minimum 1-re korlátozzuk.
+        effective_rounds: int = max(total_selections_cached, 1)
 
         best_name: str = ""
         best_score: float = -float("inf")
 
         for arm in self._ucb_arms.values():
-            score: float = arm.ucb_score(total_selections_cached, c)
+            score: float = arm.ucb_score(effective_rounds, c)
             if score > best_score:
                 best_score = score
                 best_name = arm.name

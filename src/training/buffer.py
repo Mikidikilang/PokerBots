@@ -15,6 +15,13 @@ Hivatkozasok:
     - Specifikacio: training/buffer.py — CompressedListStorage
     - GAE: Schulman et al. "High-Dimensional Continuous Control Using GAE"
     - TorchRL: https://docs.pytorch.org/rl/stable/
+
+FIX C1 (2025-03-28): set_last_value() / get_last_bootstrap_value() hozzaadva.
+    A korabbi implementacioban a buffer nem tarolta a bootstrap erteket,
+    ezert a runner.py a collector._current_obs-bol szamolta ujra, ami
+    episode-hataron versenyfutasi allapotot (race condition) okozott.
+    Most a collector.collect_rollout() vege elott atomikusan beallitja
+    a bootstrap erteket a bufferben, es a runner.py onnan olvassa ki.
 """
 
 from __future__ import annotations
@@ -80,11 +87,20 @@ class RolloutBuffer:
     generatorral veletlenszeruen feldarabolt mini-batch-eket
     szolgaltat a PPO epoch-ok szamara.
 
+    [C1 FIX] A bootstrap erteket a collector atomikusan tarolja a
+    bufferben a collect_rollout() legvegen, set_last_value() segitsegevel.
+    A runner.py a compute_gae(last_value=self.buffer.get_last_bootstrap_value())
+    hivason keresztul olvassa ki. Ez megszunteti a korabbi race conditiont,
+    ahol a runner.py a collector._current_obs-bol szamolta ujra az erteket
+    egy lepessessel kesobb.
+
     Example:
         >>> buf = RolloutBuffer(RolloutBufferConfig(buffer_size=2048))
         >>> for step in range(2048):
         ...     buf.add(obs, action, reward, log_prob, value, done)
-        >>> buf.compute_gae(last_value=0.0)
+        >>> # A collector automatikusan beallitja:
+        >>> buf.set_last_value(bootstrap_val)
+        >>> buf.compute_gae(last_value=buf.get_last_bootstrap_value())
         >>> for batch in buf.get_mini_batches():
         ...     loss = trainer.compute_loss(batch)
 
@@ -104,8 +120,6 @@ class RolloutBuffer:
         self.pos: int = 0
         self.full: bool = False
 
-        size: int = self.config.buffer_size
-
         # Tarolo tombokre: listakent indul, a compute_gae-ben tensorra konvertalodik
         self._observations: list[dict[str, torch.Tensor]] = []
         self._actions: list[torch.Tensor] = []
@@ -118,7 +132,13 @@ class RolloutBuffer:
         self._advantages: torch.Tensor | None = None
         self._returns: torch.Tensor | None = None
 
-        # Phase 4-20: Pre-consolidated batching tensors (allocated in compute_gae)
+        # [C1 FIX] Atomikus bootstrap ertek taroloja.
+        # A collector.collect_rollout() a rollout VEGE elott beallitja,
+        # mielott a runner.py meghivja compute_gae()-t.
+        # Ez garantalja, hogy a V(s_T) a HELYES, truncated allapothoz tartozik.
+        self._last_bootstrap_value: float = 0.0
+
+        # Pre-consolidated batching tensors (allocated in compute_gae)
         self._obs_tensors: dict[str, torch.Tensor] = {}
         self._actions_tensor: torch.Tensor | None = None
         self._log_probs_tensor: torch.Tensor | None = None
@@ -127,9 +147,50 @@ class RolloutBuffer:
         logger.info(
             "RolloutBuffer inicializalva: size=%d, gamma=%.3f, "
             "gae_lambda=%.3f, mini_batches=%d",
-            size, self.config.gamma, self.config.gae_lambda,
+            self.config.buffer_size, self.config.gamma, self.config.gae_lambda,
             self.config.num_mini_batches,
         )
+
+    # =========================================================================
+    # [C1 FIX] Bootstrap Ertek Kezelese
+    # =========================================================================
+
+    def set_last_value(self, value: float | torch.Tensor) -> None:
+        """Beallitja a GAE szamitashoz szukseges bootstrap erteket.
+
+        Ezt a metodust a collector.collect_rollout() hivja meg kozvetlenul
+        a rollout loop vege utan, MIELOTT visszaadna a vezerlesst a runner-nek.
+        Igy a bootstrap ertek garantaltan a HELYES, truncated allapothoz
+        tartozo V(s_T), nem pedig egy kesobb szamolt kozelites.
+
+        [C1 FIX] A korabbi implementacioban a RolloutBuffer.set_last_value()
+        nem letezett, ezert a collector `if hasattr(self.buffer, "set_last_value")`
+        ag sohasem futott le. A runner.py ezutan ujra hivta
+        collector.get_last_bootstrap_value()-t, ami a mar megvaltoztatott
+        _current_obs-bol szamolt - igy a bootstrap ertek egy lepessessel
+        kesobb szamolodott, versenyfutasi allapotot eloallitva episode hatarokon.
+
+        Args:
+            value: Bootstrap ertek V(s_T). Lehet float vagy torch.Tensor.
+                   Tensor eseten .detach().cpu().item() hivodik ra.
+        """
+        if isinstance(value, torch.Tensor):
+            self._last_bootstrap_value = float(value.detach().cpu().item())
+        else:
+            self._last_bootstrap_value = float(value)
+        logger.debug("Bootstrap ertek beallitva: %.6f", self._last_bootstrap_value)
+
+    def get_last_bootstrap_value(self) -> float:
+        """Visszaadja a set_last_value() altal beallitott bootstrap erteket.
+
+        Ha set_last_value() meg nem lett meghivva (pl. az epizod normalis
+        vegfutasa volt, done=True), visszaad 0.0-t, ami matematikailag
+        helyes (nincs jovobeli jutalom terminalis allapotbol).
+
+        Returns:
+            A legutolso bootstrap ertek, alapertelmezetten 0.0.
+        """
+        return self._last_bootstrap_value
 
     # =========================================================================
     # Adat Hozzaadas
@@ -181,9 +242,16 @@ class RolloutBuffer:
 
         A returns a diszkontalt jutalom: R_t = A_t + V(s_t)
 
+        [C1 FIX] Ajanlott hivasi mod (runner.py-ban):
+            self.buffer.compute_gae(last_value=self.buffer.get_last_bootstrap_value())
+        A last_value parameter megtartva a backward kompatibilitashoz, de a
+        set_last_value() + get_last_bootstrap_value() paron keresztul torteno
+        hivatas garantaltan helyes timing-ot biztosit.
+
         Args:
             last_value: Az utolso allapot erteke V(s_T) a bootstrap-hoz.
-                       0.0 ha az epizod veget ert.
+                       0.0 ha az epizod veget ert. Elonyben reszesitett mod:
+                       self.buffer.get_last_bootstrap_value() hasznalata.
         """
         num_steps: int = len(self._rewards)
         if num_steps == 0:
@@ -226,27 +294,22 @@ class RolloutBuffer:
 
         logger.info(
             "GAE szamitas kesz: %d lepes, adv_mean=%.4f, adv_std=%.4f, "
-            "returns_mean=%.4f",
+            "returns_mean=%.4f, bootstrap_val=%.6f",
             num_steps, adv_mean, adv_std,
             float(self._returns.mean().item()),
+            last_value,
         )
 
-        # Phase 4-20: Pre-allocate consolidated batching tensors (O(N) instead of O(N²))
+        # Pre-allocate consolidated batching tensors (O(1) per-batch indexing)
         self._consolidate_tensors()
 
     def _consolidate_tensors(self) -> None:
-        """Pre-allocate consolidated tensors for O(1) mini-batch building.
-        
-        Stacks all observations, actions, log_probs, and values into single
-        tensors. This eliminates per-batch tensor construction overhead,
-        reducing get_mini_batches complexity from O(N²) to O(N).
-        """
+        """Pre-allocate consolidated tensors for O(1) mini-batch building."""
         num_steps: int = len(self._rewards)
-        
-        # Consolidate observations: create dict of stacked tensors
+
         if self._observations:
             first_obs = self._observations[0]
-            self._obs_tensors: dict[str, torch.Tensor] = {}
+            self._obs_tensors = {}
             for key in first_obs:
                 self._obs_tensors[key] = torch.stack(
                     [self._observations[i][key] for i in range(num_steps)],
@@ -254,22 +317,18 @@ class RolloutBuffer:
                 )
         else:
             self._obs_tensors = {}
-        
-        # Stack all actions, log_probs, values and enforce 1-D shapes (P1.4 fix)
-        # Collector may attach extra batch dimensions, so we normalize to (num_steps,)
-        self._actions_tensor: torch.Tensor = torch.stack(self._actions, dim=0).view(num_steps)
-        self._log_probs_tensor: torch.Tensor = torch.stack(self._log_probs, dim=0).view(num_steps)
+
+        self._actions_tensor = torch.stack(self._actions, dim=0).view(num_steps)
+        self._log_probs_tensor = torch.stack(self._log_probs, dim=0).view(num_steps)
         values_stacked: torch.Tensor = torch.stack(
             [v if isinstance(v, torch.Tensor) else torch.tensor(float(v))
              for v in self._values], dim=0
         )
-        self._values_tensor: torch.Tensor = values_stacked.view(num_steps)
-        
+        self._values_tensor = values_stacked.view(num_steps)
+
         logger.debug(
-            "Consolidated batching tensors allocated: "
-            "%d steps, obs keys=%d, actions shape=%s",
+            "Consolidated batching tensors allocated: %d steps, obs keys=%d",
             num_steps, len(self._obs_tensors),
-            tuple(self._actions_tensor.shape),
         )
 
     # =========================================================================
@@ -278,13 +337,6 @@ class RolloutBuffer:
 
     def get_mini_batches(self) -> Generator[dict[str, Any], None, None]:
         """Veletlenszeruen kevert mini-batch-eket general a PPO epoch-okhoz.
-
-        A buffer tartalmat veletlenszeruen permutlja, majd egyenlo
-        meretu mini-batch-ekre darabolja. Minden batch egy szotart
-        ad vissza a kovetkezo kulcsokkal:
-            observations, actions, old_log_probs, advantages, returns, old_values
-
-        Phase 4-20: Uses pre-consolidated tensors for O(1) per-batch indexing.
 
         Yields:
             Dict[str, Any] mini-batch szotar.
@@ -315,17 +367,16 @@ class RolloutBuffer:
             )
             batch_size = num_steps
 
-        # Veletlenszeru permutacio
         indices: np.ndarray = np.random.permutation(num_steps)
 
         for start in range(0, num_steps, batch_size):
             end: int = min(start + batch_size, num_steps)
             batch_indices: np.ndarray = indices[start:end]
 
-            # Phase 4-20: Direct indexing from pre-consolidated tensors (O(1))
-            batch_obs: dict[str, torch.Tensor] = {}
-            for key, obs_tensor in self._obs_tensors.items():
-                batch_obs[key] = obs_tensor[batch_indices]
+            batch_obs: dict[str, torch.Tensor] = {
+                key: obs_tensor[batch_indices]
+                for key, obs_tensor in self._obs_tensors.items()
+            }
 
             batch: dict[str, Any] = {
                 "observations": batch_obs,
@@ -347,7 +398,11 @@ class RolloutBuffer:
     # =========================================================================
 
     def reset(self) -> None:
-        """Torli a buffer teljes tartalmat a kovetkezo rollout-hoz."""
+        """Torli a buffer teljes tartalmat a kovetkezo rollout-hoz.
+
+        [C1 FIX] A _last_bootstrap_value is visszaall 0.0-ra, hogy ne
+        maradjon stale ertek a kovetkezo rollout GAE szamitasahoz.
+        """
         self._observations.clear()
         self._actions.clear()
         self._rewards.clear()
@@ -358,27 +413,27 @@ class RolloutBuffer:
         self._returns = None
         self.pos = 0
         self.full = False
-        
-        # Explicitly release consolidated tensors to free memory immediately
+
+        # [C1 FIX] Bootstrap ertek resetelese — stale ertek ne maradjon
+        self._last_bootstrap_value = 0.0
+
+        # Explicitly release consolidated tensors
         self._obs_tensors = {}
         self._actions_tensor = None
         self._log_probs_tensor = None
         self._values_tensor = None
-        logger.debug("RolloutBuffer resetelve (konszolidalt tenzorok torolve).")
+        logger.debug("RolloutBuffer resetelve (bootstrap ertek es konszolidalt tenzorok torolve).")
 
     def __len__(self) -> int:
         """A bufferben tarolt lepesek szama."""
         return len(self._rewards)
 
     def get_stats(self) -> dict[str, float]:
-        """Visszaadja a buffer tartalmanak osszefoglalo statisztikait.
-
-        Returns:
-            Dict metrika nevekkel es ertekekkel.
-        """
+        """Visszaadja a buffer tartalmanak osszefoglalo statisztikait."""
         stats: dict[str, float] = {
             "buffer_size": float(len(self)),
             "buffer_full": float(self.full),
+            "last_bootstrap_value": self._last_bootstrap_value,
         }
         if self._rewards:
             rewards = np.array(self._rewards)
@@ -395,32 +450,25 @@ class RolloutBuffer:
         return stats
 
     def save_to_disk(self, filepath: str) -> None:
-        """A buffer tartalmat diszkre menti (checkpoint szamara).
-
-        Args:
-            filepath: Cel utvonal (.pt fajl).
-        """
+        """A buffer tartalmat diszkre menti (checkpoint szamara)."""
         state: dict[str, Any] = {
             "rewards": self._rewards,
             "dones": self._dones,
             "pos": self.pos,
             "full": self.full,
             "config": self.config,
+            "last_bootstrap_value": self._last_bootstrap_value,  # [C1 FIX]
         }
         torch.save(state, filepath)
         logger.info("Buffer state mentve: %s (%d lepes)", filepath, len(self))
 
     def load_from_disk(self, filepath: str) -> None:
-        """A buffer tartalmat visszatolti a diszkrol.
-
-        Args:
-            filepath: Forras utvonal (.pt fajl).
-        """
-        # Phase 3-18: Use weights_only=True for secure deserialization.
-        # Buffer state contains only tensors and scalars, safe to load.
+        """A buffer tartalmat visszatolti a diszkrol."""
         state: dict[str, Any] = torch.load(filepath, weights_only=True)
         self._rewards = state["rewards"]
         self._dones = state["dones"]
         self.pos = state["pos"]
         self.full = state["full"]
+        # [C1 FIX] Bootstrap ertek visszatoltes
+        self._last_bootstrap_value = state.get("last_bootstrap_value", 0.0)
         logger.info("Buffer state betoltve: %s (%d lepes)", filepath, self.pos)

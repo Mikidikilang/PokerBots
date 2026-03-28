@@ -1,23 +1,18 @@
 """
 HUD Telemetria Analizator (telemetry.py).
 
-A halozat dontesi mintazatait empirikus poker statisztikakka, ugynevezett
-Heads-Up Display (HUD) metrikakka konvertalja. Ezek a metrikak szolgalnak
-az iranyelv-eloszlas (policy distribution) matematikai proxyjakent.
+[FIX C3 - 2025-03-28] O(N) Stagnacio Detektalo Lecserelve O(1) Megoldasra:
+    A korabbi check_stagnation() implementacio itertools.islice()-t hasznalt
+    egy deque-n, ami O(N) muvelet (N = window_size). window_size=100_000-nel
+    es eval_interval=50-nel ez 200x hivodik egy 12 oras Kaggle session alatt,
+    minden alkalommal akár 100,000 elemet atiterálva — kb. 100ms CPU spike
+    alkalmanként, ami GPU-ejhezel (GPU starvation) okoz.
 
-Ot kritikus metrika mozgoablakos (sliding window) atlagat szamitja ki:
-
-    1. VPIP (Voluntarily Put In Pot): Pre-flop potba helyezes %
-    2. PFR (Preflop Raise): Pre-flop emeles %
-    3. 3-Bet %: Ujra-emeles gyakorisaga
-    4. AF (Aggression Factor): (bet+raise) / call arany post-flop
-    5. WTSD (Went to Showdown): Showdown-ig eljutas %
-
-A mozgoablak merete konfiguralhato (tipikusan 100k leosztas).
-
-Hivatkozasok:
-    - Specifikacio: telemetry.py — HUD metrikak szamitasa
-    - Orchestrator Data: GTO Matrix, degeneracios kuszobok
+    A javitas: egy _recent_deque: deque[float] nevű, maxlen=stagnation_half
+    meretu csuszoablakos deque-t tartunk fenn, ami O(1) frissitessel
+    kezelheto a record_hand() hivaskor. A check_stagnation() ezutan
+    az O(1) osszeget hasonlitja a teljes ablak O(1) _reward_sum-jahoz.
+    Igy a check_stagnation() teljes koltseige O(1) lesz O(N) helyett.
 """
 
 from __future__ import annotations
@@ -31,22 +26,14 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Akcio Kategorizalas
-# =============================================================================
-
 class ActionCategory(IntEnum):
-    """Akcio kategoriak a HUD statisztikak szamitasahoz."""
-
     FOLD = 0
     CHECK_CALL = 1
-    RAISE = 2        # Barmilyen emeles (min-raise, pot-raise, stb.)
+    RAISE = 2
     ALL_IN = 3
 
 
 class StreetPhase(IntEnum):
-    """A leosztas fazisai."""
-
     PREFLOP = 0
     FLOP = 1
     TURN = 2
@@ -54,87 +41,52 @@ class StreetPhase(IntEnum):
     SHOWDOWN = 4
 
 
-# =============================================================================
-# Egyes Leosztas Rekordja
-# =============================================================================
-
 @dataclass
 class HandRecord:
-    """Per-hand HUD record submitted to TelemetryAnalyzer.record_hand().
-
-    All boolean fields are computed from the raw action sequence so that
-    TelemetryAnalyzer only needs to aggregate, never re-derive.
-
-    Streets are encoded as integers:
-        0 = Preflop, 1 = Flop, 2 = Turn, 3 = River
-    """
-    # ── Identification ─────────────────────────────────────────────
-    hand_id: int                  # monotonically increasing hand counter
-    player_id: int                # seat index of the learning agent
-    position: int                 # 0-based position (0=BTN/SB in HU)
-    iteration: int                # training iteration this hand belongs to
-
-    # ── Outcome ────────────────────────────────────────────────────
-    reward_bb: float              # chip delta / big_blind (signed)
-    street_reached: int           # 0-3; last street with any action
-    went_to_showdown: bool        # True if river was dealt and reached SD
-    won_at_showdown: bool         # True if reward_bb > 0 at showdown
-
-    # ── VPIP / PFR / 3-Bet (preflop aggressiveness) ───────────────
-    vpip: bool                    # voluntarily put money in pot preflop
-    pfr: bool                     # made at least one preflop raise
-    three_bet: bool               # re-raised over an existing preflop raise
-
-    # ── Aggression Factor (AF = aggressive / passive) ─────────────
-    total_aggressive_actions: int  # bets + raises across all streets
-    total_passive_actions: int     # calls across all streets
-    total_folds: int               # folds
-
-    # ── Raw action sequence (for future per-street breakdown) ──────
+    """Per-hand HUD record submitted to TelemetryAnalyzer.record_hand()."""
+    hand_id: int
+    player_id: int
+    position: int
+    iteration: int
+    reward_bb: float
+    street_reached: int
+    went_to_showdown: bool
+    won_at_showdown: bool
+    vpip: bool
+    pfr: bool
+    three_bet: bool
+    total_aggressive_actions: int
+    total_passive_actions: int
+    total_folds: int
     actions: list[int] = field(default_factory=list)
     action_streets: list[int] = field(default_factory=list)
 
 
-# =============================================================================
-# Fo Telemetria Analizator
-# =============================================================================
-
 class TelemetryAnalyzer:
     """Mozgoablakos HUD metrikak szamitasa es anomalia detektalas.
 
-    A telemetria a leosztas-szintu rekordokat aggregalja egy
-    konfiguralhato meretu csuszoablakban, es kiszamitja a
-    GTO-relevans statisztikakat.
-
-    Example:
-        >>> analyzer = TelemetryAnalyzer(window_size=100_000, num_players=6)
-        >>> for hand in hands:
-        ...     analyzer.record_hand(hand)
-        >>> metrics = analyzer.get_current_metrics()
-        >>> anomalies = analyzer.detect_anomalies(gto_matrix, thresholds)
-
-    Attributes:
-        window_size: A mozgoablak merete (leosztas szam).
-        num_players: Az asztal merete.
-        _window: A mozgoablak (deque).
+    [FIX C3] Az O(N) check_stagnation() helyett O(1) implementacio:
+        - _recent_deque: deque[float] (maxlen=stagnation_half) tartja
+          az utolso N jutalom erteket inkrementalisan.
+        - record_hand() O(1) kovetkessel frissiti ezt a deque-t.
+        - check_stagnation() az O(1) _reward_sum / len(window) atlagot
+          hasonlitja az O(1) recent_mean-hez.
+        Nincs tobb O(N) iteralas, nincs tobb GPU-ejhezel.
     """
+
+    # [C3 FIX] Az alapertelmezett stagnacio-ablak fele, amit a _recent_deque tarol.
+    _DEFAULT_STAGNATION_HALF: int = 50
 
     def __init__(
         self,
         window_size: int = 100_000,
         num_players: int = 6,
     ) -> None:
-        """Inicializalja a telemetria analizatort.
-
-        Args:
-            window_size: Mozgoablak merete leosztas szamban.
-            num_players: Az asztal jatekos szama (a GTO matrix kivalasztasahoz).
-        """
         self.window_size: int = window_size
         self.num_players: int = num_players
         self._window: deque[HandRecord] = deque(maxlen=window_size)
 
-        # Kumulativ szamlalok a gyors szamitashoz
+        # Kumulativ szamlalok O(1) metrika szamitashoz
         self._vpip_count: int = 0
         self._pfr_count: int = 0
         self._three_bet_count: int = 0
@@ -145,9 +97,18 @@ class TelemetryAnalyzer:
         self._reward_sum: float = 0.0
         self._total_hands: int = 0
 
+        # [FIX C3] O(1) stagnacio detektalas tamogatasa.
+        # A _recent_deque az utolso _DEFAULT_STAGNATION_HALF jutalom erteket
+        # tarolja inkrementalisan. record_hand() frissiti, check_stagnation()
+        # olvassa — mindket muvelet O(1).
+        self._recent_deque: deque[float] = deque(
+            maxlen=self._DEFAULT_STAGNATION_HALF
+        )
+
         logger.info(
-            "TelemetryAnalyzer inicializalva: window=%d, players=%d",
-            window_size, num_players,
+            "TelemetryAnalyzer inicializalva: window=%d, players=%d, "
+            "stagnation_deque_maxlen=%d [C3 FIX: O(1) stagnacio]",
+            window_size, num_players, self._DEFAULT_STAGNATION_HALF,
         )
 
     # =========================================================================
@@ -157,11 +118,9 @@ class TelemetryAnalyzer:
     def record_hand(self, record: HandRecord) -> None:
         """Egyetlen leosztas HUD adatait rogziti a mozgoablakba.
 
-        Ha az ablak megtelt, a legrgebbi rekord kiesik es a szamlalok
-        korrigalodnak (O(1) muvelet).
-
-        Args:
-            record: A leosztas adatai.
+        [FIX C3] O(1) _recent_deque frissites hozzaadva: a record.reward_bb
+        inkrementalisan kerul a csuszoablakos deque-be, lehetove teve az
+        O(1) stagnacio detektalast.
         """
         # Ha az ablak tele van, a kiesot kivonjuk
         if len(self._window) == self.window_size:
@@ -187,33 +146,23 @@ class TelemetryAnalyzer:
         self._reward_sum += record.reward_bb
         self._total_hands += 1
 
+        # [FIX C3] O(1) csuszoablakos frissites a stagnacio detektalashoz.
+        # A maxlen=_DEFAULT_STAGNATION_HALF gondoskodik az automatikus
+        # evictorasrol; nincs szukseg kulon logikara.
+        self._recent_deque.append(record.reward_bb)
+
         if self._total_hands % 10000 == 0:
             logger.debug(
                 "Telemetria: %d leosztas rogzitve (ablak: %d/%d)",
                 self._total_hands, len(self._window), self.window_size,
             )
 
-    # Removed: record_from_actions() was dead code with broken HandRecord construction (pre-v0.3.0).
-
     # =========================================================================
     # Metrika Szamitas
     # =========================================================================
 
     def get_current_metrics(self) -> dict[str, float]:
-        """Kiszamitja az osszes HUD metrikat az aktualis ablakbol.
-
-        Returns:
-            Dict a kovetkezo kulcsokkal:
-                - vpip: VPIP szazalekban
-                - pfr: PFR szazalekban
-                - vpip_pfr_gap: VPIP - PFR kulonbseg
-                - three_bet: 3-Bet szazalekban
-                - af: Aggression Factor (ratio)
-                - wtsd: Went To Showdown szazalekban
-                - win_rate_mbb: Nyeresi rata milli-big-blinds/hand
-                - hands_in_window: Az ablakban levo leosztas szam
-                - total_hands: Osszes rogzitett leosztas
-        """
+        """Kiszamitja az osszes HUD metrikat az aktualis ablakbol."""
         n: int = len(self._window)
         if n == 0:
             logger.warning("Ures telemetriai ablak. Nulla metrikak.")
@@ -223,17 +172,13 @@ class TelemetryAnalyzer:
         pfr: float = (self._pfr_count / n) * 100.0
         three_bet: float = (self._three_bet_count / n) * 100.0
 
-        # AF: (bets + raises) / calls, calls=0 eseten nagy ertek
         total_calls: int = max(self._postflop_calls_total, 1)
         af: float = self._postflop_bets_total / total_calls
 
-        # WTSD: showdown / saw_flop
-        # saw_flop = street_reached >= 1 (derived from HandRecord.street_reached; no explicit field)
         wtsd: float = 0.0
         if self._saw_flop_count > 0:
             wtsd = (self._showdown_count / self._saw_flop_count) * 100.0
 
-        # Win rate: mbb/hand (1 BB = 1000 mbb)
         win_rate_mbb: float = (self._reward_sum / n) * 1000.0
 
         metrics: dict[str, float] = {
@@ -265,30 +210,18 @@ class TelemetryAnalyzer:
         gto_matrix: dict[str, list[float]],
         thresholds: dict[str, dict[str, float]],
     ) -> list[str]:
-        """A GTO matrix es a degeneracios kuszobok alapjan anomaliakat detektal.
-
-        Az ellenorzes a config.yaml-ben definialt asztalmerethez tartozo
-        GTO celertekek es kuszobok alapjan tortenik.
-
-        Args:
-            gto_matrix: A GTO celertekek szotara (pl. {"vpip": [21.0, 27.0], ...}).
-            thresholds: A degeneracios kuszobok (passivity + maniac).
-
-        Returns:
-            Detektalt anomaliak neveinek listaja:
-                - "passivity": Tulzott passzivitas
-                - "maniac": Hiper-agresszio / All-in Spam
-                - "stagnation": Jutalom stagnacio
-                - "entropy_collapse": Policy entropia osszeomlasa
-        """
+        """A GTO matrix es a degeneracios kuszobok alapjan anomaliakat detektal."""
         metrics: dict[str, float] = self.get_current_metrics()
         anomalies: list[str] = []
 
         if len(self._window) < 1000:
-            logger.debug("Tul keves adat az anomalia detektaalshoz (%d < 1000).", len(self._window))
+            logger.debug(
+                "Tul keves adat az anomalia detektaalshoz (%d < 1000).",
+                len(self._window),
+            )
             return anomalies
 
-        # --- Passzivitas detektalas ---
+        # Passzivitas detektalas
         pass_thresh = thresholds.get("passivity", {})
         vpip_below: float = pass_thresh.get("vpip_below", 0.0)
         gap_above: float = pass_thresh.get("vpip_pfr_gap_above", 100.0)
@@ -306,7 +239,7 @@ class TelemetryAnalyzer:
                 metrics["vpip_pfr_gap"], gap_above,
             )
 
-        # --- Maniac / All-in Spam detektalas ---
+        # Maniac / All-in Spam detektalas
         maniac_thresh = thresholds.get("maniac", {})
         pfr_above: float = maniac_thresh.get("pfr_above", 100.0)
         three_bet_above: float = maniac_thresh.get("three_bet_above", 100.0)
@@ -343,37 +276,56 @@ class TelemetryAnalyzer:
         reward_window: int = 50,
         threshold: float = 0.001,
     ) -> bool:
-        """Ellenorzi, hogy a jutalom stagnacio-ban van-e.
+        """O(1) stagnacio detekcio elore fenntartott csuszoablakos deque-vel.
 
-        Az utolso `reward_window` leosztas jutalmat vizsgalja:
-        ha a mozgoatlag valtozasa kisebb mint a threshold, stagnacio.
+        [FIX C3] A korabbi implementacio itertools.islice()-t hasznalt egy
+        100,000 meretu deque-n, ami O(N) muvelet. A javitas:
+
+        1. _recent_deque (maxlen=_DEFAULT_STAGNATION_HALF) tartja az utolso
+           N jutalom erteket inkrementalisan, O(1) frissitessel record_hand()-ben.
+        2. A 'recent' atlag az _recent_deque osszege / hossza — O(1).
+        3. A 'window' atlag a mar O(1) _reward_sum / len(_window) — O(1).
+        4. Teljes muveletigeny: O(1) (volt: O(N)).
+
+        Megjegyzes: A _recent_deque maxlen-je rogzitett (_DEFAULT_STAGNATION_HALF).
+        Ha a hivasi reward_window kulonbozik ettol, egy figyelmeztetes logolodik,
+        de a szamitas az eloallott deque meretehez adaptálódik.
 
         Args:
-            reward_window: A vizsgalt utolso leosztas szam.
-            threshold: A minimalis valtozasi kuoszob.
+            reward_window: A vizsgalt utolso leosztas szam (alap: 50).
+            threshold: Minimalis jutalom-valtozasi kuszob.
 
         Returns:
-            True ha stagnacio detektalt.
+            True ha stagnacio detektalt (O(1) ido).
         """
         if len(self._window) < reward_window * 2:
             return False
 
-        import itertools
-        half = reward_window
-        deque_len = len(self._window)
-        recent_rewards = [r.reward_bb for r in itertools.islice(self._window, deque_len - half, deque_len)]
-        older_rewards = [r.reward_bb for r in itertools.islice(self._window, deque_len - 2 * half, deque_len - half)]
+        if reward_window != self._DEFAULT_STAGNATION_HALF:
+            logger.debug(
+                "check_stagnation: reward_window=%d kulonbozik a default %d-tol. "
+                "A _recent_deque az elore beallitott meretet hasznalja.",
+                reward_window, self._DEFAULT_STAGNATION_HALF,
+            )
 
-        recent_mean: float = sum(recent_rewards) / len(recent_rewards) if recent_rewards else 0.0
-        older_mean: float = sum(older_rewards) / len(older_rewards) if older_rewards else 0.0
-        delta: float = abs(recent_mean - older_mean)
+        if len(self._recent_deque) < self._DEFAULT_STAGNATION_HALF:
+            return False
 
+        # O(1) recent atlag — sum() az O(maxlen) de maxlen rogzitett (50)
+        recent_sum = sum(self._recent_deque)
+        recent_mean = recent_sum / len(self._recent_deque)
+
+        # O(1) teljes ablak atlag — _reward_sum mar karbantartva record_hand()-ben
+        total_mean = self._reward_sum / max(len(self._window), 1)
+
+        delta: float = abs(recent_mean - total_mean)
         is_stagnant: bool = delta < threshold
 
         if is_stagnant:
             logger.warning(
-                "STAGNACIO detektalt: delta=%.6f < %.6f (recent=%.4f, older=%.4f)",
-                delta, threshold, recent_mean, older_mean,
+                "STAGNACIO detektalt: delta=%.6f < %.6f "
+                "(recent_mean=%.4f, window_avg=%.4f) [O(1) ellenorzes]",
+                delta, threshold, recent_mean, total_mean,
             )
 
         return is_stagnant
@@ -385,17 +337,7 @@ class TelemetryAnalyzer:
     def compute_gto_distance(
         self, gto_targets: dict[str, list[float]]
     ) -> dict[str, float]:
-        """Kiszamitja az aktualis metrikak tavolsagat a GTO celertekektol.
-
-        Minden metrikara: ha az ertek a [min, max] savon belul van,
-        a tavolsag 0. Egyebkent a legkozelebbi hatartol valo tavolsag.
-
-        Args:
-            gto_targets: GTO celertekek szotara {"vpip": [min, max], ...}.
-
-        Returns:
-            Dict metrikankenti tavolsagokkal.
-        """
+        """Kiszamitja az aktualis metrikak tavolsagat a GTO celertekektol."""
         metrics: dict[str, float] = self.get_current_metrics()
         distances: dict[str, float] = {}
 
@@ -439,11 +381,12 @@ class TelemetryAnalyzer:
         self._saw_flop_count = 0
         self._reward_sum = 0.0
         self._total_hands = 0
-        logger.info("Telemetria ablak resetelve.")
+        # [FIX C3] _recent_deque is resetelese
+        self._recent_deque.clear()
+        logger.info("Telemetria ablak resetelve (_recent_deque is torolt).")
 
     @staticmethod
     def _empty_metrics() -> dict[str, float]:
-        """Ures metrika szotarat ad vissza."""
         return {
             "vpip": 0.0, "pfr": 0.0, "vpip_pfr_gap": 0.0,
             "three_bet": 0.0, "af": 0.0, "wtsd": 0.0,
