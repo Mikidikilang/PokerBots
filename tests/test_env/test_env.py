@@ -111,7 +111,7 @@ class TestObservationBuilder:
     def test_action_mask_shape(self, sample_raw_state: dict) -> None:
         builder = ObservationBuilder()
         obs = builder.build(sample_raw_state)
-        assert obs["action_mask"].shape == (9,)
+        assert obs["action_mask"].shape == (10,)
 
     def test_flatten_dimension(self) -> None:
         builder = ObservationBuilder(ObservationConfig(num_players=6))
@@ -213,26 +213,27 @@ class TestActionMapper:
         ctx = GameContext(pot_size=100, my_stack=500, amount_to_call=50,
                          min_raise_amount=100, big_blind=10)
         mask = mapper.get_action_mask_tensor(ctx)
-        assert mask.shape == (9,)
+        assert mask.shape == (10,)
 
     def test_action_mask_logit_masking(self) -> None:
         """Az illegalis akciok valoszinusege ~0 a Softmax utan."""
         import torch
         mapper = ActionMapper()
-        mask_data = np.array([1, 1, 0, 0, 1, 0, 0, 0, 1], dtype=np.float32)
+        # Legal actions: FOLD(0), CHECK_CALL(1), RAISE_3QUARTER_POT(5), ALL_IN(9)
+        mask_data = np.array([1, 1, 0, 0, 0, 1, 0, 0, 0, 1], dtype=np.float32)
         mask = torch.tensor(mask_data)
-        logits = torch.tensor(np.random.randn(9).astype(np.float32))
+        logits = torch.tensor(np.random.randn(10).astype(np.float32))
         masked = ActionMapper.apply_action_mask(logits, mask)
 
         # Softmax
         probs = torch.softmax(masked, dim=-1)
-        # Illegalis indexek: 2, 3, 5, 6, 7
-        for idx in [2, 3, 5, 6, 7]:
+        # Illegalis indexek: 2, 3, 4, 6, 7, 8
+        for idx in [2, 3, 4, 6, 7, 8]:
             assert float(probs[idx].item()) < 1e-20
 
     def test_action_mask_shape_mismatch_raises(self) -> None:
         import torch
-        logits = torch.tensor(np.zeros(9, dtype=np.float32))
+        logits = torch.tensor(np.zeros(10, dtype=np.float32))
         mask = torch.tensor(np.zeros(5, dtype=np.float32))
         with pytest.raises(ValueError, match="alakja nem egyezik"):
             ActionMapper.apply_action_mask(logits, mask)

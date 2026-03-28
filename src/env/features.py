@@ -47,6 +47,9 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Import NUM_ACTIONS dynamically to stay in sync with action_mapper expansions.
+# Avoid circular imports: action_mapper does not import from features.
+from src.env.action_mapper import NUM_ACTIONS as _ACTION_SPACE_SIZE  # noqa: E402
 
 DECK_SIZE:  int = 52
 NUM_SUITS:  int = 4
@@ -68,14 +71,24 @@ _CHIP_NORMALIZATION_MAX_MULTIPLIER: float = 5.0
 ACTION_DIM_LEGACY: int = 9
 """Original action feature dimension (9 action types only)."""
 
-ACTION_DIM_EXTENDED: int = 11
-"""Extended action feature dimension with player attribution and street context.
+ACTION_DIM_V2: int = 11
+"""Intermediate extended dimension: hero indicator + street (no bet encoding).
+Used for loading checkpoints trained before the RTA-1 bet-size fix."""
 
-Layout of the 11 dimensions per betting-history step:
+ACTION_DIM_EXTENDED: int = 12
+"""Full extended action feature dimension with player attribution, street, and bet size.
 
-    Indices 0-8:  One-hot encoding of the action type.
+Layout of the 12 dimensions per betting-history step:
+
+    Indices 0-8:  One-hot encoding of the action type  (9 dims — matches NUM_ACTIONS-1
+                  since All-in occupies the last one-hot slot even with 10 actions;
+                  raise type is captured, all-in is a separate class).
     Index 9:      Hero indicator (1.0 = hero's action, 0.0 = opponent's).
     Index 10:     Normalized street (0.00=preflop, 0.33=flop, 0.67=turn, 1.00=river).
+    Index 11:     Normalized bet ratio: min(bet_amount / pot_before_action, 3.0) / 3.0
+                  Captures bet sizing information critical for RTA opponent modelling.
+                  0.0 = no bet/check, ~0.11 = min-raise, ~0.33 = pot-sized, 1.0 = 3x pot+.
+                  [RTA-1 FIX — checkpoint-breaking change]
 """
 
 _STREET_NORMALIZATION: dict[int, float] = {
@@ -90,16 +103,19 @@ _STREET_NORMALIZATION: dict[int, float] = {
 class ObservationConfig:
     """Observation Space configuration.
 
-    [FIX Y-1] action_feature_dim defaults to 11 (extended). Set to 9 for
-    backward-compatible loading of old checkpoints.
+    action_feature_dim valid values:
+        9  (ACTION_DIM_LEGACY)   — original, action type only
+        11 (ACTION_DIM_V2)       — hero indicator + street (pre-RTA-1 checkpoints)
+        12 (ACTION_DIM_EXTENDED) — full: hero indicator + street + bet ratio [default]
     """
 
     num_players:          int   = 6
     max_betting_actions:  int   = 18
-    action_feature_dim:   int   = ACTION_DIM_EXTENDED  # [Y-1] 11 (was 9)
+    action_feature_dim:   int   = ACTION_DIM_EXTENDED   # 12 (was 11 in v0.3.x)
     initial_stack_bb:     float = 200.0
     normalization_range:  tuple[float, float] = (0.0, 1.0)
-    use_extended_history: bool  = True   # [Y-1] enables dims 9 and 10
+    use_extended_history: bool  = True    # enables dims 9 and 10
+    use_bet_encoding:     bool  = True    # [RTA-1] enables dim 11 (bet ratio)
 
     def __post_init__(self) -> None:
         if not 2 <= self.num_players <= 9:
@@ -110,18 +126,20 @@ class ObservationConfig:
             raise ValueError(
                 f"max_betting_actions must be >= 1, got {self.max_betting_actions}"
             )
-        if self.action_feature_dim not in (ACTION_DIM_LEGACY, ACTION_DIM_EXTENDED):
+        if self.action_feature_dim not in (ACTION_DIM_LEGACY, ACTION_DIM_V2, ACTION_DIM_EXTENDED):
             raise ValueError(
-                f"action_feature_dim must be {ACTION_DIM_LEGACY} (legacy) or "
-                f"{ACTION_DIM_EXTENDED} (extended), got {self.action_feature_dim}"
+                f"action_feature_dim must be {ACTION_DIM_LEGACY} (legacy), "
+                f"{ACTION_DIM_V2} (v2 extended), or {ACTION_DIM_EXTENDED} (full), "
+                f"got {self.action_feature_dim}"
             )
         logger.debug(
             "ObservationConfig: players=%d, max_betting=%d, "
-            "action_dim=%d, extended=%s",
+            "action_dim=%d, extended=%s, bet_encoding=%s",
             self.num_players,
             self.max_betting_actions,
             self.action_feature_dim,
             self.use_extended_history,
+            self.use_bet_encoding,
         )
 
 
@@ -143,6 +161,14 @@ class ObservationBuilder:
     [FIX H1] Chip normalization bounded to [0, 1] via 5x stack cap.
     """
 
+    # Keys that must be present in every observation dict passed to build().
+    # Missing keys in RTA (live screen-scrape / log-parse) produce silent zeros
+    # without this check, leading to incorrect fold/call decisions.
+    _REQUIRED_KEYS: frozenset[str] = frozenset({
+        "hand", "public_cards", "pot", "my_chips", "big_blind",
+        "amount_to_call", "position", "legal_actions",
+    })
+
     def __init__(self, config: ObservationConfig | None = None) -> None:
         self.config: ObservationConfig = config or ObservationConfig()
         self._norm_min: float = self.config.normalization_range[0]
@@ -150,11 +176,12 @@ class ObservationBuilder:
 
         logger.info(
             "ObservationBuilder initialized: %d players, %d max actions, "
-            "action_dim=%d (extended=%s), obs_dim=%d",
+            "action_dim=%d (extended=%s, bet_encoding=%s), obs_dim=%d",
             self.config.num_players,
             self.config.max_betting_actions,
             self.config.action_feature_dim,
             self.config.use_extended_history,
+            self.config.use_bet_encoding,
             self.get_observation_dim(),
         )
 
@@ -162,14 +189,40 @@ class ObservationBuilder:
     # Public API
     # =========================================================================
 
-    def build(self, raw_state: dict[str, Any]) -> dict[str, torch.Tensor]:
-        """Build the full observation dict from a raw game state."""
+    def build(
+        self,
+        raw_state: dict[str, Any],
+        validate: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Build the full observation dict from a raw game state.
+
+        Args:
+            raw_state: Raw game state dictionary from environment or RTA parser.
+            validate:  If True, raise ValueError if any of _REQUIRED_KEYS is
+                       missing. Set to True in RTA/inference paths to catch
+                       incomplete screen-scrape results early. [RTA-2 FIX]
+
+        Raises:
+            ValueError: validate=True and required keys are absent.
+            KeyError:   'hand' key missing (always enforced regardless of validate).
+        """
         if isinstance(raw_state, tuple):
             raw_state = raw_state[0]
 
         state_source = raw_state
         if "raw_obs" in raw_state and isinstance(raw_state["raw_obs"], dict):
             state_source = {**raw_state, **raw_state["raw_obs"]}
+
+        # [RTA-2 FIX] Strict key validation for live online data paths.
+        if validate:
+            missing = self._REQUIRED_KEYS - set(state_source.keys())
+            if missing:
+                raise ValueError(
+                    f"ObservationBuilder.build(validate=True): required keys "
+                    f"missing from state: {sorted(missing)}. "
+                    f"Available keys: {sorted(state_source.keys())}. "
+                    f"This likely indicates an incomplete RTA scrape result."
+                )
 
         # [FIX Y-1] Hero seat needed for player attribution in history encoding
         hero_seat: int = int(state_source.get("position", 0))
@@ -214,12 +267,14 @@ class ObservationBuilder:
     def get_observation_dim(self) -> int:
         """Compute the flat observation dimension from current config.
 
-        [FIX Y-1] Extended history (action_feature_dim=11):
+        With action_feature_dim=12 (default, 6-Max):
             hole_cards:       52
             community_cards:  52
-            env_metrics:       4 + (num_players - 1)
-            betting_history:  max_betting_actions × action_feature_dim
-            position:          num_players
+            env_metrics:       4 + (num_players - 1)  = 9
+            betting_history:  18 × 12                  = 216  (was 198 with dim=11)
+            position:          6
+            ──────────────────────────────────────────────────
+            Total:            335                       (was 317 with dim=11)
         """
         card_dim:     int = DECK_SIZE * 2
         metrics_dim:  int = 4 + (self.config.num_players - 1)
@@ -362,6 +417,21 @@ class ObservationBuilder:
             street = max(0, min(street, 3))  # clamp to [0, 3]
             history_tensor[step_idx, 10] = _STREET_NORMALIZATION[street]
 
+            # ── Dimension 11: normalized bet ratio ────────────────────────
+            # [RTA-1 FIX] Encodes how large the bet was relative to the pot.
+            # Critical for RTA villain range-reading: 20% c-bet ≠ 90% c-bet.
+            # Formula: min(bet_amount / pot_before_action, 3.0) / 3.0 → [0, 1]
+            # Falls back to 0.0 if fields absent (old wrappers without pot_before).
+            if action_dim >= 12 and self.config.use_bet_encoding:
+                pot_before = float(step.get("pot_before", 0.0))
+                bet_amount = float(step.get("amount", 0.0))
+                if pot_before > 0.0:
+                    normalized_bet = min(bet_amount / pot_before, 3.0) / 3.0
+                else:
+                    # pot_before absent (legacy wrapper) — degrade gracefully
+                    normalized_bet = 0.0
+                history_tensor[step_idx, 11] = normalized_bet
+
         if logger.isEnabledFor(logging.DEBUG):
             hero_actions: int = (
                 int(history_tensor[:, 9].sum().item()) if extended else 0
@@ -369,8 +439,9 @@ class ObservationBuilder:
             total_steps: int = min(len(history), max_actions)
             logger.debug(
                 "Betting history encoded: steps=%d/%d, hero_actions=%d, "
-                "action_dim=%d, extended=%s",
+                "action_dim=%d, extended=%s, bet_encoded=%s",
                 total_steps, max_actions, hero_actions, action_dim, extended,
+                (action_dim >= 12 and self.config.use_bet_encoding),
             )
 
         return history_tensor
@@ -390,7 +461,8 @@ class ObservationBuilder:
         return position_vector
 
     def _encode_action_mask(self, legal_actions: list[int | Any]) -> torch.Tensor:
-        num_actions: int = 9
+        # Use dynamic NUM_ACTIONS from action_mapper (currently 10 after expansion)
+        num_actions: int = _ACTION_SPACE_SIZE
         mask: torch.Tensor = torch.zeros(num_actions, dtype=torch.float32)
 
         for action_item in legal_actions:

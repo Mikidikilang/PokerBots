@@ -85,11 +85,11 @@ class NetworkConfig:
                               használ. Megtartva backward-compat céllal.
     """
 
-    observation_dim: int = 281
-    num_actions: int = 9
+    observation_dim: int = 335       # updated for 10 actions + 12-dim history
+    num_actions: int = 10            # expanded from 9 (Priority-3 block bet fix)
     card_input_dim: int = 52
     context_input_dim: int = 9       # env_metrics_dim  (4 + num_opponents)
-    history_input_dim: int = 162     # 18 * 9
+    history_input_dim: int = 216     # 18 * 12  (was 162 = 18*9, then 198 = 18*11)
     position_input_dim: int = 6      # == num_players
     card_embed_dim: int = 64
     context_embed_dim: int = 32
@@ -201,6 +201,11 @@ class NetworkConfig:
 
         Returns:
             Teljesen inicializált NetworkConfig példány.
+
+        Note:
+            After the action-space expansion (9→10) and betting-history expansion
+            (11→12 dims), existing checkpoints are incompatible. Training must
+            restart from scratch.
         """
         env_cfg   = cfg.get("environment", {})
         obs_cfg   = env_cfg.get("observation_space", {})
@@ -452,6 +457,14 @@ class PokerActorCritic(nn.Module):
 
     Egyetlen belépési pont a collector és a trainer számára:
         get_action_and_value(obs, action=None) -> (action, log_prob, entropy, value)
+
+    Convergence note (Priority-4 documentation fix):
+        The EMA/FSP average-strategy network reduces exploitability and
+        cycle-avoidance in multi-player self-play. However, theoretical Nash
+        Equilibrium convergence guarantees (Heinrich & Silver 2015) apply
+        only to two-player zero-sum games. 6-Max NLHE is neither; the
+        avg_network approximates an exploitability-reducing average strategy,
+        not a formal Nash Equilibrium.
 
     Example:
         >>> config = NetworkConfig.from_dict(yaml_cfg, num_players=6)
@@ -826,13 +839,35 @@ class PokerActorCritic(nn.Module):
     ) -> tuple[int, float, float]:
         """Egyetlen akció mintavételezés a rollout fázisban.
 
+        [RTA-3 FIX] Auto-unsqueeze: if the input tensors are unbatched (no batch
+        dimension), a batch dimension of 1 is automatically added before forward().
+        This makes get_action() safe to call from both the collector (which already
+        batches) and from RTA inference code (which typically passes single states).
+
         Args:
-            observation:   Egyedi (nem batch) megfigyelés dict.
-            deterministic: True = greedy, False = sztochasztikus.
+            observation:   Observation dict. May be batched (batch, ...) or
+                           unbatched (...). Batch dimension is auto-detected and
+                           added if missing.
+            deterministic: True = greedy argmax, False = stochastic sample.
 
         Returns:
             Tuple: (action_index, log_probability, state_value).
         """
+        # [RTA-3 FIX] Auto-detect and correct missing batch dimension.
+        # hole_cards / community_cards: unbatched = (52,), batched = (B, 52)
+        # betting_history: unbatched = (18, 12), batched = (B, 18, 12)
+        # position / env_metrics / action_mask: unbatched = (D,), batched = (B, D)
+        _needs_unsqueeze = False
+        for _k, _v in observation.items():
+            if _k == "betting_history":
+                _needs_unsqueeze = (_v.dim() == 2)
+            else:
+                _needs_unsqueeze = (_v.dim() == 1)
+            break  # Check first key only — all tensors have the same batch structure
+
+        if _needs_unsqueeze:
+            observation = {k: v.unsqueeze(0) for k, v in observation.items()}
+
         # Phase 4-23: Use strict inference_mode for better safety and performance
         with torch.inference_mode():
             action_dist, value = self.forward(observation)

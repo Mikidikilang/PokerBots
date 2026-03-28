@@ -45,7 +45,7 @@ class TrainerConfig:
     entropy_coef: float = 0.01
     num_epochs: int = 4
     clip_range_vf: float | None = None
-    target_kl: float | None = None
+    target_kl: float | None = 0.015   # [Priority-2] default KL threshold; config.yaml overrides
     learning_rate_schedule: str = "none"
     lr_warmup_steps: int | None = None
 
@@ -61,7 +61,7 @@ class TrainerConfig:
             entropy_coef=ppo.get("entropy_coefficient", 0.01),
             num_epochs=ppo.get("num_epochs", 4),
             clip_range_vf=ppo.get("clip_range_vf"),
-            target_kl=None,
+            target_kl=ppo.get("target_kl", 0.015),  # [Priority-2] read from config
             learning_rate_schedule=ppo.get("learning_rate_schedule", "none"),
             lr_warmup_steps=ppo.get("lr_warmup_steps"),
         )

@@ -268,9 +268,30 @@ def build_training_pipeline(
             device_ids=[local_rank],
             output_device=local_rank,
         )
+        # [CV-2 FIX] Monkey-patch custom methods through the DDP wrapper.
+        # DistributedDataParallel only forwards __call__ (the standard forward pass).
+        # Custom methods like get_action_and_value() raise AttributeError on the
+        # DDP wrapper even though they exist on the inner .module.
+        # This patch must live here (not in run_ddp.py) so it also applies to the
+        # `torchrun` launch path via train_local.py main().
+        _DDP_CUSTOM_METHODS = (
+            "get_action_and_value",
+            "get_value",
+            "get_action",
+            "evaluate_actions",
+            "get_param_count",
+            "save_checkpoint",
+        )
+        for _method_name in _DDP_CUSTOM_METHODS:
+            if not hasattr(network, _method_name):
+                # Closure over _method_name to avoid late-binding in the lambda
+                def _make_forwarder(_mn: str):
+                    return lambda *a, **kw: getattr(network.module, _mn)(*a, **kw)
+                setattr(network, _method_name, _make_forwarder(_method_name))
         logger.info(
-            "Network wrapped with DistributedDataParallel (rank=%d/%d)",
-            rank, world_size,
+            "Network wrapped with DistributedDataParallel (rank=%d/%d); "
+            "custom methods monkey-patched: %s [CV-2 FIX]",
+            rank, world_size, _DDP_CUSTOM_METHODS,
         )
 
     # =========================================================================
@@ -485,6 +506,23 @@ def build_training_pipeline(
         "new_opponent_names":  [],
     }
 
+    # [CV-1 FIX] Shared state for DDP opponent broadcast.
+    # on_iteration_end (rank 0 only) writes the selected opponent index.
+    # on_ddp_sync (all ranks) broadcasts it so every rank's env stays in sync.
+    # The reference list is built from opponent_pool.archetypes at pipeline init
+    # time — all ranks construct the same pool, so the order is identical.
+    _ddp_opponent_state: dict[str, Any] = {
+        "selected_idx": 0,
+    }
+    _ARCHETYPE_NAMES_ORDERED: list[str] = list(opponent_pool.archetypes.keys())
+    # Sentinel index for FSP avg-strategy path (snapshot path uses same sentinel)
+    _FSP_SENTINEL_IDX: int = len(_ARCHETYPE_NAMES_ORDERED)
+    logger.info(
+        "[CV-1] DDP opponent broadcast state initialized: "
+        "%d archetypes, fsp_sentinel=%d",
+        len(_ARCHETYPE_NAMES_ORDERED), _FSP_SENTINEL_IDX,
+    )
+
     def on_iteration_end(iteration: int, stats: dict[str, float]) -> None:
         """Orchestrator callback — runs on rank 0 only."""
         nonlocal phase_transition_state
@@ -520,6 +558,27 @@ def build_training_pipeline(
                             combined_metrics[f"hud/{key}"] = value
                 except Exception as e:
                     logger.debug("HUD metrics extraction failed: %s", e)
+
+                # [Priority-4 FIX] ESS of PolicyAverager pool — logged every
+                # iteration as a training health metric (not just in Phase 2).
+                # A declining ESS % warns of policy collapse before it hurts win rate.
+                if orchestrator is not None:
+                    try:
+                        avg_stats = orchestrator.curriculum._policy_averager.get_stats()
+                        pool_size = float(avg_stats["pool_size"])
+                        eff_ess   = float(avg_stats["effective_ess"])
+                        combined_metrics["fsp/pool_size"]    = pool_size
+                        combined_metrics["fsp/ess"]          = eff_ess
+                        combined_metrics["fsp/total_weight"] = float(avg_stats["total_weight"])
+                        combined_metrics["fsp/ess_pct"]      = (
+                            eff_ess / max(pool_size, 1.0) * 100.0
+                        )
+                        combined_metrics["fsp/phase"] = float(
+                            orchestrator.curriculum.current_phase.value
+                        )
+                    except Exception as ess_exc:
+                        logger.debug("ESS metrics extraction failed: %s", ess_exc)
+
                 local_steps = runner.collector.get_total_steps() if hasattr(runner, "collector") else 0
                 combined_metrics["total_env_steps"] = local_steps * world_size
                 monitor.log_metrics(step=iteration, metrics=combined_metrics)
@@ -530,15 +589,6 @@ def build_training_pipeline(
                     network=network,
                     iteration=iteration,
                 )
-
-            # ESS metrics
-            if monitor.active and orchestrator is not None:
-                avg_stats = orchestrator.curriculum._policy_averager.get_stats()
-                monitor.log_metrics(step=iteration, metrics={
-                    "fsp/pool_size":     float(avg_stats["pool_size"]),
-                    "fsp/ess":           float(avg_stats["effective_ess"]),
-                    "fsp/total_weight":  float(avg_stats["total_weight"]),
-                })
 
             # =================================================================
             # [FIX P0-A] Wire opponent selection to the environment.
@@ -560,6 +610,21 @@ def build_training_pipeline(
                 logger.debug(
                     "[P0-A] Opponent for iter %d: '%s' (phase=%d)",
                     iteration + 1, opp_name, phase_val,
+                )
+
+            # [CV-1 FIX] Store selected opponent index for DDP broadcast.
+            # Uses integer index to avoid string broadcast complexity.
+            if world_size > 1:
+                if opp_name in _ARCHETYPE_NAMES_ORDERED:
+                    _ddp_opponent_state["selected_idx"] = (
+                        _ARCHETYPE_NAMES_ORDERED.index(opp_name)
+                    )
+                else:
+                    # FSP snapshot path or avg_strategy neural opponent
+                    _ddp_opponent_state["selected_idx"] = _FSP_SENTINEL_IDX
+                logger.debug(
+                    "[CV-1] Stored DDP opponent idx=%d for '%s'",
+                    _ddp_opponent_state["selected_idx"], opp_name,
                 )
 
         # =====================================================================
@@ -603,6 +668,7 @@ def build_training_pipeline(
         """Cross-rank synchronization — called on ALL ranks every iteration.
 
         [FIX C-2] Broadcasts shutdown flag from rank 0 to all ranks.
+        [CV-1 Part C] Broadcasts opponent index from rank 0 to all ranks.
         """
         nonlocal phase_transition_state
 
@@ -631,6 +697,41 @@ def build_training_pipeline(
                 rank,
             )
             runner.request_stop()
+
+        # Broadcast 3: Opponent index [CV-1 Part C]
+        # Rank 0 selected an opponent via curriculum.select_opponent_idx();
+        # stored in _ddp_opponent_state["selected_idx"]. Broadcast it and
+        # set on each rank's environment.
+        opponent_idx_tensor = torch.tensor(
+            [float(_ddp_opponent_state.get("selected_idx", _FSP_SENTINEL_IDX))],
+            dtype=torch.long,
+            device=device,
+        )
+        dist.broadcast(opponent_idx_tensor, src=0)
+        received_idx = int(opponent_idx_tensor[0].item())
+        logger.debug("Rank %d received opponent index broadcast: %d", rank, received_idx)
+
+        # Resolve index → opponent name and set on current environment
+        if received_idx == _FSP_SENTINEL_IDX:
+            # FSP mode sentinel (pool, not a fixed archetype)
+            opponent_name = "PolicyAverager (FSP)"
+            logger.debug("Rank %d using FSP opponent selection", rank)
+        elif 0 <= received_idx < len(_ARCHETYPE_NAMES_ORDERED):
+            opponent_name = _ARCHETYPE_NAMES_ORDERED[received_idx]
+            logger.debug(
+                "Rank %d setting opponent to archetype %d: %s",
+                rank, received_idx, opponent_name
+            )
+        else:
+            logger.warning("Rank %d received invalid opponent index: %d", rank, received_idx)
+            opponent_name = None  # keep previous
+
+        if opponent_name and hasattr(runner, "env") and runner.env is not None:
+            try:
+                runner.env.set_active_opponent(opponent_name)
+                logger.debug("Rank %d opponent set to: %s", rank, opponent_name)
+            except Exception as e:
+                logger.debug("Rank %d opponent set failed: %s", rank, e)
 
     # =========================================================================
     # [FIX R-1] on_checkpoint — unconditional DDP barrier after rank-0 I/O

@@ -111,19 +111,21 @@ class WrapperConfig:
 
 
 # =============================================================================
-# Internal action-index constants
+# Internal action-index constants (mirrors PokerAction enum in action_mapper.py)
+# Must be kept in sync with action_mapper.PokerAction.
 # =============================================================================
 
-_FOLD       = 0
-_CHECK_CALL = 1
-_MIN_RAISE  = 2
-_RAISE_HALF = 3
-_RAISE_75   = 4
-_RAISE_POT  = 5
-_RAISE_150  = 6
-_RAISE_2X   = 7
-_ALL_IN     = 8
-_N_RAISE_LEVELS: int = _RAISE_2X - _MIN_RAISE  # == 5
+_FOLD        = 0
+_CHECK_CALL  = 1
+_MIN_RAISE   = 2
+_RAISE_THIRD = 3   # NEW — 33% pot block bet (Priority-3 fix)
+_RAISE_HALF  = 4
+_RAISE_75    = 5
+_RAISE_POT   = 6
+_RAISE_150   = 7
+_RAISE_2X    = 8
+_ALL_IN      = 9   # shifted from 8 (checkpoint-breaking)
+_N_RAISE_LEVELS: int = _RAISE_2X - _MIN_RAISE  # == 6 (was 5)
 
 
 # =============================================================================
@@ -244,10 +246,14 @@ class RLCardWrapper:
         self._current_street = _PUBLIC_CARDS_TO_STREET.get(n_public, 0)
 
         self._hand_history.append({
-            "action": action,
-            "amount": chip_amount,
-            "player": self._current_player_id,
-            "street": self._current_street,  # Street context for features.py FIX Y-1
+            "action":     action,
+            "amount":     chip_amount,
+            "player":     self._current_player_id,
+            "street":     self._current_street,
+            # [RTA-1 FIX] pot_before is the pot size BEFORE this action.
+            # Required by ObservationBuilder dim-11 bet-ratio encoding.
+            # Computed from raw obs state captured before env.step() is called.
+            "pot_before": float(raw.get("pot", 0.0)),
         })
 
         legal = self._current_state.get("legal_actions", {})
@@ -387,7 +393,9 @@ class RLCardWrapper:
         if not raise_ids:
             return sorted_ids[min(1, n - 1)]
 
-        proportion = (action - _MIN_RAISE) / max(_RAISE_2X - _MIN_RAISE, 1)
+        # Map our raise indices (MIN_RAISE..RAISE_2X inclusive = 2..8) linearly
+        # onto RLCard's available raise slots. _ALL_IN (9) is handled above.
+        proportion = (action - _MIN_RAISE) / max(_RAISE_2X - _MIN_RAISE, 1)  # 0.0 -> 1.0
         mapped_idx = round(proportion * (len(raise_ids) - 1))
         mapped_idx = max(0, min(mapped_idx, len(raise_ids) - 1))
         return raise_ids[mapped_idx]
@@ -412,16 +420,18 @@ class RLCardWrapper:
         if n_raises >= 1:
             legal.add(_MIN_RAISE)
         if n_raises >= 2:
-            legal.add(_RAISE_HALF)
+            legal.add(_RAISE_THIRD)   # 33% pot block bet
         if n_raises >= 3:
+            legal.add(_RAISE_HALF)    # 50% pot
+        if n_raises >= 4:
             legal.add(_RAISE_75)
             legal.add(_RAISE_POT)
-        if n_raises >= 4:
-            legal.add(_RAISE_150)
         if n_raises >= 5:
+            legal.add(_RAISE_150)
+        if n_raises >= 6:
             legal.add(_RAISE_2X)
         if n_raises >= 1 and my_chips > 0:
-            legal.add(_ALL_IN)
+            legal.add(_ALL_IN)        # index 9
 
         return sorted(legal)
 

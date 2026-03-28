@@ -170,13 +170,14 @@ class TestActionMaskingMath:
         import torch
         from src.env.action_mapper import ILLEGAL_ACTION_LOGIT
 
-        logits = torch.tensor(np.random.randn(9).astype(np.float32))
-        mask = torch.tensor(np.array([1, 1, 0, 0, 1, 0, 0, 0, 1], dtype=np.float32))
+        logits = torch.tensor(np.random.randn(10).astype(np.float32))
+        # Legal actions: FOLD(0), CHECK_CALL(1), RAISE_3QUARTER_POT(5), ALL_IN(9)
+        mask = torch.tensor(np.array([1, 1, 0, 0, 0, 1, 0, 0, 0, 1], dtype=np.float32))
 
         masked = logits + (1.0 - mask) * ILLEGAL_ACTION_LOGIT
         probs = torch.softmax(masked, dim=-1)
 
-        for idx in [2, 3, 5, 6, 7]:
+        for idx in [2, 3, 4, 6, 7, 8]:
             assert float(probs[idx].item()) < 1e-20, \
                 f"Illegalis index {idx} valoszinusege nem nulla: {probs[idx].item()}"
 
@@ -185,13 +186,15 @@ class TestActionMaskingMath:
         import torch
         from src.env.action_mapper import ILLEGAL_ACTION_LOGIT
 
-        logits = torch.tensor(np.random.randn(9).astype(np.float32))
-        mask = torch.tensor(np.array([1, 0, 1, 0, 1, 0, 1, 0, 1], dtype=np.float32))
+        logits = torch.tensor(np.random.randn(10).astype(np.float32))
+        # Legal actions at even indices: FOLD(0), RAISE_MIN(2), RAISE_3QUARTER_POT(5), RAISE_2POT(7), (unused)(9 odd, but 9 added)
+        # Actually even indices: [0, 2, 4, 6, 8] in old → [0, 2, 5, 7, 9] in new
+        mask = torch.tensor(np.array([1, 0, 1, 0, 0, 1, 0, 1, 0, 1], dtype=np.float32))
 
         masked = logits + (1.0 - mask) * ILLEGAL_ACTION_LOGIT
         probs = torch.softmax(masked, dim=-1)
 
-        legal_sum = sum(float(probs[i].item()) for i in [0, 2, 4, 6, 8])
+        legal_sum = sum(float(probs[i].item()) for i in [0, 2, 5, 7, 9])
         assert abs(legal_sum - 1.0) < 1e-5, f"Legalis osszeg: {legal_sum}"
 
     def test_single_legal_action_probability_one(self) -> None:
@@ -199,13 +202,14 @@ class TestActionMaskingMath:
         import torch
         from src.env.action_mapper import ILLEGAL_ACTION_LOGIT
 
-        logits = torch.tensor(np.random.randn(9).astype(np.float32))
-        mask = torch.tensor(np.array([0, 0, 0, 0, 1, 0, 0, 0, 0], dtype=np.float32))
+        logits = torch.tensor(np.random.randn(10).astype(np.float32))
+        # Only RAISE_3QUARTER_POT(5) is legal (was index 4 → now 5)
+        mask = torch.tensor(np.array([0, 0, 0, 0, 0, 1, 0, 0, 0, 0], dtype=np.float32))
 
         masked = logits + (1.0 - mask) * ILLEGAL_ACTION_LOGIT
         probs = torch.softmax(masked, dim=-1)
 
-        assert float(probs[4].item()) > 0.999
+        assert float(probs[5].item()) > 0.999
 
     def test_illegal_logit_value(self) -> None:
         """Az ILLEGAL_ACTION_LOGIT erteke -1e8."""

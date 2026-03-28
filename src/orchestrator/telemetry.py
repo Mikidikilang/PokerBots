@@ -97,13 +97,15 @@ class TelemetryAnalyzer:
         self._reward_sum: float = 0.0
         self._total_hands: int = 0
 
-        # [FIX C3] O(1) stagnacio detektalas tamogatasa.
-        # A _recent_deque az utolso _DEFAULT_STAGNATION_HALF jutalom erteket
-        # tarolja inkrementalisan. record_hand() frissiti, check_stagnation()
-        # olvassa — mindket muvelet O(1).
+        # [FIX C3 / CV-4] True O(1) stagnation detection.
+        # _recent_deque stores the last N rewards (N = _DEFAULT_STAGNATION_HALF).
+        # _recent_sum maintains the running sum of _recent_deque, updated
+        # incrementally in record_hand() — eviction is O(1) via deque maxlen,
+        # and mean computation avoids sum() iteration entirely.
         self._recent_deque: deque[float] = deque(
             maxlen=self._DEFAULT_STAGNATION_HALF
         )
+        self._recent_sum: float = 0.0   # [CV-4] running sum for O(1) mean
 
         logger.info(
             "TelemetryAnalyzer inicializalva: window=%d, players=%d, "
@@ -146,10 +148,12 @@ class TelemetryAnalyzer:
         self._reward_sum += record.reward_bb
         self._total_hands += 1
 
-        # [FIX C3] O(1) csuszoablakos frissites a stagnacio detektalashoz.
-        # A maxlen=_DEFAULT_STAGNATION_HALF gondoskodik az automatikus
-        # evictorasrol; nincs szukseg kulon logikara.
+        # [CV-4 FIX] True O(1) running-sum maintenance.
+        # Before appending, subtract the value that will be evicted (if full).
+        if len(self._recent_deque) == self._DEFAULT_STAGNATION_HALF:
+            self._recent_sum -= self._recent_deque[0]  # evicted element
         self._recent_deque.append(record.reward_bb)
+        self._recent_sum += record.reward_bb
 
         if self._total_hands % 10000 == 0:
             logger.debug(
@@ -311,9 +315,9 @@ class TelemetryAnalyzer:
         if len(self._recent_deque) < self._DEFAULT_STAGNATION_HALF:
             return False
 
-        # O(1) recent atlag — sum() az O(maxlen) de maxlen rogzitett (50)
-        recent_sum = sum(self._recent_deque)
-        recent_mean = recent_sum / len(self._recent_deque)
+        # [CV-4 FIX] True O(1) recent mean — uses the incrementally maintained
+        # _recent_sum, avoiding sum() iteration over the deque entirely.
+        recent_mean = self._recent_sum / len(self._recent_deque)
 
         # O(1) teljes ablak atlag — _reward_sum mar karbantartva record_hand()-ben
         total_mean = self._reward_sum / max(len(self._window), 1)
@@ -381,9 +385,10 @@ class TelemetryAnalyzer:
         self._saw_flop_count = 0
         self._reward_sum = 0.0
         self._total_hands = 0
-        # [FIX C3] _recent_deque is resetelese
+        # [CV-4 FIX] Clear both the deque and its running sum
         self._recent_deque.clear()
-        logger.info("Telemetria ablak resetelve (_recent_deque is torolt).")
+        self._recent_sum = 0.0
+        logger.info("Telemetria ablak resetelve (_recent_deque + _recent_sum torolt).")
 
     @staticmethod
     def _empty_metrics() -> dict[str, float]:

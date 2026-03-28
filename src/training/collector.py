@@ -61,8 +61,9 @@ logger = logging.getLogger(__name__)
 _FOLD       = 0
 _CHECK_CALL = 1
 _MIN_RAISE  = 2
-_ALL_IN     = 8
+_ALL_IN     = 9   # [Action Space Fix] shifted from 8; includes new RAISE_THIRD_POT (3)
 _RAISE_ACTIONS: frozenset[int] = frozenset(range(_MIN_RAISE, _ALL_IN + 1))
+# = {2, 3, 4, 5, 6, 7, 8, 9} — includes the new 33% pot block bet (index 3)
 
 
 @runtime_checkable
@@ -276,10 +277,14 @@ class RolloutCollector:
         # a bufferben, MIELOTT a runner.py compute_gae()-t hivna.
         # Igy nincs race condition: a buffer.get_last_bootstrap_value()
         # mindig a helyes erteket adja vissza.
-        #
-        # Ha done=True (terminalis allapot), a bootstrap ertek 0.0 (helyes:
-        # nincs jovobeli jutalom terminalis allapotbol).
-        if not done and self._current_obs is not None:
+        # [CV-3 FIX] done here is from the LAST env.step() in the loop.
+        # MultiAgentRLCardWrapper.step() internally advances ALL opponent actions
+        # before returning, so self.env.is_over() is definitively correct by the
+        # time we reach this point. No off-by-one race condition remains.
+        # If the last step ended the episode (done=True), bootstrap = 0.0 (correct:
+        # no future reward from terminal state). Otherwise bootstrap from V(s_T).
+        done_is_final: bool = bool(done)
+        if not done_is_final and self._current_obs is not None:
             last_obs_tensor = self._build_obs_tensor(self._current_obs)
             last_obs_batched: dict[str, torch.Tensor] = {
                 k: v.unsqueeze(0) for k, v in last_obs_tensor.items()
@@ -293,9 +298,11 @@ class RolloutCollector:
                 float(last_value_tensor.detach().cpu().item()),
             )
         else:
-            # Terminalis allapot: 0.0 a helyes bootstrap ertek
+            # Terminalis allapot VAGY ures megfigyelés: 0.0 a helyes bootstrap ertek
             self.buffer.set_last_value(0.0)
-            logger.debug("Bootstrap ertek: 0.0 (terminalis allapot)")
+            logger.debug(
+                "Bootstrap ertek: 0.0 (terminalis allapot=%s)", done_is_final
+            )
 
         self.network.train()
 

@@ -193,8 +193,10 @@ def _compute_legal_actions_from_state(
         if game_state.my_chips >= game_state.min_raise:
             legal.append(2)  # min-raise
 
+        # Indices match expanded PokerAction enum (Priority-3 action space fix):
+        #   3 = 0.33x (block bet), 4 = 0.50x, 5 = 0.75x, 6 = 1.0x, 7 = 1.5x, 8 = 2.0x
         pot_multipliers: dict[int, float] = {
-            3: 0.50, 4: 0.75, 5: 1.00, 6: 1.50, 7: 2.00
+            3: 0.33, 4: 0.50, 5: 0.75, 6: 1.00, 7: 1.50, 8: 2.00
         }
         for action_idx, mult in pot_multipliers.items():
             raise_size: float = (
@@ -204,7 +206,7 @@ def _compute_legal_actions_from_state(
             if game_state.my_chips >= raise_size:
                 legal.append(action_idx)
 
-        legal.append(8)  # All-in always available when chips above call
+        legal.append(9)  # All-in always available when chips above call (Priority-3 action space fix)
 
     return sorted(set(legal))
 
@@ -227,11 +229,13 @@ def _action_idx_to_acpc_string(
     if action_idx == 1:
         return "c"
 
-    if action_idx == 8:
+    if action_idx == 9:   # ALL_IN shifted from 8 → 9 (Priority-3 action space fix)
         return f"r{int(game_state.my_chips)}"
 
+    # Index mapping after action space expansion (10 actions, indices 2-8 are raises):
+    #   2=min, 3=0.33x, 4=0.50x, 5=0.75x, 6=1.0x, 7=1.5x, 8=2.0x
     pot_multipliers: dict[int, float] = {
-        2: 0.0, 3: 0.50, 4: 0.75, 5: 1.00, 6: 1.50, 7: 2.00,
+        2: 0.0, 3: 0.33, 4: 0.50, 5: 0.75, 6: 1.00, 7: 1.50, 8: 2.00,
     }
     mult: float = pot_multipliers.get(action_idx, 1.0)
 

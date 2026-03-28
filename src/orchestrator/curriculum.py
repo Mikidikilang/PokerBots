@@ -128,8 +128,12 @@ class PolicyAverager:
     In FSP, each player maintains an "average strategy":
         σ̄(t) = (1/t) Σ_{k=1}^{t} σ(k)
 
-    The key theorem: σ̄(t) converges to a Nash equilibrium as t → ∞,
-    even though the instantaneous best-response σ(t) cycles.
+    The key theorem (Heinrich & Silver 2015): in two-player zero-sum games,
+    σ̄(t) converges to a Nash equilibrium as t → ∞. For 6-Max NLHE (multi-
+    player, non-zero-sum), convergence to a formal Nash is not guaranteed;
+    the average strategy converges to an exploitability-reducing mixed
+    strategy that resists single-opponent exploitation, which is the
+    practical target for superhuman poker play.
 
     Linear weighting (iteration-proportional) is theoretically equivalent
     to the time-average update rule. Uniform weighting is also valid and

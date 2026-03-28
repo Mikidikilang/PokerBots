@@ -49,7 +49,7 @@ environment:
     total_card_dim: 104                 # Összesített kártyatér (52 + 52)
     max_betting_rounds: 4               # Pre-flop, Flop, Turn, River
     max_actions_per_round: 18           # Maximális licitlehetőségek egy leosztásban
-    betting_history_dim: [18, 11]       # +2 dims per step: hero indicator + street
+    betting_history_dim: [18, 12]       # +3 dims per step: hero indicator + street + normalized bet ratio
     position_encoding: "one_hot"        # One-hot pozíció vektor (num_players dimenziós)
     normalization_method: "big_blind"   # Monetáris értékek normalizálása BB-hez viszonyítva
     normalization_range: [0.0, 1.0]     # Célintervallum a normalizált értékekhez
@@ -57,17 +57,18 @@ environment:
   # --- Akciótér (Action Space) ---
   action_space:
     type: "discrete"                    # Diszkretizált akciótér
-    num_actions: 9                      # 9 lehetséges akció (0-8 index)
+    num_actions: 10                     # 10 lehetséges akció (0-9 index)
     actions:
       0: "fold"                         # Dobás
       1: "check_call"                   # Passz / Megadás
       2: "min_raise"                    # Minimum emelés
-      3: "raise_0.5x_pot"              # Fél pot emelés
-      4: "raise_0.75x_pot"             # 3/4 pot emelés
-      5: "raise_1.0x_pot"              # Teljes pot emelés
-      6: "raise_1.5x_pot"              # Másfélszeres pot (overbet)
-      7: "raise_2.0x_pot"              # Kétszeres pot (deep overbet)
-      8: "all_in"                       # Teljes zsetonkészlet betolása
+      3: "raise_0.33x_pot"             # 1/3 pot block bet (GTO range bet / blocker bet)
+      4: "raise_0.5x_pot"              # Fél pot emelés
+      5: "raise_0.75x_pot"             # 3/4 pot emelés
+      6: "raise_1.0x_pot"              # Teljes pot emelés
+      7: "raise_1.5x_pot"              # Másfélszeres pot (overbet)
+      8: "raise_2.0x_pot"              # Kétszeres pot (deep overbet)
+      9: "all_in"                       # Teljes zsetonkészlet betolása
     illegal_action_logit_mask: -1.0e+8  # LEGACY fallback; a kód torch.finfo(dtype).min-t használ (AMP-safe)
 
 # ---------------------------------------------------------------------------
@@ -118,10 +119,12 @@ ppo:
   value_loss_coefficient: 0.5           # Értékveszteség súlyozási tényező (c₁)
   gamma: 0.99                           # Diszkontálási faktor (γ)
   gae_lambda: 0.95                      # Generalized Advantage Estimation (λ)
+  target_kl: 0.015                      # KL divergencia korai leállítási küszöb — megakadályozza az over-optimization-t
+                                        # a magas-varianciájú póker rollout-okban (Priority-2 fix)
 
   # --- Mintavételezés és Batch ---
   rollout_steps: 2048                   # Lépések száma egy rollout-ban (adatgyűjtés)
-  num_epochs: 4                         # PPO epoch-ok száma egy batch-en belül
+  num_epochs: 2                         # PPO epoch-ok száma (csökkentve 4→2; póker variancia miatt az adat hamar stale)
   batch_size: 64                        # Mini-batch méret a gradiens frissítéshez
   num_mini_batches: 4                   # Mini-batch darabszám (rollout_steps / batch_size)
 
