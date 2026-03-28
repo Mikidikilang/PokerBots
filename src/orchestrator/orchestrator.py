@@ -1,19 +1,24 @@
 """
 Auto-Adaptiv Curriculum Orchestrator (orchestrator.py).
 
-[FIX C2 - 2025-03-28] DDP FSP Snapshot Deadlock Javitas:
-    A _save_fsp_snapshot() mostantol dist.barrier()-t hasznal mielott
-    a torch.save()-t meghivja. Multi-GPU futasnal Rank 0 FSP snapshot
-    mentese blokkolhatott volna a fajlrendszer I/O-n, miközben a tobbi
-    rank tovabb tanult — potencialis deadlockot okozva. A barrier
-    garantalja, hogy minden rank ugyanazon a ponton var, mielott a
-    mentés megkezdodik.
+[FIX C-1 — 2025-03-28] dist.barrier() REMOVED from _save_fsp_snapshot().
 
-[FIX M5 - 2025-03-28] Entropia CAP Teves Figyelmezteto Log Javitas:
-    Az _intervene_passivity() es _intervene_stagnation() most DEBUG
-    szinten logol, ha az entropia eppen a capnel van, nem WARNING szinten.
-    Ez megszunteti a felrevezeto beavatkozasi logokat, amikor a rendszer
-    normalis mukodest folytat a cap kozeleben.
+    ROOT CAUSE OF DEADLOCK:
+    The orchestrator runs on rank 0 ONLY. When _save_fsp_snapshot() called
+    dist.barrier(), rank 0 would block waiting for rank 1 to arrive at the
+    same collective. But rank 1 was already executing on_ddp_sync() in
+    runner.py where it calls dist.broadcast() — a completely different
+    collective operation. NCCL sees barrier on rank 0 and broadcast on rank 1
+    = collective mismatch = permanent hang of both processes.
+
+    THE FIX:
+    Remove all dist.barrier() calls from _save_fsp_snapshot(). This method
+    runs on rank 0 only and performs local file I/O only — it needs zero
+    cross-rank synchronization. Phase transition is already communicated to
+    all ranks through the on_ddp_sync() broadcast path in runner.py, which
+    is the correct and only synchronization point.
+
+[FIX M5 — 2025-03-28] Entropy CAP log level WARNING -> DEBUG (normal operation).
 """
 
 from __future__ import annotations
@@ -49,11 +54,7 @@ class OrchestratorConfig:
 class AutoAdaptiveOrchestrator:
     """A rendszer fo felugyeleti entitasa (Singleton).
 
-    [FIX C2] A _save_fsp_snapshot() mostantol DDP barrier-t hasznal
-    multi-GPU futasban a deadlock elkeuleseere.
-
-    [FIX M5] Az entropia cap figyelmezteto log DEBUG szintre kerult
-    (a cap normalis mukodest jelez, nem hibat).
+    Rank 0 only. Never calls dist.barrier() — see module docstring.
     """
 
     _instance: AutoAdaptiveOrchestrator | None = None
@@ -113,7 +114,8 @@ class AutoAdaptiveOrchestrator:
         self._network_ref: Any = None
         self._fsp_snapshot_counter: int = 0
 
-        # [C2 FIX] DDP world_size tarolasa a barrier logikához
+        # DDP world_size stored for informational logging only.
+        # It is NOT used for dist.barrier() — see module docstring.
         self._ddp_world_size: int = 1
 
         self._intervention_count: int = 0
@@ -147,17 +149,20 @@ class AutoAdaptiveOrchestrator:
         logger.debug("Network referencia beallitva az Orchestrator-ban.")
 
     def set_ddp_world_size(self, world_size: int) -> None:
-        """[FIX C2] DDP world_size beallitasa a barrier logikához.
+        """Store DDP world_size for informational logging.
 
-        Ezt a train_local.py build_training_pipeline() hiva meg
-        a pipeline osszeallitasakor, ha world_size > 1.
+        NOTE: This value is NOT used for dist.barrier() synchronization.
+        The orchestrator runs on rank 0 only and performs local I/O only.
+        Cross-rank synchronization happens exclusively in runner.py's
+        on_ddp_sync() callback via dist.broadcast().
 
         Args:
-            world_size: Az osszes DDP process szama (1 = nincs DDP).
+            world_size: Total number of DDP processes (1 = no DDP).
         """
         self._ddp_world_size = world_size
         logger.info(
-            "DDP world_size beallitva az Orchestratorban: %d [C2 FIX]",
+            "DDP world_size=%d registered in Orchestrator (informational only, "
+            "no barriers will be called from this class).",
             world_size,
         )
 
@@ -285,9 +290,7 @@ class AutoAdaptiveOrchestrator:
     def _intervene_passivity(self, metrics: dict[str, float]) -> None:
         """Passzivitas korrekcios beavatkozas.
 
-        [FIX M5] Az entropia cap elesekor DEBUG szinten logolunk (nem WARNING):
-        a cap eleres normalis mukodest jelez (a rendszer nem tud tobbet boostolni),
-        nem hibat.
+        [FIX M5] Entropy CAP logging moved to DEBUG (normal operation, not a warning).
         """
         if self._trainer_ref is not None:
             current_ent: float = getattr(
@@ -298,11 +301,11 @@ class AutoAdaptiveOrchestrator:
             new_ent: float = min(current_ent * boost, self._max_entropy_coef)
             at_cap = new_ent >= self._max_entropy_coef
 
-            # [FIX M5] CAP eresekere DEBUG (nem WARNING) — ez normalis allapot
             if at_cap:
+                # [FIX M5] DEBUG not WARNING — hitting the cap is normal
                 logger.debug(
-                    "Entropia CAP elerve (normalis): %.4f >= %.4f max. "
-                    "Tovabbi noveles blokkolva (ez nem hiba).",
+                    "Entropy CAP reached (normal operation): %.4f >= %.4f max. "
+                    "Further boost blocked — this is expected behaviour.",
                     new_ent, self._max_entropy_coef,
                 )
             else:
@@ -324,12 +327,12 @@ class AutoAdaptiveOrchestrator:
 
     def _intervene_maniac(self, metrics: dict[str, float]) -> None:
         self.reward_shaper.update_penalty_lambda(0.5)
-        logger.info("Maniac intervenció: bloff buntetes lambda=0.5 aktiválva")
+        logger.info("Maniac intervencio: bloff buntetes lambda=0.5 aktiválva")
 
     def _intervene_stagnation(self) -> None:
         """Stagnacio korrekcios beavatkozas.
 
-        [FIX M5] Ugyanaz a cap-log javitas mint _intervene_passivity-ban.
+        [FIX M5] Entropy CAP logging moved to DEBUG (normal operation).
         """
         if self._trainer_ref is not None:
             current_ent: float = getattr(
@@ -340,10 +343,10 @@ class AutoAdaptiveOrchestrator:
             new_ent: float = min(current_ent * boost, self._max_entropy_coef)
             at_cap = new_ent >= self._max_entropy_coef
 
-            # [FIX M5] CAP eresekere DEBUG (normalis allapot)
             if at_cap:
+                # [FIX M5] DEBUG not WARNING
                 logger.debug(
-                    "Stagnacio: Entropia CAP elerve (normalis): %.4f >= %.4f max.",
+                    "Stagnacio: Entropy CAP reached (normal): %.4f >= %.4f max.",
                     new_ent, self._max_entropy_coef,
                 )
             else:
@@ -359,7 +362,7 @@ class AutoAdaptiveOrchestrator:
         """Callback a fazisatmenet utan."""
         self.reward_shaper.deactivate_all_shaping()
 
-        if self.curriculum.current_phase.value == 2:  # PHASE_2_FSP
+        if self.curriculum.current_phase.value == 2:
             self._save_fsp_snapshot()
 
         logger.info(
@@ -370,52 +373,39 @@ class AutoAdaptiveOrchestrator:
         )
 
     # =========================================================================
-    # [FIX C2] FSP Snapshot Mentes DDP Barrier-rel
+    # [FIX C-1] FSP Snapshot — NO dist.barrier(), rank-0-local I/O only
     # =========================================================================
 
     def _save_fsp_snapshot(self) -> None:
-        """FSP snapshot mentes DDP barrier-rel a deadlock elkeruleseere.
+        """Save FSP network snapshot to disk (rank 0, local I/O only).
 
-        [FIX C2] A korabbi implementacioban az FSP snapshot mentes nem
-        szinkronizalt a tobb DDP rank kozott. Rank 0 blokkolhatott a
-        fajlrendszer I/O-n (torch.save()), miközben a tobb rank tovabb
-        szamolt — potencialis deadlockot okozva.
+        [FIX C-1] All dist.barrier() calls have been REMOVED.
 
-        A javitas: dist.barrier() hivodik, mielott es utan a torch.save().
-        Ez biztositja, hogy:
-        1. Minden rank ugyanazon a ponton var (elotte).
-        2. Rank 0 elvegzi a mentést.
-        3. Minden rank folytathat (utana).
+        Why they caused a deadlock:
+            - This method runs on rank 0 ONLY (orchestrator is rank-0-only).
+            - When rank 0 called dist.barrier(), it blocked waiting for rank 1.
+            - But rank 1 was executing on_ddp_sync() in runner.py calling
+              dist.broadcast() — a different collective operation entirely.
+            - NCCL encountered a collective mismatch: permanent hang.
 
-        Ha _ddp_world_size == 1 (single-GPU), a barrier kihagyodik.
+        Why no barrier is needed:
+            - This method only calls torch.save() + os.replace() — pure local
+              file I/O with no GPU operations and no cross-rank data exchange.
+            - Phase transitions are communicated to all ranks via the
+              dist.broadcast() call already present in runner.py's on_ddp_sync().
+            - That broadcast is the single correct synchronization point.
         """
         if self._network_ref is None:
             logger.warning("FSP snapshot save sikertelen: _network_ref is None")
             return
 
         import torch
-        from pathlib import Path
 
         try:
             fsp_dir = Path("checkpoints/fsp")
             fsp_dir.mkdir(parents=True, exist_ok=True)
 
-            # [FIX C2] DDP barrier ELOTT — mindenki varja meg, hogy a mentor
-            # biztosan keszult el az elozo iteracio gradiens frissiteseivel
-            if self._ddp_world_size > 1:
-                try:
-                    import torch.distributed as dist
-                    if dist.is_available() and dist.is_initialized():
-                        dist.barrier()
-                        logger.debug("DDP barrier elott FSP snapshot save [C2 FIX]")
-                except Exception as barrier_exc:
-                    logger.warning(
-                        "DDP barrier sikertelen FSP snapshot elott: %s. "
-                        "Mentés folytatodik barriernel kul.",
-                        barrier_exc,
-                    )
-
-            # DDP wrapper eltavolitasa, state dict kinyerese
+            # Unwrap DDP wrapper if present
             if isinstance(self._network_ref, torch.nn.parallel.DistributedDataParallel):
                 state_dict = self._network_ref.module.state_dict()
             else:
@@ -424,7 +414,7 @@ class AutoAdaptiveOrchestrator:
             self._fsp_snapshot_counter += 1
             snapshot_path = fsp_dir / f"snapshot_{self._fsp_snapshot_counter:08d}.pt"
 
-            # Atomikus mentes: temp fajl -> rename (M2 fix mintajara)
+            # Atomic write: temp file -> rename (SIGKILL-safe, M2 pattern)
             tmp_path = snapshot_path.with_suffix(".pt.tmp")
             try:
                 torch.save(state_dict, str(tmp_path))
@@ -437,25 +427,13 @@ class AutoAdaptiveOrchestrator:
                         pass
                 raise save_exc
 
-            # [FIX C2] DDP barrier UTAN — mindenki megvarja a mentés veget
-            if self._ddp_world_size > 1:
-                try:
-                    import torch.distributed as dist
-                    if dist.is_available() and dist.is_initialized():
-                        dist.barrier()
-                        logger.debug("DDP barrier utan FSP snapshot save [C2 FIX]")
-                except Exception as barrier_exc:
-                    logger.warning(
-                        "DDP barrier sikertelen FSP snapshot utan: %s",
-                        barrier_exc,
-                    )
-
-            # Regisztracio az opponent pool-ba (MAB tracking)
+            # Register in MAB pool
             opponent_name = f"fsp_snapshot_{self._fsp_snapshot_counter:08d}"
             self.curriculum.register_opponent(opponent_name)
 
             logger.info(
-                "FSP snapshot mentve (atomikusan): %s (counter=%d) [C2 DDP-safe]",
+                "FSP snapshot saved (atomic, rank-0 local I/O, no barrier): "
+                "%s (counter=%d)",
                 snapshot_path, self._fsp_snapshot_counter,
             )
 
