@@ -49,7 +49,7 @@ environment:
     total_card_dim: 104                 # Összesített kártyatér (52 + 52)
     max_betting_rounds: 4               # Pre-flop, Flop, Turn, River
     max_actions_per_round: 18           # Maximális licitlehetőségek egy leosztásban
-    betting_history_dim: [18, 9]        # [max_akciók, akció_típusok + normalizált_méretek]
+    betting_history_dim: [18, 11]       # +2 dims per step: hero indicator + street
     position_encoding: "one_hot"        # One-hot pozíció vektor (num_players dimenziós)
     normalization_method: "big_blind"   # Monetáris értékek normalizálása BB-hez viszonyítva
     normalization_range: [0.0, 1.0]     # Célintervallum a normalizált értékekhez

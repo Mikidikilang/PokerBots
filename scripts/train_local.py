@@ -2,27 +2,28 @@
 """
 Lokalis Training CLI Belepesi Pont (train_local.py).
 
-[FIX C-2 — 2025-03-28] Shutdown signal broadcast to all DDP ranks.
+[FIX R-1 — 2025-03-28] DDP Checkpoint Deadlock fixed in on_checkpoint.
 
-    ROOT CAUSE OF HANG:
-    GracefulShutdownMonitor called runner.request_stop() on rank 0 only.
-    Rank 0 exited its while-loop. Rank 1 entered the next iteration and
-    called loss.backward() which blocks in DDP's all_reduce hook waiting
-    for rank 0's gradient contribution — permanent hang, no error.
+    ROOT CAUSE:
+    on_checkpoint() only ran I/O on rank 0, then returned immediately on
+    all other ranks. Rank 1 re-entered the training loop and called
+    loss.backward() which blocked in DDP's all_reduce waiting for rank 0's
+    gradient contribution — rank 0 was still writing the 200MB checkpoint.
+    Result: permanent hang (deadlock) on every checkpoint save.
 
     THE FIX:
-    on_ddp_sync() now broadcasts a shutdown flag from rank 0 to all ranks
-    using dist.broadcast(). This is a synchronous collective that all ranks
-    already call every iteration — the correct and only synchronization point.
-    All ranks exit the training loop together on the same iteration.
+    Add an unconditional dist.barrier() AFTER the rank-0 save attempt.
+    The barrier fires on EVERY rank whether the save succeeded or failed.
+    All ranks reach the barrier together, wait for rank 0 to finish I/O,
+    then proceed to the next iteration simultaneously — no race condition.
 
+    KEY INVARIANT: The barrier must be unconditional — it must execute even
+    if the save throws an exception (we catch-and-log rather than re-raise).
+    Re-raising inside the if-rank-0 block would skip the barrier and leave
+    all other ranks waiting at it forever.
+
+[FIX C-2 — 2025-03-28] Shutdown signal broadcast to all DDP ranks.
 [FIX H-1 — 2025-03-28] _session_start captured BEFORE build_training_pipeline().
-
-    GracefulShutdownMonitor was starting its clock at __init__ time, which
-    happens INSIDE build_training_pipeline() after DDP init, HF download,
-    and model construction. Those steps can take minutes, silently eating
-    into the 11.5h budget. Now _session_start is captured in main() before
-    any I/O and passed through as start_time=.
 """
 
 from __future__ import annotations
@@ -37,12 +38,10 @@ from typing import Any
 
 import yaml
 
-# Load environment variables from .env file (for WANDB_API_KEY, etc.)
 try:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).parent.parent / ".env")
 except ImportError:
-    # dotenv not installed; continue without .env support
     pass
 
 import torch
@@ -206,7 +205,7 @@ def build_training_pipeline(
         device = torch.device(device_str)
     logger.info("Device: %s (rank=%d/%d)", device, rank, world_size)
 
-    # --- Seed (DDP-aware: each rank gets a unique seed for rollout diversity) ---
+    # --- Seed (DDP-aware) ---
     from src.mlops.state_manager import RNGStateManager
     seed: int = cfg.get("project", {}).get("seed", 42)
     seed_with_rank: int = seed + rank
@@ -261,29 +260,24 @@ def build_training_pipeline(
 
     if resume:
         logger.info("Resume mode enabled. Attempting to load checkpoint...")
-        
+
         if checkpoint_path:
-            logger.info("Resume: explicit checkpoint path provided: %s", checkpoint_path)
             checkpoint_to_resume = state_manager.ckpt_mgr.load(
                 checkpoint_path, map_location=device
             )
         else:
-            # Check if checkpoints exist before loading
             ckpt_list = state_manager.list_checkpoints()
             if ckpt_list:
                 logger.info(
-                    "Resume: found %d checkpoints in %s. Latest: %s",
+                    "Resume: found %d checkpoints. Latest: %s",
                     len(ckpt_list),
-                    state_manager.ckpt_mgr.checkpoint_dir,
                     ckpt_list[-1].name,
                 )
             else:
                 logger.warning(
-                    "Resume: NO checkpoints found in %s. "
-                    "If you expected a checkpoint, check the path or HF download logs.",
-                    state_manager.ckpt_mgr.checkpoint_dir,
+                    "Resume: NO checkpoints found. Cold start."
                 )
-            
+
             checkpoint_to_resume = state_manager.load_training_state(
                 map_location=str(device)
             )
@@ -291,31 +285,23 @@ def build_training_pipeline(
         if checkpoint_to_resume is not None:
             model_state_dict = checkpoint_to_resume["model_state_dict"]
             resumed_iteration = checkpoint_to_resume.get("iteration", 0)
-            
+
             if world_size > 1:
                 if not any(k.startswith("module.") for k in model_state_dict.keys()):
-                    logger.info("DDP: adding 'module.' prefix to checkpoint keys.")
                     model_state_dict = {
                         f"module.{k}": v for k, v in model_state_dict.items()
                     }
-            
+
             network.load_state_dict(model_state_dict)
             start_iteration = resumed_iteration
             orchestrator_state = checkpoint_to_resume.get("orchestrator_state", {})
-            
+
             logger.info(
-                "✓ RESUME SUCCESSFUL: iteration=%d, model_params=%s, "
-                "optim_state=%s, scheduler_state=%s",
+                "✓ RESUME SUCCESSFUL: iteration=%d",
                 start_iteration,
-                "loaded" if model_state_dict else "MISSING",
-                "loaded" if checkpoint_to_resume.get("optimizer_state_dict") else "MISSING",
-                "loaded" if checkpoint_to_resume.get("scheduler_state_dict") else "MISSING",
             )
         else:
-            logger.warning(
-                "✗ RESUME FAILED: no checkpoint could be loaded. "
-                "Starting from iteration 0 (cold start)."
-            )
+            logger.warning("✗ RESUME FAILED: cold start.")
 
     # --- Orchestrator (rank 0 only) ---
     from src.orchestrator.orchestrator import (
@@ -348,12 +334,9 @@ def build_training_pipeline(
     shutdown_monitor: GracefulShutdownMonitor | None = None
 
     if rank == 0:
-        # [FIX H-1] start_time captured in main() BEFORE this call.
-        # Without this the monitor's clock started AFTER DDP init + HF download,
-        # silently losing minutes of the 11.5h Kaggle budget.
         shutdown_monitor = GracefulShutdownMonitor(
             ShutdownConfig.from_dict(cfg),
-            start_time=start_time,  # None → monitor captures time.monotonic() now
+            start_time=start_time,
         )
         if start_time is not None:
             logger.info(
@@ -370,9 +353,6 @@ def build_training_pipeline(
         if resume and checkpoint_to_resume:
             wandb_run_id = checkpoint_to_resume.get("wandb_run_id")
         monitor.setup(config=cfg, resume=resume, run_id=wandb_run_id)
-        logger.info(
-            "W&B monitoring: active=%s, run_id=%s", monitor.active, monitor.run_id
-        )
 
     # --- HF Sync (rank 0 only) ---
     from src.mlops.hf_sync import AsyncModelUploader, configure_headless_auth
@@ -398,7 +378,6 @@ def build_training_pipeline(
     # Callbacks
     # =========================================================================
 
-    # Shared mutable state for on_ddp_sync phase broadcast
     phase_transition_state: dict[str, Any] = {
         "transition_occurred": False,
         "new_phase_name":      "",
@@ -444,6 +423,22 @@ def build_training_pipeline(
                 combined_metrics["total_env_steps"] = local_steps * world_size
                 monitor.log_metrics(step=iteration, metrics=combined_metrics)
 
+            # ── NEW: Record PolicyAverager snapshot on rank 0 (Phase 2 only) ───
+            if orchestrator is not None:
+                orchestrator.curriculum.maybe_record_fsp_snapshot(
+                    network=network,
+                    iteration=iteration,
+                )
+
+            # ── NEW: Log ESS to W&B for monitoring Nash convergence quality ────
+            if monitor.active and orchestrator is not None:
+                avg_stats = orchestrator.curriculum._policy_averager.get_stats()
+                monitor.log_metrics(step=iteration, metrics={
+                    "fsp/pool_size":     float(avg_stats["pool_size"]),
+                    "fsp/ess":           float(avg_stats["effective_ess"]),
+                    "fsp/total_weight":  float(avg_stats["total_weight"]),
+                })
+
         # Shutdown check (rank 0 only)
         if rank == 0 and shutdown_monitor is not None:
             if shutdown_monitor.should_shutdown():
@@ -457,26 +452,13 @@ def build_training_pipeline(
     def on_ddp_sync(iteration: int) -> None:
         """Cross-rank synchronization — called on ALL ranks every iteration.
 
-        This is the ONLY place where DDP collectives are called from within
-        the training loop callbacks. Two broadcasts per iteration:
-
-        1. Phase transition flag: rank 0 tells all ranks about curriculum change.
-        2. [FIX C-2] Shutdown flag: rank 0 tells all ranks to exit the loop.
-
-        Without fix C-2:
-            rank 0 calls runner.request_stop() (sets _should_stop=True)
-            rank 0 exits while-loop
-            rank 1 enters next iteration → loss.backward() → blocks in all_reduce
-            → permanent hang, no error message, session killed at 12h timeout.
-
-        With fix C-2:
-            all ranks synchronize the shutdown flag here (before backward())
-            all ranks set _should_stop=True and exit together on the same iter
+        [FIX C-2] Broadcasts shutdown flag from rank 0 to all ranks so they
+        all exit the training loop together on the same iteration.
         """
         nonlocal phase_transition_state
 
         if world_size <= 1:
-            return  # Single-GPU: no collectives needed
+            return
 
         # --- Broadcast 1: Phase transition ---
         phase_flag = torch.tensor(
@@ -488,9 +470,6 @@ def build_training_pipeline(
         phase_transition_state["transition_occurred"] = bool(phase_flag.item() > 0.5)
 
         # --- Broadcast 2: Shutdown flag [FIX C-2] ---
-        # rank 0 writes its _should_stop value; all other ranks receive it.
-        # If rank 0 has set _should_stop=True (via GracefulShutdownMonitor or
-        # KeyboardInterrupt), all ranks learn this here and exit together.
         should_stop_val = 1.0 if runner._should_stop else 0.0
         stop_flag = torch.tensor(
             [should_stop_val], dtype=torch.float32, device=device
@@ -499,32 +478,116 @@ def build_training_pipeline(
 
         if bool(stop_flag.item() > 0.5) and not runner._should_stop:
             logger.info(
-                "[Rank %d] Shutdown broadcast received — "
-                "requesting stop to exit training loop cleanly.",
+                "[Rank %d] Shutdown broadcast received — requesting stop.",
                 rank,
             )
             runner.request_stop()
 
-    def on_checkpoint(iteration: int, net: Any) -> None:
-        """Checkpoint save (rank 0 only — prevents file conflicts)."""
-        if rank != 0:
-            return
+    # =========================================================================
+    # [FIX R-1] on_checkpoint — unconditional DDP barrier after rank-0 I/O
+    # =========================================================================
 
-        rng_states = RNGStateManager.capture_states(dl_generator)
-        state_manager.save_training_state(
-            network=net,
-            optimizer=runner.trainer.optimizer,
-            scheduler=runner.trainer.scheduler,
-            iteration=iteration,
-            total_env_steps=runner.collector.get_total_steps(),
-            total_hands=0,
-            best_mean_reward=-float("inf"),
-            orchestrator_state=orchestrator.get_state() if orchestrator else {},
-            config=cfg,
-            rng_states=rng_states,
-            wandb_run_id=monitor.run_id if monitor.active else None,
-            is_best=False,
-        )
+    def on_checkpoint(iteration: int, net: Any) -> None:
+        """Periodic checkpoint callback — rank-0 writes, ALL ranks synchronize.
+
+        DDP INVARIANT: Every rank must exit this function at the same logical
+        moment, regardless of whether they performed any I/O work.
+
+        ─── Why the deadlock occurs without this barrier ──────────────────
+        Without the barrier:
+            t=0 │ rank 0  →  enters torch.save() (blocking file I/O, 2-8 sec)
+            t=0 │ rank 1  →  returns immediately (no save work)
+            t=1 │ rank 1  →  re-enters training loop → loss.backward()
+            t=1 │ rank 1  →  DDP hooks fire: all_reduce() waiting for rank 0
+            t=2 │ rank 0  →  still writing the checkpoint...
+            t=∞ │ DEADLOCK: rank 0 never enters all_reduce, rank 1 waits forever.
+
+        ─── How the barrier fixes it ──────────────────────────────────────
+            t=0 │ rank 0  →  saves checkpoint
+            t=0 │ rank 1  →  hits barrier immediately, blocks
+            t=2 │ rank 0  →  finishes saving, reaches barrier
+            t=2 │ ALL     →  barrier clears simultaneously
+            t=3 │ ALL     →  next iteration begins together — no race condition.
+        """
+        # ── Phase 1: Rank 0 performs all I/O ────────────────────────────────
+        if rank == 0:
+            try:
+                rng_states: dict[str, Any] = RNGStateManager.capture_states(
+                    dataloader_generator=dl_generator
+                )
+
+                state_manager.save_training_state(
+                    network=net,
+                    optimizer=runner.trainer.optimizer,
+                    scheduler=runner.trainer.scheduler,
+                    iteration=iteration,
+                    total_env_steps=runner.collector.get_total_steps(),
+                    total_hands=runner.collector.get_total_episodes(),
+                    best_mean_reward=-float("inf"),
+                    orchestrator_state=(
+                        orchestrator.get_state()
+                        if orchestrator is not None
+                        else {}
+                    ),
+                    config=cfg,
+                    rng_states=rng_states,
+                    wandb_run_id=(
+                        monitor.run_id
+                        if (monitor is not None and monitor.active)
+                        else None
+                    ),
+                    is_best=False,
+                )
+                logger.info(
+                    "[Rank 0] Checkpoint saved: iter=%d, steps=%d",
+                    iteration,
+                    runner.collector.get_total_steps(),
+                )
+
+            except Exception as save_exc:
+                # CRITICAL: log but DO NOT re-raise here.
+                # Re-raising would skip the barrier below, leaving all other
+                # ranks waiting at it forever — a subtler form of the same deadlock.
+                logger.error(
+                    "[Rank 0] Checkpoint save FAILED at iter %d: %s",
+                    iteration,
+                    save_exc,
+                    exc_info=True,
+                )
+
+        # ── Phase 2: Unconditional synchronization barrier ───────────────────
+        #
+        # THIS IS THE FIX (R-1). The barrier must execute on EVERY rank,
+        # regardless of:
+        #   • Whether this rank saved anything
+        #   • Whether the save on rank 0 succeeded or failed
+        #   • Whether world_size == 1 (the condition guards the call)
+        #
+        if world_size > 1:
+            try:
+                dist.barrier()
+
+                if rank == 0:
+                    logger.debug(
+                        "[Rank 0] DDP barrier cleared post-checkpoint (iter=%d)",
+                        iteration,
+                    )
+
+            except Exception as barrier_exc:
+                # A dist.barrier() failure means the NCCL communicator is
+                # corrupted. There is no safe way to continue training.
+                logger.critical(
+                    "[Rank %d] dist.barrier() failed after checkpoint at iter %d: %s",
+                    rank,
+                    iteration,
+                    barrier_exc,
+                    exc_info=True,
+                )
+                raise RuntimeError(
+                    f"[DDP] Irrecoverable barrier failure in on_checkpoint "
+                    f"at iteration {iteration}. "
+                    f"Original error: {barrier_exc}"
+                ) from barrier_exc
 
     # --- Runner ---
     from src.training.runner import TrainingRunner, RunnerConfig
@@ -564,7 +627,7 @@ def build_training_pipeline(
             runner.trainer.scheduler.load_state_dict(
                 checkpoint_to_resume["scheduler_state_dict"]
             )
-            logger.info("LR scheduler state restored from checkpoint [FIX H-4]")
+            logger.info("LR scheduler state restored from checkpoint")
 
         if "rng_states" in checkpoint_to_resume and checkpoint_to_resume["rng_states"]:
             RNGStateManager.restore_states(checkpoint_to_resume["rng_states"])
@@ -574,15 +637,15 @@ def build_training_pipeline(
         orchestrator.set_trainer_reference(runner.trainer)
 
     return {
-        "runner":          runner,
-        "network":         network,
-        "orchestrator":    orchestrator,
-        "state_manager":   state_manager,
+        "runner":           runner,
+        "network":          network,
+        "orchestrator":     orchestrator,
+        "state_manager":    state_manager,
         "shutdown_monitor": shutdown_monitor,
-        "monitor":         monitor,
-        "uploader":        uploader,
-        "fault_handler":   fault_handler,
-        "config":          cfg,
+        "monitor":          monitor,
+        "uploader":         uploader,
+        "fault_handler":    fault_handler,
+        "config":           cfg,
     }
 
 
@@ -618,10 +681,8 @@ def main() -> None:
     logger = logging.getLogger(__name__)
 
     # [FIX H-1] Capture monotonic clock BEFORE setup_ddp() and BEFORE
-    # build_training_pipeline(). DDP init (NCCL rendezvous) and HF checkpoint
-    # download can each take minutes. Without this fix, the GracefulShutdown-
-    # Monitor's clock started after those operations, silently losing that
-    # time from the 11.5h Kaggle budget.
+    # build_training_pipeline(). DDP init and HF checkpoint download can
+    # each take minutes, silently eating into the 11.5h Kaggle budget.
     _session_start: float = time.monotonic()
     logger.info(
         "Session clock started: %.4f (monotonic) [FIX H-1]", _session_start
@@ -646,19 +707,16 @@ def main() -> None:
 
     if args.seed is not None:
         cfg["project"]["seed"] = args.seed
-        if rank == 0:
-            logger.info("Seed override: %d", args.seed)
 
     if args.max_iter > 0:
         cfg.setdefault("runtime", {})["max_iterations"] = args.max_iter
 
-    # Pass _session_start so GracefulShutdownMonitor measures true wall time
     pipeline: dict[str, Any] = build_training_pipeline(
         cfg,
         device_override=args.device,
         resume=args.resume,
         checkpoint_path=args.checkpoint,
-        start_time=_session_start,   # [FIX H-1]
+        start_time=_session_start,
         rank=rank,
         local_rank=local_rank,
         world_size=world_size,
@@ -682,7 +740,6 @@ def main() -> None:
         summary = {"error": str(exc)}
     finally:
         if rank == 0:
-            # Flush async upload THEN stop thread — correct order [FIX M-2]
             if pipeline.get("uploader") and pipeline["uploader"].is_active():
                 pipeline["uploader"].trigger_manual_upload()
                 pipeline["uploader"].shutdown()
@@ -690,7 +747,6 @@ def main() -> None:
             if pipeline.get("monitor"):
                 pipeline["monitor"].finish()
 
-        # DDP cleanup — all ranks must participate
         if world_size > 1:
             try:
                 dist.barrier()

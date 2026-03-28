@@ -1,29 +1,38 @@
 """
 Slumbot HUNL Benchmark Runner (benchmark_runner.py).
 
-Orchestrates full match evaluations against Slumbot using the ACPC protocol.
-Converts game states to observation dicts, evaluates our PokerActorCritic model,
-and tracks cumulative win rate (mbb/hand).
+[FIX R-2 — 2025-03-28] Three ACPC protocol bugs fixed:
 
-The evaluator:
-  1. Loads pre-trained model weights from a checkpoint
-  2. Plays HUNL matches against ACPC server (alternating positions)
-  3. Translates ACPC MATCHSTATE to our 11-key observation format
-  4. Uses ActionMapper to convert discrete actions to chip amounts
-  5. Tracks cumulative chip delta and calculates mbb/hand win rate
+    BUG 1 — () parsing error:
+        MATCHSTATE messages contain NO parentheses. Legal actions are NOT
+        embedded in the message string. They must be computed from the
+        parsed game state (stacks, pot, call amounts).
+
+    BUG 2 — Missing turn detection:
+        In ACPC HU NLHE, the server sends MATCHSTATE only when the client
+        must act. We double-check via is_my_turn from the game-state parser.
+
+    BUG 3 — Broken game-state parsing:
+        The old _extract_game_state() used a character-by-character loop
+        that mis-handled multi-raise streets and didn't track the
+        acting-player's turn correctly. Replaced with a complete action-
+        history replayer (_parse_game_state_from_acpc) that tracks
+        stacks, bets, and the next actor accurately.
 """
 
 from __future__ import annotations
 
 import logging
-import torch
+import math
+import re
 from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import NamedTuple, TYPE_CHECKING, Any
+
+import torch
 
 from src.env.action_mapper import ActionMapper
 from src.env.features import ObservationBuilder, ObservationConfig
-from src.evaluation.acpc_client import AcpcClient, HandResult, MatchState
+from src.evaluation.acpc_client import AcpcClient, MatchState
 from src.model.networks import NetworkConfig, PokerActorCritic
 
 logger = logging.getLogger(__name__)
@@ -35,25 +44,214 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SlumbotEvalConfig:
-    """Configuration for Slumbot HUNL evaluation.
-
-    Attributes:
-        checkpoint_path: Path to model checkpoint file.
-        acpc_host: Slumbot ACPC server hostname.
-        acpc_port: Slumbot ACPC server port.
-        stack_size_bb: Initial stack size in big blinds.
-        big_blind: Big blind value in chips.
-        max_hands: Maximum hands to play.
-        device: PyTorch device (cpu/cuda).
-    """
+    """Configuration for Slumbot HUNL evaluation."""
 
     checkpoint_path: str
-    acpc_host: str = "slumbot.com"
-    acpc_port: int = 9000
-    stack_size_bb: int = 200
-    big_blind: float = 2.0
-    max_hands: int = 100_000
-    device: str = "cpu"
+    acpc_host:    str   = "slumbot.com"
+    acpc_port:    int   = 9000
+    stack_size_bb: int  = 200
+    big_blind:    float = 2.0
+    max_hands:    int   = 100_000
+    device:       str   = "cpu"
+
+
+# =============================================================================
+# [FIX R-2] Parsed game state data structure
+# =============================================================================
+
+class _ParsedGameState(NamedTuple):
+    """Immutable snapshot of game state derived from ACPC action history."""
+    my_chips:       float  # Remaining stack for the hero
+    opponent_chips: float  # Remaining stack for the villain
+    pot:            float  # Total chips committed by both players so far
+    amount_to_call: float  # Chips required to call (0 = can check)
+    min_raise:      float  # Minimum legal raise amount (absolute chips)
+    is_my_turn:     bool   # True if the hero should act next
+
+
+# =============================================================================
+# [FIX R-2] Correct ACPC game-state parser
+# =============================================================================
+
+def _parse_game_state_from_acpc(
+    action_history: str,
+    position: int,
+    stack_bb: int,
+    big_blind: float,
+) -> _ParsedGameState:
+    """Reconstruct game state by replaying the ACPC action history.
+
+    ACPC HU NLHE action encoding (streets separated by '/'):
+        'f'          — fold
+        'c'          — call or check
+        'r{amount}'  — raise TO {amount} chips (absolute, not incremental)
+
+    Position convention:
+        0 = button / small blind — acts FIRST preflop, SECOND postflop
+        1 = big blind            — acts SECOND preflop, FIRST postflop
+    """
+    initial_stack: float = stack_bb * big_blind
+    sb: float = big_blind / 2.0
+    bb: float = big_blind
+
+    stacks: list[float] = [initial_stack - sb, initial_stack - bb]
+    street_bets: list[float] = [sb, bb]   # Preflop: blinds already posted
+    pot: float = sb + bb
+    street_idx: int = 0
+
+    streets: list[str] = action_history.split("/") if action_history else [""]
+
+    for s_idx, street_str in enumerate(streets):
+        street_idx = s_idx
+
+        if s_idx > 0:
+            street_bets = [0.0, 0.0]
+
+        # Preflop: button (pos 0) acts first. Postflop: big blind (pos 1) first.
+        acting: int = 0 if s_idx == 0 else 1
+
+        i: int = 0
+        last_raise_size: float = bb
+
+        while i < len(street_str):
+            ch: str = street_str[i]
+
+            if ch == "f":
+                i += 1
+                acting = 1 - acting
+
+            elif ch == "c":
+                other: int = 1 - acting
+                call_delta: float = max(0.0, street_bets[other] - street_bets[acting])
+                call_delta = min(call_delta, stacks[acting])
+                stacks[acting] -= call_delta
+                pot += call_delta
+                street_bets[acting] += call_delta
+                i += 1
+                acting = 1 - acting
+
+            elif ch == "r":
+                j: int = i + 1
+                while j < len(street_str) and street_str[j].isdigit():
+                    j += 1
+                raise_to: float = float(street_str[i + 1: j]) if j > i + 1 else 0.0
+
+                prev_commitment: float = street_bets[acting]
+                raise_delta: float = min(
+                    max(0.0, raise_to - prev_commitment),
+                    stacks[acting],
+                )
+
+                other = 1 - acting
+                last_raise_size = max(raise_to - street_bets[other], bb)
+
+                stacks[acting] -= raise_delta
+                pot += raise_delta
+                street_bets[acting] = min(
+                    raise_to, prev_commitment + stacks[acting] + raise_delta
+                )
+                i = j
+                acting = 1 - acting
+
+            else:
+                i += 1
+
+    hero: int = position
+    villain: int = 1 - position
+
+    amount_to_call: float = max(0.0, street_bets[villain] - street_bets[hero])
+
+    min_raise_increment: float = max(last_raise_size, bb)
+    min_raise: float = amount_to_call + min_raise_increment
+
+    is_my_turn: bool = (acting == position)
+
+    return _ParsedGameState(
+        my_chips=stacks[hero],
+        opponent_chips=stacks[villain],
+        pot=pot,
+        amount_to_call=amount_to_call,
+        min_raise=min_raise,
+        is_my_turn=is_my_turn,
+    )
+
+
+def _compute_legal_actions_from_state(
+    game_state: _ParsedGameState,
+    big_blind: float,
+) -> list[int]:
+    """Compute legal 9-action indices from the parsed game state.
+
+    [FIX R-2] Legal actions are computed from game state, NOT parsed from
+    the MATCHSTATE string (which contains no legal-action field).
+    """
+    legal: list[int] = [0, 1]  # Fold and check/call are always legal
+
+    remaining_after_call: float = game_state.my_chips - game_state.amount_to_call
+
+    if remaining_after_call > 0 and game_state.my_chips > 0:
+        if game_state.my_chips >= game_state.min_raise:
+            legal.append(2)  # min-raise
+
+        pot_multipliers: dict[int, float] = {
+            3: 0.50, 4: 0.75, 5: 1.00, 6: 1.50, 7: 2.00
+        }
+        for action_idx, mult in pot_multipliers.items():
+            raise_size: float = (
+                game_state.amount_to_call
+                + mult * (game_state.pot + game_state.amount_to_call)
+            )
+            if game_state.my_chips >= raise_size:
+                legal.append(action_idx)
+
+        legal.append(8)  # All-in always available when chips above call
+
+    return sorted(set(legal))
+
+
+def _action_idx_to_acpc_string(
+    action_idx: int,
+    game_state: _ParsedGameState,
+    big_blind: float,
+) -> str:
+    """Convert our discrete action index to an ACPC-protocol action string.
+
+    ACPC format:
+        'f'          — fold
+        'c'          — call or check
+        'r{amount}'  — raise TO {amount} (total commitment this street)
+    """
+    if action_idx == 0:
+        return "f"
+
+    if action_idx == 1:
+        return "c"
+
+    if action_idx == 8:
+        return f"r{int(game_state.my_chips)}"
+
+    pot_multipliers: dict[int, float] = {
+        2: 0.0, 3: 0.50, 4: 0.75, 5: 1.00, 6: 1.50, 7: 2.00,
+    }
+    mult: float = pot_multipliers.get(action_idx, 1.0)
+
+    if action_idx == 2:
+        raise_amount: float = game_state.min_raise
+    else:
+        raise_amount = (
+            game_state.amount_to_call
+            + mult * (game_state.pot + game_state.amount_to_call)
+        )
+
+    raise_amount = min(raise_amount, game_state.my_chips)
+    raise_amount = max(raise_amount, game_state.min_raise)
+
+    return f"r{int(raise_amount)}"
+
+
+def _is_terminal_action_history(action_history: str) -> bool:
+    """Return True if the action history contains a fold (hand is over)."""
+    return "f" in action_history.replace("/", "")
 
 
 # =============================================================================
@@ -61,27 +259,12 @@ class SlumbotEvalConfig:
 # =============================================================================
 
 def _convert_card_acpc_to_observationbuilder(acpc_card: str) -> str:
-    """Convert ACPC 'RankSuit' format (e.g., 'As') to ObservationBuilder 'SuitRank' (e.g., 'SA').
-
-    ACPC sends cards in RankSuit format (Ace of Spades = 'As').
-    ObservationBuilder requires SuitRank format (Ace of Spades = 'SA').
-
-    Args:
-        acpc_card: Card in ACPC format (e.g., 'As', 'Kh', '2d').
-
-    Returns:
-        Card in ObservationBuilder format (e.g., 'SA', 'KH', '2D').
-
-    Raises:
-        ValueError: If card format is invalid.
-    """
+    """Convert ACPC 'RankSuit' (e.g., 'As') to ObservationBuilder 'SuitRank' (e.g., 'SA')."""
     if len(acpc_card) != 2:
-        raise ValueError(f"Invalid card format: '{acpc_card}' (expected 2 chars)")
-
+        raise ValueError(f"Invalid card format: '{acpc_card}'")
     rank_char = acpc_card[0].upper()
     suit_char = acpc_card[1].upper()
-
-    return suit_char + rank_char  # Reverse to SuitRank format
+    return suit_char + rank_char
 
 
 # =============================================================================
@@ -89,63 +272,41 @@ def _convert_card_acpc_to_observationbuilder(acpc_card: str) -> str:
 # =============================================================================
 
 class SlumbotEvaluator:
-    """Evaluates our poker AI against Slumbot using ACPC protocol.
-
-    Plays Heads-Up No-Limit hold'em matches and tracks win rate in mbb/hand.
-    """
+    """Fixed SlumbotEvaluator — corrected play_hand() and all helper methods."""
 
     def __init__(self, config: SlumbotEvalConfig, network_config: NetworkConfig) -> None:
-        """Initialize the evaluator.
-
-        Args:
-            config: SlumbotEvalConfig with checkpoint and server details.
-            network_config: NetworkConfig for model architecture.
-        """
         self.config = config
         self.device = torch.device(config.device)
 
-        # Load model
         self.network = PokerActorCritic(network_config).to(self.device)
         self._load_checkpoint(config.checkpoint_path)
 
-        # Initialize components
         obs_config = ObservationConfig(num_players=2)
         self.obs_builder = ObservationBuilder(obs_config)
         self.action_mapper = ActionMapper()
 
-        # ACPC client
         self.acpc_client = AcpcClient(
             host=config.acpc_host,
             port=config.acpc_port,
         )
         self.acpc_client.handshake()
 
-        # Tracking
-        self.hands_played = 0
+        self.hands_played     = 0
         self.total_chip_delta = 0.0
-        self.hands_won = 0
-        self.hands_lost = 0
+        self.hands_won        = 0
+        self.hands_lost       = 0
 
         logger.info(
-            "SlumbotEvaluator initialized: %s vs %s:%d, stack=%.0f BB, device=%s",
+            "SlumbotEvaluator initialized: %s vs %s:%d, stack=%d BB, device=%s",
             config.checkpoint_path, config.acpc_host, config.acpc_port,
             config.stack_size_bb, config.device,
         )
 
     def _load_checkpoint(self, checkpoint_path: str) -> None:
-        """Load model weights from checkpoint.
-
-        Args:
-            checkpoint_path: Path to .pt checkpoint file.
-
-        Raises:
-            FileNotFoundError: If checkpoint doesn't exist.
-            RuntimeError: If loading fails.
-        """
+        from pathlib import Path
         path = Path(checkpoint_path)
         if not path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-
         try:
             state_dict = torch.load(path, map_location=self.device, weights_only=True)
             self.network.load_state_dict(state_dict)
@@ -158,344 +319,258 @@ class SlumbotEvaluator:
         acpc_state: MatchState,
         legal_actions: list[int],
     ) -> dict[str, Any] | None:
-        """Convert ACPC MATCHSTATE to 11-key observation format.
-
-        Extracts game state from ACPC MatchState including parsing action history
-        to compute pot, stacks, amount to call, and minimum raise.
-
-        Args:
-            acpc_state: Parsed MatchState object from ACPC client.
-            legal_actions: List of legal action indices (0-8 from ACPC).
-
-        Returns:
-            11-key observation dict for get_action(), or None if conversion fails.
-
-        Raises:
-            Logs errors internally; returns None on failure.
-        """
+        """Convert ACPC MATCHSTATE to 11-key observation format."""
         try:
-            # Convert card format: ACPC "RankSuit" (e.g., 'As') → "SuitRank" (e.g., 'SA')
-            hole_cards = [_convert_card_acpc_to_observationbuilder(c) for c in acpc_state.hole_cards]
-            public_cards = [_convert_card_acpc_to_observationbuilder(c) for c in acpc_state.board_cards]
+            hole_cards = [
+                _convert_card_acpc_to_observationbuilder(c)
+                for c in acpc_state.hole_cards
+            ]
+            public_cards = [
+                _convert_card_acpc_to_observationbuilder(c)
+                for c in acpc_state.board_cards
+            ]
 
-            # Extract game state from action history
-            # Format: "r100c//:AsKh|2d3c4d" → action_history is empty preflop before actions
-            my_chips, opponent_chips, pot_size, amount_to_call, min_raise = self._extract_game_state(
-                acpc_state.action_history,
-                acpc_state.stage,
-                acpc_state.position,
-            )
-
-            # Get big blind and small blind from config
-            big_blind = self.config.big_blind
+            big_blind   = self.config.big_blind
             small_blind = big_blind / 2.0
 
-            # Build the 11-key observation dict
             obs_dict = {
-                "hand": hole_cards,
-                "public_cards": public_cards,
-                "pot": float(pot_size),
-                "my_chips": float(my_chips),
-                "opponent_chips": float(opponent_chips),
-                "big_blind": float(big_blind),
-                "small_blind": float(small_blind),
-                "position": int(acpc_state.position),
-                "betting_history": [],  # Not used by network, but required by ObservationBuilder
-                "legal_actions": legal_actions,
-                "amount_to_call": float(amount_to_call),
+                "hand":            hole_cards,
+                "public_cards":    public_cards,
+                "pot":             0.0,          # overridden after parsing
+                "my_chips":        0.0,          # overridden after parsing
+                "opponent_chips":  0.0,          # overridden after parsing
+                "big_blind":       float(big_blind),
+                "small_blind":     float(small_blind),
+                "position":        int(acpc_state.position),
+                "betting_history": [],
+                "legal_actions":   legal_actions,
+                "amount_to_call":  0.0,          # overridden after parsing
+                "min_raise":       float(big_blind * 2),
             }
-
             return obs_dict
 
         except Exception as e:
             logger.error("Failed to convert MATCHSTATE to observation: %s", e)
             return None
 
-    def _extract_game_state(
-        self,
-        action_history: str,
-        stage: int,
-        position: int,
-    ) -> tuple[float, float, float, float, float]:
-        """Extract game state metrics from ACPC action history.
-
-        Parses the action string (e.g., "r100c/:r50c") to compute:
-        - Current stacks for both players
-        - Pot size
-        - Amount to call for current decision point
-        - Minimum raise amount
-
-        Args:
-            action_history: ACPC action string (e.g., "r100c/:r50c").
-            stage: Current betting stage (0=preflop, 1=flop, 2=turn, 3=river).
-            position: Our position (0=small blind/button, 1=big blind).
-
-        Returns:
-            Tuple of (my_chips, opponent_chips, pot_size, amount_to_call, min_raise).
-        """
-        initial_stack = self.config.stack_size_bb * self.config.big_blind
-        big_blind = self.config.big_blind
-        small_blind = big_blind / 2.0
-
-        # Start with initial state
-        my_chips = initial_stack
-        opponent_chips = initial_stack
-        amount_to_call = 0.0
-        min_raise = 0.0
-
-        # If position == 0 (button/small blind), we post small blind first
-        # If position == 1 (big blind), opponent posts small blind
-        if position == 0:
-            my_chips -= small_blind
-            opponent_chips -= big_blind
-            amount_to_call = big_blind - small_blind  # To match big blind
-        else:
-            my_chips -= big_blind
-            opponent_chips -= small_blind
-            amount_to_call = 0.0  # We posted big blind, can check
-
-        # Parse action history to extract chips put in
-        streets = action_history.split("/")
-        for street_idx, street in enumerate(streets):
-            if not street or street_idx > stage:
-                break
-
-            current_bet = 0.0 if street_idx == 0 else amount_to_call
-            for action_char in street:
-                if action_char == 'f':
-                    # Fold: no chips added, hand likely over (shouldn't reach here if ACPC working)
-                    pass
-                elif action_char == 'c':
-                    # Call: match the current bet
-                    amount_to_call = 0.0
-                elif action_char == 'k':
-                    # Check: no bet
-                    amount_to_call = 0.0
-                elif action_char == 'r':
-                    # Raise: need to parse amount
-                    # Format example: "r100" means raise to 100 total
-                    idx = street.index('r')
-                    amount_str = ""
-                    for i in range(idx + 1, len(street)):
-                        if street[i].isdigit():
-                            amount_str += street[i]
-                        else:
-                            break
-                    if amount_str:
-                        amount_to_call = float(amount_str)
-                elif action_char == 'a':
-                    # All-in: amount is remaining stack
-                    amount_to_call = my_chips
-
-        # Calculate pot: initial blinds + chips from action history
-        pot_size = small_blind + big_blind
-        # (Simplified: in reality would need to track per-street contributions)
-
-        return my_chips, opponent_chips, pot_size, amount_to_call, min_raise
-
     def _select_action(
         self,
         obs_dict: dict[str, Any],
         legal_actions: list[int],
     ) -> int | None:
-        """Select action using model inference.
-
-        Calls the network.get_action() with the observation dict, validates
-        legality, and falls back to check/call if model selects illegal action.
-
-        Args:
-            obs_dict: 11-key observation dict from _matchstate_to_observation.
-            legal_actions: List of legal discrete action indices (0-8).
-
-        Returns:
-            Action index (0-8) selected by model, or None on error.
-        """
+        """Select action using model inference."""
         try:
-            # Run inference with gradient disabled
             with torch.inference_mode():
                 action_idx, _, _ = self.network.get_action(obs_dict, deterministic=True)
 
-            # Validate legality
             if action_idx not in legal_actions:
                 logger.warning(
-                    "Model action %d not legal. Legal actions: %s. "
-                    "Falling back to check/call.",
+                    "Model action %d not legal (%s). Falling back to check/call.",
                     action_idx, legal_actions,
                 )
-                # Fallback: prefer check/call (action 1) if legal, else first legal action
                 action_idx = 1 if 1 in legal_actions else legal_actions[0]
 
             return action_idx
 
         except Exception as e:
             logger.error("Failed to select action: %s", e)
-            # Emergency fallback to check/call or first legal action
             return 1 if 1 in legal_actions else legal_actions[0]
 
-            logger.debug(
-                "Action selected: idx=%d (%s) -> %s (%.0f chips)",
-                action_idx, poker_action.name, resolved.description, resolved.amount,
-            )
-
-            return action_idx, resolved.amount
-
-        except Exception as e:
-            logger.error("Error selecting action: %s", e)
-            return None
-
     def play_hand(self) -> bool:
-        """Play a single hand against Slumbot until completion.
+        """Play one complete hand against the ACPC server.
 
-        Implements the game loop:
-        1. Receive MATCHSTATE message
-        2. If our turn: convert to observation, select action, send to ACPC
-        3. If HAND_RESULT: parse chip delta, update win tracking, exit loop
-        4. Repeat until hand ends
+        [FIX R-2] Protocol loop:
+            1. Receive a line from the server.
+            2. If MATCHSTATE:  parse game state, compute legal actions FROM
+               game state (NOT from message string), verify our turn, act.
+            3. If HAND_RESULT: record chip delta, mark hand complete.
+            4. Repeat until hand_complete or error.
 
-        Returns:
-            True if hand completed successfully, False if error occurred.
+        Key corrections:
+            • Legal actions are COMPUTED from game state — NOT parsed from
+              the MATCHSTATE string (which has no legal-action field).
+            • Turn detection uses is_my_turn from the action-history parser.
+            • Game state parsing uses _parse_game_state_from_acpc, which
+              correctly replays the full ACPC action history.
         """
-        hand_complete = False
-        action_count = 0
-        max_actions = 1000  # Prevent infinite loop
+        hand_complete: bool = False
+        action_count:  int  = 0
+        MAX_ACTIONS_PER_HAND: int = 200
 
-        try:
-            while not hand_complete and action_count < max_actions:
-                # Receive next message from ACPC server
-                message = self.acpc_client._recv_line()
-                if not message:
-                    logger.warning("Received empty message from ACPC")
-                    return False
-
-                # Check message type
-                if message.startswith("MATCHSTATE:"):
-                    # Parse MATCHSTATE to get current game state
-                    acpc_state = self.acpc_client.parse_matchstate(message)
-                    if acpc_state is None:
-                        logger.warning("Failed to parse MATCHSTATE: %s", message)
-                        return False
-
-                    # Extract legal actions from message format
-                    # Message format: MATCHSTATE:position:round:action_history|hole_cards|board_cards (legal_actions)
-                    # Extract the (legal_actions) part which contains action indices
-                    if "(" not in message or ")" not in message:
-                        logger.warning("MATCHSTATE missing legal actions: %s", message)
-                        return False
-
-                    legal_actions_str = message[message.index("(") + 1 : message.index(")")]
-                    # Example: "fcr" means actions 0 (fold), 1 (check), 2 (raise) not available
-                    # Or "(fcr)" means these actions are available
-                    # Parse which actions are available from the ACPC message
-                    legal_actions = []
-                    if "f" in legal_actions_str:
-                        legal_actions.append(0)
-                    if "c" in legal_actions_str:
-                        legal_actions.append(1)
-                    if "r" in legal_actions_str:
-                        legal_actions.extend([2, 3, 4, 5, 6, 7, 8])  # All raise amounts
-
-                    if not legal_actions:
-                        legal_actions = [1]  # Fallback to check/call
-                        logger.warning("Could not parse legal actions from: %s", legal_actions_str)
-
-                    # Convert ACPC state to observation dict
-                    obs_dict = self._matchstate_to_observation(acpc_state, legal_actions)
-                    if obs_dict is None:
-                        logger.warning("Failed to convert MATCHSTATE to observation")
-                        return False
-
-                    # Get action from our model
-                    action_idx = self._select_action(obs_dict, legal_actions)
-                    if action_idx is None:
-                        logger.warning("Failed to select action")
-                        return False
-
-                    # Convert action index to ACPC protocol format
-                    # Actions: 0=fold, 1=call/check, 2-8=various raise amounts
-                    if action_idx == 0:
-                        action_str = "f"
-                    elif action_idx == 1:
-                        action_str = "c"
-                    else:
-                        # For raise actions, compute the amount based on game state
-                        # Simplified: map action indices to raise amounts
-                        # In practice, ActionMapper would do this more precisely
-                        amount_to_call = obs_dict.get("amount_to_call", 0.0)
-                        min_bet = amount_to_call if amount_to_call > 0 else obs_dict.get("big_blind", 2.0)
-                        raise_amount = int(min_bet * (1.5 ** (action_idx - 2)))
-                        action_str = f"r{raise_amount}"
-
-                    # Send action to ACPC server
-                    self.acpc_client._send_line(action_str)
-                    action_count += 1
-                    logger.debug("Sent action: %s (action_idx=%d)", action_str, action_idx)
-
-                elif message.startswith("HAND_RESULT:"):
-                    # Hand has ended, extract chip delta
-                    result = self.acpc_client.parse_result(message)
-                    if result is not None:
-                        # Update running win rate tracker
-                        self.total_chip_delta += result.chip_delta
-                        if result.chip_delta > 0:
-                            self.hands_won += 1
-                        elif result.chip_delta < 0:
-                            self.hands_lost += 1
-
-                        logger.debug(
-                            "Hand result: delta=%.0f chips, running total=%.0f chips, "
-                            "mbb/hand=%.3f, hands_won=%d, hands_lost=%d",
-                            result.chip_delta,
-                            self.total_chip_delta,
-                            self._calculate_mbb_hand(),
-                            self.hands_won,
-                            self.hands_lost,
-                        )
-                    else:
-                        logger.warning("Failed to parse HAND_RESULT: %s", message)
-
-                    hand_complete = True
-
-                else:
-                    # Unknown message type
-                    logger.warning("Unknown message type: %s", message[:50])
-                    # Continue trying to receive valid messages
-                    continue
-
-            if action_count >= max_actions:
-                logger.error("Hand exceeded maximum actions (%d)", max_actions)
+        while not hand_complete and action_count < MAX_ACTIONS_PER_HAND:
+            try:
+                raw_line: str = self.acpc_client._recv_line()
+            except Exception as recv_exc:
+                logger.error("ACPC recv failed: %s", recv_exc)
                 return False
 
-            return True
+            if not raw_line:
+                logger.warning("Received empty line from ACPC server")
+                return False
 
-        except Exception as e:
-            logger.error("Error during hand play: %s", e)
+            # ── Branch 1: Game state update ─────────────────────────────
+            if raw_line.startswith("MATCHSTATE:"):
+                acpc_state = self.acpc_client.parse_matchstate(raw_line)
+                if acpc_state is None:
+                    logger.warning("Failed to parse MATCHSTATE: %s", raw_line[:80])
+                    return False
+
+                # Detect terminal state (fold in history)
+                if _is_terminal_action_history(acpc_state.action_history):
+                    logger.debug("Terminal MATCHSTATE (fold) — waiting for HAND_RESULT")
+                    action_count += 1
+                    continue
+
+                # ── Parse game state from action history ──────────────────
+                game_state: _ParsedGameState = _parse_game_state_from_acpc(
+                    action_history=acpc_state.action_history,
+                    position=acpc_state.position,
+                    stack_bb=self.config.stack_size_bb,
+                    big_blind=self.config.big_blind,
+                )
+
+                # ── Verify it is our turn ──────────────────────────────────
+                if not game_state.is_my_turn:
+                    logger.debug("MATCHSTATE received but is_my_turn=False — skipping")
+                    action_count += 1
+                    continue
+
+                # ── [FIX R-2] Compute legal actions from game state ────────
+                # Legal actions are NOT in the MATCHSTATE string.
+                legal_actions: list[int] = _compute_legal_actions_from_state(
+                    game_state=game_state,
+                    big_blind=self.config.big_blind,
+                )
+
+                if not legal_actions:
+                    logger.error("No legal actions computed — fallback to check/call")
+                    legal_actions = [1]
+
+                # ── Build observation dict ─────────────────────────────────
+                obs_dict = self._matchstate_to_observation(acpc_state, legal_actions)
+                if obs_dict is None:
+                    logger.warning("Observation construction failed — folding")
+                    self.acpc_client.send_action("f")
+                    action_count += 1
+                    continue
+
+                # ── Inject computed game state (precise values) ────────────
+                obs_dict["pot"]            = game_state.pot
+                obs_dict["my_chips"]       = game_state.my_chips
+                obs_dict["opponent_chips"] = game_state.opponent_chips
+                obs_dict["amount_to_call"] = game_state.amount_to_call
+                obs_dict["min_raise"]      = game_state.min_raise
+                obs_dict["legal_actions"]  = legal_actions
+
+                # ── Select action via neural network ──────────────────────
+                action_idx: int | None = self._select_action(obs_dict, legal_actions)
+                if action_idx is None:
+                    action_idx = 1 if 1 in legal_actions else legal_actions[0]
+
+                # ── Convert to ACPC protocol string and send ──────────────
+                action_str: str = _action_idx_to_acpc_string(
+                    action_idx=action_idx,
+                    game_state=game_state,
+                    big_blind=self.config.big_blind,
+                )
+
+                logger.debug(
+                    "Hand step: position=%d, action_idx=%d → '%s', "
+                    "pot=%.0f, call=%.0f, stacks=(%.0f, %.0f)",
+                    acpc_state.position,
+                    action_idx,
+                    action_str,
+                    game_state.pot,
+                    game_state.amount_to_call,
+                    game_state.my_chips,
+                    game_state.opponent_chips,
+                )
+
+                try:
+                    self.acpc_client.send_action(action_str)
+                except Exception as send_exc:
+                    logger.error("Failed to send action '%s': %s", action_str, send_exc)
+                    return False
+
+                action_count += 1
+
+            # ── Branch 2: Hand result (terminal) ────────────────────────
+            elif "HAND_RESULT" in raw_line or "SCORE" in raw_line:
+                chip_delta: float = self._parse_hand_result(
+                    raw_line, self.config.big_blind
+                )
+                self.total_chip_delta += chip_delta
+                self.hands_played += 1
+
+                if chip_delta > 0:
+                    self.hands_won += 1
+                elif chip_delta < 0:
+                    self.hands_lost += 1
+
+                logger.debug(
+                    "Hand complete: delta=%.1f chips (%.3f BB), "
+                    "cumulative mbb/h=%.2f over %d hands",
+                    chip_delta,
+                    chip_delta / self.config.big_blind,
+                    self._calculate_mbb_hand(),
+                    self.hands_played,
+                )
+                hand_complete = True
+
+            else:
+                logger.debug("Unknown ACPC message (skipping): %s", raw_line[:60])
+                action_count += 1
+
+        if action_count >= MAX_ACTIONS_PER_HAND:
+            logger.error("Hand aborted: exceeded MAX_ACTIONS_PER_HAND (%d)", MAX_ACTIONS_PER_HAND)
             return False
 
-    def run_evaluation(self) -> dict[str, Any]:
-        """Run the full evaluation match.
+        return hand_complete
 
-        Returns:
-            Dictionary with evaluation stats (hands_played, mbb_hand, win_rate, etc.).
+    @staticmethod
+    def _parse_hand_result(raw_line: str, big_blind: float) -> float:
+        """Parse a HAND_RESULT or SCORE line into hero's chip delta.
+
+        Supported formats:
+            HAND_RESULT:hand_num:delta_p0:delta_p1   (Slumbot)
+            SCORE:delta_p0:delta_p1:hand_num:cards   (older ACPC)
         """
-        logger.info("Starting Slumbot evaluation: %d hands", self.config.max_hands)
+        tokens: list[str] = re.findall(r"-?\d+(?:\.\d+)?", raw_line)
 
+        if not tokens:
+            logger.warning("Could not parse numeric delta from: %s", raw_line[:80])
+            return 0.0
+
+        if raw_line.startswith("HAND_RESULT:") and len(tokens) >= 2:
+            try:
+                return float(tokens[1])
+            except (ValueError, IndexError):
+                pass
+
+        try:
+            return float(tokens[0])
+        except ValueError:
+            return 0.0
+
+    def _calculate_mbb_hand(self) -> float:
+        if self.hands_played == 0:
+            return 0.0
+        chip_delta_bb = self.total_chip_delta / self.config.big_blind
+        return (chip_delta_bb / self.hands_played) * 1000.0
+
+    def run_evaluation(self) -> dict[str, Any]:
+        logger.info("Starting Slumbot evaluation: %d hands", self.config.max_hands)
         try:
             for hand_num in range(self.config.max_hands):
                 success = self.play_hand()
                 if not success:
                     logger.warning("Hand %d failed", hand_num + 1)
                     continue
-
-                self.hands_played += 1
-
-                # Log progress every 1000 hands
                 if (hand_num + 1) % 1000 == 0:
-                    mbb_hand = self._calculate_mbb_hand()
                     logger.info(
                         "Progress: %d hands played, mbb/hand=%.2f",
-                        self.hands_played, mbb_hand,
+                        self.hands_played, self._calculate_mbb_hand(),
                     )
-
         except KeyboardInterrupt:
             logger.info("Evaluation interrupted by user")
         except Exception as e:
@@ -505,88 +580,15 @@ class SlumbotEvaluator:
 
         return self.get_results()
 
-    def _calculate_mbb_hand(self) -> float:
-        """Calculate win rate in milli-big-blinds per hand.
-
-        Returns:
-            mbb/hand win rate (0 if no hands played).
-        """
-        if self.hands_played == 0:
-            return 0.0
-
-        chip_delta_bb = self.total_chip_delta / self.config.big_blind
-        return (chip_delta_bb / self.hands_played) * 1000.0  # Convert to mbb
-
     def get_results(self) -> dict[str, Any]:
-        """Get evaluation results summary.
-
-        Returns:
-            Dictionary with stats: hands_played, mbb_hand, win_rate_pct, etc.
-        """
-        mbb_hand = self._calculate_mbb_hand()
+        mbb_hand     = self._calculate_mbb_hand()
         win_rate_pct = (self.hands_won / max(self.hands_played, 1)) * 100.0
-
         return {
-            "hands_played": self.hands_played,
-            "total_chip_delta": self.total_chip_delta,
-            "mbb_hand": mbb_hand,
-            "hands_won": self.hands_won,
-            "hands_lost": self.hands_lost,
-            "win_rate_pct": win_rate_pct,
-            "superhuman": mbb_hand >= 50.0,  # Threshold from config
+            "hands_played":      self.hands_played,
+            "total_chip_delta":  self.total_chip_delta,
+            "mbb_hand":          mbb_hand,
+            "hands_won":         self.hands_won,
+            "hands_lost":        self.hands_lost,
+            "win_rate_pct":      win_rate_pct,
+            "superhuman":        mbb_hand >= 50.0,
         }
-
-
-# =============================================================================
-# CLI Entry Point
-# =============================================================================
-
-def main() -> None:
-    """Run Slumbot benchmark from command line."""
-    import argparse
-    import json
-    from src.model.networks import NetworkConfig
-
-    parser = argparse.ArgumentParser(description="Slumbot HUNL Benchmark")
-    parser.add_argument("--checkpoint", required=True, help="Path to model checkpoint")
-    parser.add_argument("--host", default="slumbot.com", help="ACPC server host")
-    parser.add_argument("--port", type=int, default=9000, help="ACPC server port")
-    parser.add_argument("--hands", type=int, default=100_000, help="Max hands to play")
-    parser.add_argument("--device", default="cpu", help="Device (cpu/cuda)")
-    parser.add_argument("--config", help="Path to network config YAML")
-
-    args = parser.parse_args()
-
-    # Load network config
-    if args.config:
-        import yaml
-        with open(args.config) as f:
-            cfg = yaml.safe_load(f)
-        net_config = NetworkConfig.from_dict(cfg, num_players=2)
-    else:
-        net_config = NetworkConfig()
-
-    # Create evaluator
-    eval_config = SlumbotEvalConfig(
-        checkpoint_path=args.checkpoint,
-        acpc_host=args.host,
-        acpc_port=args.port,
-        max_hands=args.hands,
-        device=args.device,
-    )
-
-    evaluator = SlumbotEvaluator(eval_config, net_config)
-
-    # Run evaluation
-    results = evaluator.run_evaluation()
-
-    # Print results
-    logger.info("Evaluation Complete:")
-    for key, value in results.items():
-        logger.info("  %s: %s", key, value)
-
-    print(json.dumps(results, indent=2))
-
-
-if __name__ == "__main__":
-    main()

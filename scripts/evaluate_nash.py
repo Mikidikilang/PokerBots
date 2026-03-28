@@ -63,7 +63,7 @@ def load_config(config_path: str = "config.yaml") -> dict[str, Any]:
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
     try:
-        with open(config_file) as f:
+        with open(config_file, encoding="utf-8") as f:
             config = yaml.safe_load(f)
         logger.info("Config loaded from: %s", config_path)
         return config
@@ -116,7 +116,7 @@ def load_checkpoint(
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
     try:
-        checkpoint = torch.load(ckpt_path, map_location=device)
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
 
         # Handle both full checkpoint dicts and bare state_dicts
         if isinstance(checkpoint, dict):
