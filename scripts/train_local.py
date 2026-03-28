@@ -2,26 +2,30 @@
 """
 Lokalis Training CLI Belepesi Pont (train_local.py).
 
+[FIX P0-A — 2025-03-28] Opponent pool wired into the training loop.
+
+    build_training_pipeline() now:
+      1. Creates an OpponentPool with the four Phase-0 archetypes.
+      2. Passes it to make_env() so a MultiAgentRLCardWrapper is used.
+      3. Registers the archetypes with CurriculumManager's UCB1 arms.
+      4. In on_iteration_end(), calls curriculum.select_opponent() /
+         select_opponent_fsp() and routes the result to
+         env.set_active_opponent() so the correct bot is in place for
+         the NEXT rollout.
+
+[FIX P1-A — 2025-03-28] Average-strategy network added (NFSP).
+
+    A second network avg_network is kept as an exponential moving average
+    of the best-response network:
+        α  = 1 / max(iteration, 1)   (time-decaying, exact FSP average)
+        avg_p ← lerp(avg_p, br_p, α)
+
+    This is the minimal NFSP implementation that prevents the RPS cycling
+    (rock-paper-scissors dynamics) in Phase 2 self-play.  The avg_network
+    is registered as a NeuralOpponentAgent ("avg_strategy") in the
+    opponent pool so Phase 2 can sample from it.
+
 [FIX R-1 — 2025-03-28] DDP Checkpoint Deadlock fixed in on_checkpoint.
-
-    ROOT CAUSE:
-    on_checkpoint() only ran I/O on rank 0, then returned immediately on
-    all other ranks. Rank 1 re-entered the training loop and called
-    loss.backward() which blocked in DDP's all_reduce waiting for rank 0's
-    gradient contribution — rank 0 was still writing the 200MB checkpoint.
-    Result: permanent hang (deadlock) on every checkpoint save.
-
-    THE FIX:
-    Add an unconditional dist.barrier() AFTER the rank-0 save attempt.
-    The barrier fires on EVERY rank whether the save succeeded or failed.
-    All ranks reach the barrier together, wait for rank 0 to finish I/O,
-    then proceed to the next iteration simultaneously — no race condition.
-
-    KEY INVARIANT: The barrier must be unconditional — it must execute even
-    if the save throws an exception (we catch-and-log rather than re-raise).
-    Re-raising inside the if-rank-0 block would skip the barrier and leave
-    all other ranks waiting at it forever.
-
 [FIX C-2 — 2025-03-28] Shutdown signal broadcast to all DDP ranks.
 [FIX H-1 — 2025-03-28] _session_start captured BEFORE build_training_pipeline().
 """
@@ -29,6 +33,7 @@ Lokalis Training CLI Belepesi Pont (train_local.py).
 from __future__ import annotations
 
 import argparse
+import copy
 import logging
 import os
 import sys
@@ -166,9 +171,19 @@ def load_config(config_path: str) -> dict[str, Any]:
 # Environment
 # =============================================================================
 
-def create_environment(cfg: dict[str, Any]) -> Any:
+def create_environment(
+    cfg: dict[str, Any],
+    opponent_pool: Any | None = None,
+) -> Any:
+    """Create the poker environment, optionally wired to an opponent pool.
+
+    [FIX P0-A] When opponent_pool is provided, make_env returns a
+    MultiAgentRLCardWrapper that injects opponent actions from the pool
+    for all non-hero seats.  When None, falls back to the original
+    self-play RLCardWrapper.
+    """
     from src.env.wrappers import make_env
-    return make_env(cfg)
+    return make_env(cfg, opponent_pool=opponent_pool)
 
 
 # =============================================================================
@@ -187,15 +202,13 @@ def build_training_pipeline(
 ) -> dict[str, Any]:
     """Assemble the full training pipeline.
 
+    [FIX P0-A] Creates an OpponentPool and wires it into the environment.
+    [FIX P1-A] Creates an average-strategy network for NFSP convergence.
+
     Args:
-        start_time: Monotonic clock captured BEFORE this call in main() or
-                    in Cell 1-A of the Kaggle notebook. Passed directly to
-                    GracefulShutdownMonitor so it measures true session
-                    duration (including DDP init and HF download time).
-                    [FIX H-1]
+        start_time: Monotonic clock captured BEFORE this call. [FIX H-1]
     """
     logger = logging.getLogger(__name__)
-    import torch
 
     # --- Device ---
     device_str: str = device_override or cfg.get("runtime", {}).get("device", "auto")
@@ -216,8 +229,23 @@ def build_training_pipeline(
             seed, rank, seed_with_rank,
         )
 
-    # --- Environment ---
-    env = create_environment(cfg)
+    # =========================================================================
+    # [FIX P0-A] Opponent Pool — must be created before environment
+    # =========================================================================
+    from src.training.opponent_pool import OpponentPool
+    mab_cfg = cfg.get("orchestrator", {}).get("mab", {})
+    opponent_pool = OpponentPool(
+        archetype_names=["calling_station", "maniac", "random", "tight_passive"],
+        max_pool_size=int(mab_cfg.get("max_pool_size", 20)),
+        device=device,
+    )
+    logger.info(
+        "[P0-A] OpponentPool created: %s",
+        opponent_pool.get_all_archetype_names(),
+    )
+
+    # --- Environment (wired to opponent pool) ---
+    env = create_environment(cfg, opponent_pool=opponent_pool)
 
     # --- ObservationBuilder ---
     from src.env.features import ObservationBuilder, ObservationConfig
@@ -244,6 +272,44 @@ def build_training_pipeline(
             "Network wrapped with DistributedDataParallel (rank=%d/%d)",
             rank, world_size,
         )
+
+    # =========================================================================
+    # [FIX P1-A] Average-Strategy Network (NFSP)
+    # =========================================================================
+    # We maintain a second network whose parameters are the time-average of
+    # all past best-response networks.  This implements Fictitious Self-Play
+    # (Heinrich & Silver 2015) at the weight level: the average strategy
+    # cannot be exploited by any single counter-strategy, so Phase-2
+    # training converges toward Nash instead of cycling.
+    #
+    # The EMA update in on_iteration_end():
+    #     α = 1 / max(iteration, 1)       (exact FSP time-average)
+    #     avg_p ← lerp(avg_p, br_p, α)
+    # =========================================================================
+    _base_net = (
+        network.module
+        if isinstance(network, torch.nn.parallel.DistributedDataParallel)
+        else network
+    )
+    avg_network = copy.deepcopy(_base_net)
+    avg_network.eval()
+    for p in avg_network.parameters():
+        p.requires_grad_(False)
+    logger.info("[P1-A] Average-strategy network created (NFSP)")
+
+    # Register avg_network as a NeuralOpponentAgent in the pool so that
+    # Phase-2 FSP opponent sampling can use it.
+    from src.training.opponent_pool import NeuralOpponentAgent
+    # Build a fresh obs_builder for the avg agent (no state shared with hero)
+    avg_obs_builder = ObservationBuilder(obs_config)
+    avg_agent = NeuralOpponentAgent(
+        name="avg_strategy",
+        network=avg_network,
+        obs_builder=avg_obs_builder,
+        device=device,
+    )
+    opponent_pool.archetypes["avg_strategy"] = avg_agent
+    logger.info("[P1-A] avg_strategy agent registered in OpponentPool")
 
     # --- Config objects ---
     from src.training.buffer import RolloutBufferConfig
@@ -274,9 +340,7 @@ def build_training_pipeline(
                     ckpt_list[-1].name,
                 )
             else:
-                logger.warning(
-                    "Resume: NO checkpoints found. Cold start."
-                )
+                logger.warning("Resume: NO checkpoints found. Cold start.")
 
             checkpoint_to_resume = state_manager.load_training_state(
                 map_location=str(device)
@@ -296,10 +360,34 @@ def build_training_pipeline(
             start_iteration = resumed_iteration
             orchestrator_state = checkpoint_to_resume.get("orchestrator_state", {})
 
-            logger.info(
-                "✓ RESUME SUCCESSFUL: iteration=%d",
-                start_iteration,
+            # [P1-A] Restore avg_network from its dedicated file (saved
+            # alongside every main checkpoint as avg_network_latest.pt).
+            ckpt_dir = Path(
+                cfg.get("mlops", {})
+                .get("checkpoint", {})
+                .get("local_checkpoint_dir", "checkpoints")
             )
+            avg_latest = ckpt_dir / "avg_network_latest.pt"
+            if avg_latest.exists():
+                try:
+                    avg_state = torch.load(
+                        str(avg_latest), map_location=device, weights_only=True
+                    )
+                    avg_network.load_state_dict(avg_state)
+                    logger.info("[P1-A] avg_network restored from %s", avg_latest)
+                except Exception as avg_exc:
+                    logger.warning(
+                        "[P1-A] avg_network restore failed (%s); "
+                        "starting from fresh deepcopy of main network.",
+                        avg_exc,
+                    )
+            else:
+                logger.info(
+                    "[P1-A] No avg_network_latest.pt found; "
+                    "avg_network stays as fresh deepcopy."
+                )
+
+            logger.info("✓ RESUME SUCCESSFUL: iteration=%d", start_iteration)
         else:
             logger.warning("✗ RESUME FAILED: cold start.")
 
@@ -327,6 +415,19 @@ def build_training_pipeline(
             orchestrator.load_state(orchestrator_state)
         orchestrator.set_network_reference(network)
         orchestrator.set_ddp_world_size(world_size)
+
+        # [FIX P0-A] Register static archetypes in the CurriculumManager's
+        # UCB1 arms so opponent selection works from iteration 0.
+        for _opp in ["calling_station", "maniac", "random", "tight_passive"]:
+            orchestrator.curriculum.register_opponent(_opp)
+        logger.info(
+            "[P0-A] 4 archetypes registered in Curriculum UCB1 arms; "
+            "starting with 'calling_station'."
+        )
+        # Set a sensible default for the very first rollout
+        if hasattr(env, "set_active_opponent"):
+            env.set_active_opponent("calling_station")
+
         logger.info("Orchestrator initialized on rank 0")
 
     # --- Graceful Shutdown (rank 0 only) ---
@@ -423,14 +524,14 @@ def build_training_pipeline(
                 combined_metrics["total_env_steps"] = local_steps * world_size
                 monitor.log_metrics(step=iteration, metrics=combined_metrics)
 
-            # ── NEW: Record PolicyAverager snapshot on rank 0 (Phase 2 only) ───
+            # FSP PolicyAverager snapshot (Phase 2 only)
             if orchestrator is not None:
                 orchestrator.curriculum.maybe_record_fsp_snapshot(
                     network=network,
                     iteration=iteration,
                 )
 
-            # ── NEW: Log ESS to W&B for monitoring Nash convergence quality ────
+            # ESS metrics
             if monitor.active and orchestrator is not None:
                 avg_stats = orchestrator.curriculum._policy_averager.get_stats()
                 monitor.log_metrics(step=iteration, metrics={
@@ -438,6 +539,55 @@ def build_training_pipeline(
                     "fsp/ess":           float(avg_stats["effective_ess"]),
                     "fsp/total_weight":  float(avg_stats["total_weight"]),
                 })
+
+            # =================================================================
+            # [FIX P0-A] Wire opponent selection to the environment.
+            #
+            # We select AFTER the orchestrator callback so that any phase
+            # transitions have already been applied and the curriculum phase
+            # is up-to-date.  The selected opponent will be active for the
+            # NEXT collect_rollout() call.
+            # =================================================================
+            phase_val = orchestrator.curriculum.current_phase.value
+            if phase_val < 2:
+                opp_name = orchestrator.curriculum.select_opponent()
+            else:
+                # Phase 2: FSP-aware sampling (time-weighted average strategy)
+                opp_name = orchestrator.curriculum.select_opponent_fsp(iteration)
+
+            if hasattr(runner, "env") and hasattr(runner.env, "set_active_opponent"):
+                runner.env.set_active_opponent(opp_name)
+                logger.debug(
+                    "[P0-A] Opponent for iter %d: '%s' (phase=%d)",
+                    iteration + 1, opp_name, phase_val,
+                )
+
+        # =====================================================================
+        # [FIX P1-A] Update average-strategy network via EMA (NFSP).
+        #
+        # α = 1 / max(iteration, 1) implements the exact FSP time-average:
+        #     σ̄(t) = (1/t) Σ_{k=1}^t σ(k)
+        # which can be written as the recursive update:
+        #     σ̄(t) = (1 - 1/t) * σ̄(t-1) + (1/t) * σ(t)
+        #
+        # This runs on rank 0 only.  All gradient operations are disabled.
+        # =====================================================================
+        if rank == 0:
+            actual_net = (
+                network.module
+                if isinstance(network, torch.nn.parallel.DistributedDataParallel)
+                else network
+            )
+            ema_alpha = 1.0 / max(float(iteration), 1.0)
+            with torch.no_grad():
+                for avg_p, br_p in zip(
+                    avg_network.parameters(), actual_net.parameters()
+                ):
+                    avg_p.data.lerp_(br_p.data, ema_alpha)
+            logger.debug(
+                "[P1-A] avg_network EMA updated: α=%.6f (iter=%d)",
+                ema_alpha, iteration,
+            )
 
         # Shutdown check (rank 0 only)
         if rank == 0 and shutdown_monitor is not None:
@@ -452,15 +602,14 @@ def build_training_pipeline(
     def on_ddp_sync(iteration: int) -> None:
         """Cross-rank synchronization — called on ALL ranks every iteration.
 
-        [FIX C-2] Broadcasts shutdown flag from rank 0 to all ranks so they
-        all exit the training loop together on the same iteration.
+        [FIX C-2] Broadcasts shutdown flag from rank 0 to all ranks.
         """
         nonlocal phase_transition_state
 
         if world_size <= 1:
             return
 
-        # --- Broadcast 1: Phase transition ---
+        # Broadcast 1: Phase transition
         phase_flag = torch.tensor(
             [1.0 if phase_transition_state["transition_occurred"] else 0.0],
             dtype=torch.float32,
@@ -469,7 +618,7 @@ def build_training_pipeline(
         dist.broadcast(phase_flag, src=0)
         phase_transition_state["transition_occurred"] = bool(phase_flag.item() > 0.5)
 
-        # --- Broadcast 2: Shutdown flag [FIX C-2] ---
+        # Broadcast 2: Shutdown flag [FIX C-2]
         should_stop_val = 1.0 if runner._should_stop else 0.0
         stop_flag = torch.tensor(
             [should_stop_val], dtype=torch.float32, device=device
@@ -488,33 +637,34 @@ def build_training_pipeline(
     # =========================================================================
 
     def on_checkpoint(iteration: int, net: Any) -> None:
-        """Periodic checkpoint callback — rank-0 writes, ALL ranks synchronize.
-
-        DDP INVARIANT: Every rank must exit this function at the same logical
-        moment, regardless of whether they performed any I/O work.
-
-        ─── Why the deadlock occurs without this barrier ──────────────────
-        Without the barrier:
-            t=0 │ rank 0  →  enters torch.save() (blocking file I/O, 2-8 sec)
-            t=0 │ rank 1  →  returns immediately (no save work)
-            t=1 │ rank 1  →  re-enters training loop → loss.backward()
-            t=1 │ rank 1  →  DDP hooks fire: all_reduce() waiting for rank 0
-            t=2 │ rank 0  →  still writing the checkpoint...
-            t=∞ │ DEADLOCK: rank 0 never enters all_reduce, rank 1 waits forever.
-
-        ─── How the barrier fixes it ──────────────────────────────────────
-            t=0 │ rank 0  →  saves checkpoint
-            t=0 │ rank 1  →  hits barrier immediately, blocks
-            t=2 │ rank 0  →  finishes saving, reaches barrier
-            t=2 │ ALL     →  barrier clears simultaneously
-            t=3 │ ALL     →  next iteration begins together — no race condition.
-        """
-        # ── Phase 1: Rank 0 performs all I/O ────────────────────────────────
+        """Periodic checkpoint callback — rank-0 writes, ALL ranks synchronize."""
         if rank == 0:
             try:
                 rng_states: dict[str, Any] = RNGStateManager.capture_states(
                     dataloader_generator=dl_generator
                 )
+
+                # [P1-A] Save avg_network state separately.
+                # StateManager.save_training_state() has a fixed signature and
+                # does not accept arbitrary extra keys, so we persist the
+                # average-strategy network to a dedicated file alongside the
+                # main checkpoint.  A single "latest" file is sufficient — we
+                # only ever need to resume from the most recent avg state.
+                try:
+                    avg_ckpt_dir = Path(
+                        ckpt_cfg.get("local_checkpoint_dir", "checkpoints")
+                    )
+                    avg_ckpt_dir.mkdir(parents=True, exist_ok=True)
+                    avg_tmp  = avg_ckpt_dir / "avg_network_latest.pt.tmp"
+                    avg_path = avg_ckpt_dir / "avg_network_latest.pt"
+                    torch.save(avg_network.state_dict(), str(avg_tmp))
+                    os.replace(str(avg_tmp), str(avg_path))   # atomic (SIGKILL-safe)
+                    logger.info("[P1-A] avg_network saved: %s", avg_path)
+                except Exception as avg_exc:
+                    logger.error(
+                        "[P1-A] avg_network save failed at iter %d: %s",
+                        iteration, avg_exc,
+                    )
 
                 state_manager.save_training_state(
                     network=net,
@@ -545,9 +695,6 @@ def build_training_pipeline(
                 )
 
             except Exception as save_exc:
-                # CRITICAL: log but DO NOT re-raise here.
-                # Re-raising would skip the barrier below, leaving all other
-                # ranks waiting at it forever — a subtler form of the same deadlock.
                 logger.error(
                     "[Rank 0] Checkpoint save FAILED at iter %d: %s",
                     iteration,
@@ -555,38 +702,23 @@ def build_training_pipeline(
                     exc_info=True,
                 )
 
-        # ── Phase 2: Unconditional synchronization barrier ───────────────────
-        #
-        # THIS IS THE FIX (R-1). The barrier must execute on EVERY rank,
-        # regardless of:
-        #   • Whether this rank saved anything
-        #   • Whether the save on rank 0 succeeded or failed
-        #   • Whether world_size == 1 (the condition guards the call)
-        #
+        # Unconditional DDP barrier [FIX R-1]
         if world_size > 1:
             try:
                 dist.barrier()
-
                 if rank == 0:
                     logger.debug(
                         "[Rank 0] DDP barrier cleared post-checkpoint (iter=%d)",
                         iteration,
                     )
-
             except Exception as barrier_exc:
-                # A dist.barrier() failure means the NCCL communicator is
-                # corrupted. There is no safe way to continue training.
                 logger.critical(
                     "[Rank %d] dist.barrier() failed after checkpoint at iter %d: %s",
-                    rank,
-                    iteration,
-                    barrier_exc,
-                    exc_info=True,
+                    rank, iteration, barrier_exc, exc_info=True,
                 )
                 raise RuntimeError(
                     f"[DDP] Irrecoverable barrier failure in on_checkpoint "
-                    f"at iteration {iteration}. "
-                    f"Original error: {barrier_exc}"
+                    f"at iteration {iteration}. Original error: {barrier_exc}"
                 ) from barrier_exc
 
     # --- Runner ---
@@ -639,6 +771,8 @@ def build_training_pipeline(
     return {
         "runner":           runner,
         "network":          network,
+        "avg_network":      avg_network,    # [P1-A] average-strategy network
+        "opponent_pool":    opponent_pool,  # [P0-A] wired opponent pool
         "orchestrator":     orchestrator,
         "state_manager":    state_manager,
         "shutdown_monitor": shutdown_monitor,
@@ -681,14 +815,12 @@ def main() -> None:
     logger = logging.getLogger(__name__)
 
     # [FIX H-1] Capture monotonic clock BEFORE setup_ddp() and BEFORE
-    # build_training_pipeline(). DDP init and HF checkpoint download can
-    # each take minutes, silently eating into the 11.5h Kaggle budget.
+    # build_training_pipeline().
     _session_start: float = time.monotonic()
     logger.info(
         "Session clock started: %.4f (monotonic) [FIX H-1]", _session_start
     )
 
-    # DDP init
     rank, local_rank, world_size = setup_ddp()
 
     if rank == 0:
