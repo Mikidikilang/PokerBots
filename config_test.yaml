@@ -1,0 +1,194 @@
+# =============================================================================
+# PokerAI-Project: GYORS LOKÁLIS TESZT KONFIGURÁCIÓ (Smoke Test)
+# =============================================================================
+# Ezt a fájlt direkt arra terveztük, hogy másodpercek alatt végigfusson a
+# teljes pipeline-on (adatgyűjtés, PPO frissítés, telemetria, fázisátmenet,
+# mentés) hiba nélkül.
+#
+# Futtatás: python -m scripts.train_local --config config_test.yaml --max-iter 5 --log-level DEBUG
+# =============================================================================
+
+project:
+  name: "PokerAI-NLHE-Test"
+  version: "0.1.0-test"
+  description: "Minimal smoke test config"
+  seed: 42
+
+runtime:
+  platform: "local"
+  device: "cpu"                         # Teszthez a CPU is tökéletes és gyors
+  num_workers: 1
+  log_level: "DEBUG"
+  log_dir: "logs_test/"
+
+environment:
+  game_engine: "rlcard"
+  game_type: "no-limit-holdem"
+  num_players: 2                        # 2-Max (Heads-Up) a leggyorsabb szimulációhoz
+  initial_stack_bb: 200
+  small_blind: 1
+  big_blind: 2
+  observation_space:
+    card_encoding: "multi_hot"
+    hole_cards_dim: 52
+    community_cards_dim: 52
+    total_card_dim: 104
+    max_betting_rounds: 4
+    max_actions_per_round: 18
+    betting_history_dim: [18, 9]
+    position_encoding: "one_hot"
+    normalization_method: "big_blind"
+    normalization_range: [0.0, 1.0]
+  action_space:
+    type: "discrete"
+    num_actions: 9
+    actions:
+      0: "fold"
+      1: "check_call"
+      2: "min_raise"
+      3: "raise_0.5x_pot"
+      4: "raise_0.75x_pot"
+      5: "raise_1.0x_pot"
+      6: "raise_1.5x_pot"
+      7: "raise_2.0x_pot"
+      8: "all_in"
+    illegal_action_logit_mask: -1.0e+8
+
+model:
+  architecture: "mlp_actor_critic"
+  embedding:
+    card_embed_dim: 16                  # Drasztikusan lecsökkentve
+    context_embed_dim: 8                # Drasztikusan lecsökkentve
+    history_embed_dim: 16               # Drasztikusan lecsökkentve
+  actor:
+    hidden_layers: [64, 64]             # Mini MLP
+    activation: "relu"
+    dropout: 0.0                        # Teszthez nem kell dropout
+    output_activation: "softmax"
+  critic:
+    hidden_layers: [64, 64]             # Mini MLP
+    activation: "relu"
+    dropout: 0.0
+    output_dim: 1
+  weight_init: "orthogonal"
+  weight_init_gain: 1.0
+
+ppo:
+  learning_rate: 3.0e-4
+  learning_rate_schedule: "constant"
+  lr_warmup_steps: 0
+  adam_epsilon: 1.0e-5
+  max_grad_norm: 0.5
+  clip_epsilon: 0.2
+  clip_range_vf: 0.2
+  entropy_coefficient: 0.01
+  value_loss_coefficient: 0.5
+  gamma: 0.99
+  gae_lambda: 0.95
+  
+  rollout_steps: 128                    # Nagyon pici rollout a gyors iterációhoz
+  num_epochs: 2                         # Csak 2 epoch frissítés
+  batch_size: 32                        # Pici batch (128 / 32 = 4 mini-batch)
+  num_mini_batches: 4
+  buffer:
+    max_capacity: 10_000
+    compression: "zstandard"
+    compression_level: 1
+
+orchestrator:
+  phases:
+    phase_0:
+      name: "Rules-Based Exploitation"
+      description: "Test Phase 0"
+      opponents: ["calling_station", "random"]
+      transition_threshold:
+        min_win_rate_mbb: -9999.0       # Bármilyen winrate jó a teszthez
+        min_hands: 10                   # Már 10 kéz után ugorjon Phase 1-be!
+        min_vpip_in_range: false
+    phase_1:
+      name: "Opponent Modeling & SFT"
+      description: "Test Phase 1"
+      opponents: ["calling_station"]
+      transition_threshold:
+        min_win_rate_mbb: -9999.0
+        min_hands: 20                   # 20 kéz után ugorjon Phase 2-be
+        max_exploitability_pct: 100.0
+    phase_2:
+      name: "Co-Adaptive FSP"
+      description: "Test Phase 2"
+      opponents: ["self_play_pool"]
+      target_metrics:
+        nash_distance_pct: 0.3
+        min_slumbot_mbb: 50
+  mab:
+    algorithm: "ucb"
+    ucb_exploration_factor: 2.0
+    pool_snapshot_interval: 2           # Nagyon gyakori snapshot
+    max_pool_size: 5
+  telemetry:
+    sliding_window_hands: 100           # Pici ablak
+    eval_interval_iterations: 2         # Minden 2. iterációban csekkoljon
+    log_interval_iterations: 1
+
+gto_matrix:
+  "2":
+    vpip: [71.0, 78.0]
+    pfr: [60.0, 68.0]
+    three_bet: [17.5, 23.0]
+    af: [2.5, 3.8]
+    wtsd: [26.0, 30.0]
+
+degeneration_thresholds:
+  "2":
+    passivity:
+      vpip_below: 55.0
+      vpip_pfr_gap_above: 20.0
+    maniac:
+      pfr_above: 85.0
+      three_bet_above: 30.0
+      af_above: 5.0
+
+reward_shaping:
+  bluff_penalty_lambda: 0.0
+  bluff_intensity_threshold: 0.7
+  preflop_aggression_bonus: 0.0
+  entropy_boost_factor: 2.0
+  stagnation_window: 5
+  stagnation_threshold: 0.001
+
+mlops:
+  hf_repo_id: ""                        # Tesztnél nem kell repo ID
+  hf_repo_type: "model"
+  checkpoint:
+    save_interval_iterations: 2         # Minden 2. iterációnál mentsen
+    buffer_save_interval_iterations: 10
+    local_checkpoint_dir: "checkpoints_test/"
+    max_checkpoints_to_keep: 2
+  async_upload:
+    enabled: false                      # KIKAPCSOLVA a gyors teszthez!
+    sync_interval_minutes: 15
+    commit_message_prefix: "test"
+  graceful_shutdown:
+    max_runtime_hours: 1.0              # 1 órás limit bőven elég tesztnek
+    use_monotonic_clock: true
+  rng_management:
+    save_rng_states: true
+    components:
+      - "python_stdlib"
+      - "numpy"
+      - "torch_cpu"
+
+evaluation:
+  slumbot:
+    enabled: false
+    stack_size_bb: 200
+    max_action_time_seconds: 7
+    min_hands: 10
+    superhuman_threshold_mbb: 50
+  nash_distance:
+    method: "lbr"
+    target_pct: 0.3
+    eval_hands: 50
+  aivat:
+    enabled: false
+    baseline_type: "uniform"

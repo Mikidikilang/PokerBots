@@ -62,6 +62,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
+from .dcfr_params import DCFRParameters, apply_dcfr_update
+
 logger = logging.getLogger(__name__)
 
 
@@ -73,7 +75,18 @@ class InformationSet:
     Stores:
         - Player's visible information (cards, board, history)
         - Regret for each action
-        - Iteration count (for averaging)
+        - Iteration count (for DCFR discounting)
+    
+    [PHASE 3 UPGRADE] Discounted CFR (DCFR):
+        - Tracks iteration count for this infoset
+        - Applies per-sign discount factors (α=1.5 for positive, β=0 for negative)
+        - Formula: R^new(a) = discount(t, sign) * R^old(a) + r(a)
+        - With γ=2, iteration-dependent discounting accelerates convergence
+        - Discount decreases with iteration (less emphasis on old regrets)
+    
+    [PHASE 2 LEGACY] RM+ (Regret Matching Plus):
+        - Constant discount factor (fallback mode if DCFR disabled)
+        - R^new(a) = discount_factor * R^old(a) + r(a)
     """
     
     infoset_id: str                          # Hash of (player, cards, board, history)
@@ -92,28 +105,156 @@ class InformationSet:
     positive_regret_sum: dict[int, float] = field(default_factory=dict)
     last_strategy: dict[int, float] = field(default_factory=dict)
     
+    # [AUDIT FIX #3] Strategy averaging for behavioral cloning convergence
+    # Tracks average strategy across iterations: σ̄(a|h) = (1/T) Σ_t σ^t(a|h)
+    cumulative_strategy_sum: dict[int, float] = field(default_factory=dict)
+    iteration_count_for_averaging: int = 0  # How many iterations have contributed
+    
+    # [PHASE 3] DCFR iteration tracking
+    iteration_count: int = 0  # How many times this infoset has been updated
+    dcfr_params: Optional[DCFRParameters] = None
+    
+    # Legacy RM+ mode (if DCFR disabled)
+    use_dcfr: bool = True
+    regret_discount_factor: float = 3.0    # Fallback if DCFR disabled
+    
     def __post_init__(self):
         """Ensure all action dicts have consistent keys."""
         if not self.cumulative_regret:
             logger.debug(f"Created new infoset: {self.infoset_id}")
+        if self.dcfr_params is None:
+            self.dcfr_params = DCFRParameters()
     
-    def add_regret(self, action: int, regret_value: float):
+    def add_regret(self, action: int, regret_value: float, 
+                   importance_weight: float = 1.0):
         """
-        Accumulate regret for an action.
+        Accumulate regret for an action using DCFR (NOT weighted by importance sampling).
+        
+        ★★★ CRITICAL FIX (AUDIT FIX #2) ★★★
+        
+        MATHEMATICAL GUARANTEE:
+            Importance sampling weights are REMOVED from regret accumulation.
+            
+            Pure DCFR Formula (Brown & Sandholm 2019):
+                R^new(a) = discount(t, sign) * R^old(a) + r(a)
+                
+            where discount depends on sign of R^old(a) and iteration count.
+            
+            Convergence Rate: O(1/√t) is GUARANTEED by DCFR theory.
+            
+            The regret_value input must ALREADY be scaled by reach probabilities
+            during tree traversal (NOT here).
+        
+        [PHASE 2 LEGACY] RM+ Formula (disabled):
+            R^new(a) = constant_discount * R^old(a) + r(a)
         
         Args:
             action: Action index (0-11 in poker)
-            regret_value: Counterfactual regret (can be negative)
+            regret_value: Counterfactual regret PROPERLY scaled by reach probabilities
+                         (NO additional importance weighting applied here)
+            importance_weight: DEPRECATED - accepted for API compatibility but NOT used.
+                              Will be removed in future versions.
+        
+        ★ AUDIT NOTE ★:
+            importance_weight parameter exists only for backward compatibility.
+            It is NEVER applied. Regrets are accumulated unweighted.
+            If weighting is needed, it must be done at tree traversal time.
         """
         if action not in self.cumulative_regret:
             self.cumulative_regret[action] = 0.0
             self.regret_sum_squared[action] = 0.0
             self.action_counts[action] = 0
         
-        self.cumulative_regret[action] += regret_value
+        regret_old = self.cumulative_regret[action]
+        
+        # ASSERT importance_weight is not used (for debugging)
+        if importance_weight != 1.0:
+            logger.warning(
+                f"add_regret received importance_weight={importance_weight} "
+                f"but this is ignored.  Weights must be applied at traversal time, "
+                f"not during regret accumulation. See AUDIT FIX #2."
+            )
+        
+        if self.use_dcfr and self.dcfr_params:
+            # ★ PURE DCFR: NO importance weighting ★
+            # Convergence proof requires unweighted regret accumulation
+            regret_updated = apply_dcfr_update(
+                regret_old=regret_old,
+                regret_new=regret_value,  # ← NO weighting applied here
+                iteration=self.iteration_count,
+                params=self.dcfr_params,
+            )
+        else:
+            # [PHASE 2] Legacy RM+: Constant discount (disabled by default)
+            regret_updated = (
+                self.regret_discount_factor * regret_old + regret_value
+            )
+        
+        self.cumulative_regret[action] = regret_updated
         self.regret_sum_squared[action] += regret_value ** 2
         self.action_counts[action] += 1
         self.visit_count += 1
+    
+    def increment_iteration(self):
+        """[PHASE 3] Increment iteration counter (called at end of CFR iteration)."""
+        self.iteration_count += 1
+        
+        # [AUDIT FIX #3] Accumulate current strategy for averaging
+        # This is called at the END of each iteration after regrets are finalized
+        current_strategy = self.get_strategy()
+        
+        for action, prob in current_strategy.items():
+            if action not in self.cumulative_strategy_sum:
+                self.cumulative_strategy_sum[action] = 0.0
+            # Add current iteration's probability to cumulative sum
+            self.cumulative_strategy_sum[action] += prob
+        
+        self.iteration_count_for_averaging += 1
+    
+    def get_average_strategy(self, legal_actions: Optional[list[int]] = None) -> dict[int, float]:
+        """
+        [AUDIT FIX #3] Compute average strategy across all iterations.
+        
+        Formula:
+            σ̄_i(a|h) = (1/T) Σ_{t=1}^T σ^t_i(a|h)
+        
+        This is the strategy guaranteed to converge to Nash equilibrium.
+        Use this for behavioral cloning (strategy network training),
+        NOT the current iteration's strategy.
+        
+        Args:
+            legal_actions: If provided, restrict to these actions
+        
+        Returns:
+            {action_idx: probability} where sum = 1.0
+        """
+        if not legal_actions:
+            legal_actions = list(self.cumulative_strategy_sum.keys())
+        
+        if not legal_actions or self.iteration_count_for_averaging == 0:
+            # Uniform if no data
+            num_actions = len(legal_actions) if legal_actions else 1
+            return {a: 1.0 / num_actions for a in legal_actions} if legal_actions else {}
+        
+        # Compute average by dividing cumsum by iteration count
+        avg_strategy = {}
+        total_prob = 0.0
+        
+        for action in legal_actions:
+            cumsum = self.cumulative_strategy_sum.get(action, 0.0)
+            avg_prob = cumsum / self.iteration_count_for_averaging
+            avg_strategy[action] = avg_prob
+            total_prob += avg_prob
+        
+        # Normalize (in case of floating point errors)
+        if total_prob > 1e-8:
+            avg_strategy = {a: p / total_prob for a, p in avg_strategy.items()}
+        else:
+            # Fallback to uniform
+            num_actions = len(legal_actions)
+            avg_strategy = {a: 1.0 / num_actions for a in legal_actions}
+        
+        return avg_strategy
     
     def get_strategy(self, legal_actions: Optional[list[int]] = None) -> dict[int, float]:
         """

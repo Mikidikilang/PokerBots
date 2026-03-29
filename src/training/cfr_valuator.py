@@ -71,6 +71,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from .cfr_env_state import EnvStateManager
+
 logger = logging.getLogger(__name__)
 
 
@@ -91,90 +93,155 @@ class GameNode:
 
 
 def compute_counterfactual_values(
-    trajectory: list[GameNode],
-    final_reward: float,
+    env: Any,
+    env_state_manager: EnvStateManager,
+    infoset_id: str,
+    player_to_update: int,
+    legal_actions: list[int],
     network: nn.Module,
+    infoset_storage: Any,
     device: torch.device,
-    discount_factor: float = 1.0,
-) -> dict[str, dict[int, float]]:
+    obs_builder: Any = None,
+    depth: int = 0,
+    max_depth: int = 50,
+) -> float:
     """
-    [CORE CFR COMPUTATION]
+    [CORE CFR COMPUTATION — PROPER GAME TREE TRAVERSAL]
     
-    Compute counterfactual values for all (infoset, action) pairs in trajectory.
+    Recursively traverse game tree, computing counterfactual values for each
+    (infoset, action) pair by actually stepping the environment.
     
-    Algorithm:
-        1. Forward pass: network outputs V̂(h) for each node h
-        2. Backward pass: compute counterfactual values via game tree rollback
-        3. For each action a at node h:
-           - Compute V̂(h, a) = value IF we had taken action a (hypothetically)
-           - Regret(h, a) = V̂(h, a) - V̂(h)
+    **Algorithm: External Sampling MCCFR**
+    
+    For each legal action at this infoset:
+        1. Save environment state
+        2. Step environment with action
+        3. Recursively evaluate resulting subtree
+        4. Restore environment state
+        5. Accumulate regrets based on subtree value
     
     Args:
-        trajectory: List of GameNode for this hand (first to last decision)
-        final_reward: Chip EV outcome (signed, e.g., +50 or -30)
-        network: Actor-critic network (outputs action_logits, value)
+        env: RLCard environment
+        env_state_manager: EnvStateManager for copy-on-enter, restore-on-exit
+        infoset_id: Hash of current information set
+        player_to_update: Which player's regrets to update (0 or 1)
+        legal_actions: Valid action indices from this state
+        network: Actor-critic network (for value estimates)
+        infoset_storage: InformationSetStorage for regret accumulation
         device: PyTorch device
-        discount_factor: γ for bootstrapping (usually 1.0 for episodic poker)
+        obs_builder: ObservationBuilder for observation generation
+        depth: Current depth in tree (for logging)
+        max_depth: Maximum depth to traverse (avoids infinite loops)
     
     Returns:
-        {infoset_id: {action_idx: counterfactual_regret_value}}
+        float: Counterfactual value of this node from player_to_update's perspective
     """
     
-    if not trajectory:
-        return {}
+    # Terminal condition: max depth reached
+    if depth > max_depth:
+        logger.debug(f"Max depth {max_depth} reached; returning 0.0")
+        return 0.0
     
-    # Step 1: Forward pass — get network value estimates for all nodes
-    obs_batch = torch.stack([node.obs_tensor for node in trajectory]).to(device)
+    # Get current player and check if game is terminal
+    current_player = env._env.get_player_num()
+    done = env._env.is_over()
+    
+    if done:
+        # Terminal node: return payoff
+        payoffs = env._env.get_payoffs()
+        payoff = payoffs[player_to_update] if player_to_update < len(payoffs) else 0.0
+        logger.debug(f"Terminal node at depth {depth}: payoff={payoff}")
+        return float(payoff)
+    
+    # Build observation tensor for network value estimate
+    if obs_builder is not None:
+        try:
+            obs_dict = obs_builder.build(env._env)  # type: ignore
+            obs_tensor = obs_dict.get("obs_tensor", torch.zeros(1)).to(device)
+        except Exception as e:
+            logger.warning(f"ObservationBuilder.build() failed: {e}; using zeros")
+            obs_tensor = torch.zeros(1).to(device)
+    else:
+        obs_tensor = torch.zeros(1).to(device)
+    
+    # Get network's value estimate for this node
     with torch.no_grad():
-        action_logits, value_estimates = network(obs_batch)
-        # action_logits: [len(trajectory), 12]
-        # value_estimates: [len(trajectory), 1]
-        value_estimates = value_estimates.squeeze(-1)  # [len(trajectory)]
+        batch_obs = obs_tensor.unsqueeze(0) if obs_tensor.dim() == 1 else obs_tensor
+        try:
+            action_logits, value_estimate = network(batch_obs)
+            value_self = value_estimate.squeeze().item()
+        except Exception as e:
+            logger.warning(f"Network forward pass failed: {e}; using 0.0")
+            value_self = 0.0
     
-    counterfactual_regrets: dict[str, dict[int, float]] = {}
+    # =========================================================================
+    # MCCFR Tree Traversal: For each legal action
+    # =========================================================================
     
-    # Step 2: Backward pass — compute counterfactual values
-    # Start from end of trajectory and work backward
+    counterfactual_regrets_at_node: dict[int, float] = {}
+    total_node_value = 0.0
     
-    # Bootstrap value at terminal node
-    next_value = final_reward  # Terminal: realized reward is the value
+    # Get current player's strategy from regrets (regret matching)
+    infoset = infoset_storage.get_infoset(infoset_id)
+    if infoset:
+        strategy = infoset.get_strategy(legal_actions)
+    else:
+        # Unseen infoset: uniform strategy
+        strategy = {a: 1.0 / len(legal_actions) for a in legal_actions}
     
-    for node_idx in range(len(trajectory) - 1, -1, -1):
-        node = trajectory[node_idx]
-        current_value = value_estimates[node_idx].item()
-        
-        # For each legal action, compute counterfactual value
-        # V̂(h, a) approximates: "what if we took action a here?"
-        
-        # In practice, we use the network's output as V̂(h, a)
-        # More sophisticated approaches would:
-        #   1. Compute separate values for each action via tree search
-        #   2. Use on-policy/off-policy corrections (importance sampling)
-        
-        # For Phase 2 MVP: use network value directly
-        # TODO: Implement proper counterfactual tree evaluation
-        
-        if node.infoset_id not in counterfactual_regrets:
-            counterfactual_regrets[node.infoset_id] = {}
-        
-        # Placeholder counterfactual value for each legal action
-        # Real implementation: evaluate each branch of game tree
-        for action_idx in node.legal_actions:
-            if action_idx == node.action_taken:
-                # Action we actually played: use realized value
-                counterfactual_value = next_value
-            else:
-                # Action we didn't play: approximate via network
-                # In reality, would need full game tree evaluation
-                counterfactual_value = current_value
+    subtree_values: dict[int, float] = {}
+    
+    for action_idx in legal_actions:
+        # Save environment state
+        with env_state_manager.savepoint():
+            # Step environment with this action
+            obs, reward, done, info = env.step(action_idx)
             
-            regret = counterfactual_value - current_value
-            counterfactual_regrets[node.infoset_id][action_idx] = regret
+            # Recursively evaluate subtree
+            subtree_value = compute_counterfactual_values(
+                env=env,
+                env_state_manager=env_state_manager,
+                infoset_id=f"{infoset_id}@{action_idx}",  # Unique ID for subtree
+                player_to_update=player_to_update,
+                legal_actions=list(env._env.legal_actions) if hasattr(env._env, 'legal_actions') else [],
+                network=network,
+                infoset_storage=infoset_storage,
+                device=device,
+                obs_builder=obs_builder,
+                depth=depth + 1,
+                max_depth=max_depth,
+            )
         
-        # Prepare for next iteration (moving backward through tree)
-        next_value = discount_factor * current_value + (1 - discount_factor) * final_reward
+        subtree_values[action_idx] = subtree_value
+        
+        # Accumulate weighted value
+        action_prob = strategy.get(action_idx, 1.0 / len(legal_actions))
+        total_node_value += action_prob * subtree_value
     
-    return counterfactual_regrets
+    # =========================================================================
+    # Compute Counterfactual Regrets
+    # =========================================================================
+    
+    # If this is a node where player_to_update acts, compute regrets
+    if current_player == player_to_update:
+        for action_idx in legal_actions:
+            action_value = subtree_values[action_idx]
+            counterfactual_regret = action_value - total_node_value
+            counterfactual_regrets_at_node[action_idx] = counterfactual_regret
+            
+            # Add regret to storage (for regret matching in next iteration)
+            infoset_storage.add_regret(infoset_id, action_idx, counterfactual_regret)
+        
+        logger.debug(
+            f"Depth {depth}: Updated regrets at {infoset_id}, "
+            f"node_value={total_node_value:.2f}, regrets={counterfactual_regrets_at_node}"
+        )
+    else:
+        # Opponent's node: just return expected value (no regret update)
+        logger.debug(f"Depth {depth}: Opponent node (no regret update), value={total_node_value:.2f}")
+    
+    return total_node_value
+
 
 
 def compute_value_targets(

@@ -335,12 +335,21 @@ class LocalBestResponseEvaluator:
         if action == PokerAction.FOLD:
             return 0.0
 
-        # ── Check/Call: pot-odds aware EV ────────────────────────────────
-        if action == PokerAction.CHECK_CALL:
+        # ── Check: free to see the next card ──────────────────────────────
+        if action == PokerAction.CHECK:
+            if context.amount_to_call == 0.0:
+                check_ev: float = equity * context.pot_size
+                return check_ev
+            else:
+                # Invalid CHECK with bet → treat as FOLD
+                return 0.0
+
+        # ── Call: pot-odds aware EV ───────────────────────────────────────
+        if action == PokerAction.CALL:
             call_amount: float = context.amount_to_call
 
             if call_amount == 0.0:
-                # Check: free to see the next card.
+                # No bet to call → check
                 check_ev: float = equity * context.pot_size
                 return check_ev
 

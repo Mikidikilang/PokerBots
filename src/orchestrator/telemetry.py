@@ -27,9 +27,14 @@ logger = logging.getLogger(__name__)
 
 
 class ActionCategory(IntEnum):
+    """High-level action categorization for HUD metrics.
+    
+    Note: Different from PokerAction enum (fine-grained, 12 actions).
+    This is a coarse-grained classification: FOLD / PASSIVE / AGGRESSIVE / ALL_IN.
+    """
     FOLD = 0
-    CHECK_CALL = 1
-    RAISE = 2
+    PASSIVE = 1         # CHECK or CALL (actions 1-2)
+    AGGRESSIVE = 2      # Any raise (actions 3-10)
     ALL_IN = 3
 
 

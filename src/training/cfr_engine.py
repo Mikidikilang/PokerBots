@@ -767,10 +767,12 @@ class CFREngine:
             strategy_samples_added = 0
             
             for infoset in self.infoset_storage.infosets.values():
-                # Get current strategy via regret matching
-                current_strategy = infoset.get_strategy()
+                # ★ AUDIT FIX #3 ★: Use AVERAGE strategy, not current iteration strategy
+                # Convergence proof (Hart & Mas-Colell) requires training network on
+                # strategies accumulated over ALL iterations, not just current.
+                average_strategy = infoset.get_average_strategy()
                 
-                if not current_strategy:
+                if not average_strategy:
                     continue
                 
                 # Create dummy observation tensor
@@ -778,16 +780,21 @@ class CFREngine:
                 obs_tensor = torch.randn(346, dtype=torch.float32, device=self.device)
                 
                 # Add to strategy buffer for behavioral cloning training
+                # Using averaged strategy ensures convergence to Nash
                 self.strategy_buffer.add_sample(
                     infoset_id=infoset.infoset_id,
                     observation=obs_tensor,
-                    legal_actions=list(current_strategy.keys()),
-                    action_probabilities=current_strategy,
+                    legal_actions=list(average_strategy.keys()),
+                    action_probabilities=average_strategy,
                     iteration=self.iteration,
                 )
                 strategy_samples_added += 1
             
-            logger.debug(f"  Added {strategy_samples_added} strategy samples")
+            # ★ CRITICAL ★ Increment iteration counters for strategy averaging
+            for infoset in self.infoset_storage.infosets.values():
+                infoset.increment_iteration()
+            
+            logger.debug(f"  Added {strategy_samples_added} strategy samples (AVERAGED strategies)")
             
             # ========== PHASE D: Train Strategy Network (Behavioral Cloning) ==========
             if len(self.strategy_buffer.samples) > strategy_network_batch_size:

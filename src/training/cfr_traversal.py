@@ -212,12 +212,26 @@ class MCCFRTraversal:
             for action in legal_actions:
                 regret = action_values[action] - avg_value
                 
-                # Scale regret by reach probability of opponent reaching this state
+                # ★ AUDIT FIX #2.5 ★: Scale regret by reach probability of opponent reaching this state
                 # (only opponent's actions affect counterfactual probability)
+                # 
+                # In pure CFR with explicit game tree: reach probability is exact
+                # In Deep CFR with card abstraction: reach probability should be weighted by bucket
+                #
+                # Formula (heads-up):
+                #   counterfactual_regret = regret(a) * π_{-i}(reach this state)
+                #
+                # where π_{-i} = product of opponent actions that led to this state
+                # Stored in reach_probs[1-current_player]
+                
                 opposing_reach_prob = reach_probs.get(1 - current_player, 1.0)
                 scaled_regret = regret * opposing_reach_prob
                 
-                # Store regret
+                # TODO: If using card abstraction buckets, also weight by P(concrete | bucket)
+                # bucket_weight = get_bucket_weight(infoset_id, action)
+                # weighted_regret = scaled_regret * bucket_weight
+                
+                # Store regret (unweighted by importance, per AUDIT FIX #1)
                 self.infoset_storage.add_regret(
                     infoset_id=infoset_id,
                     action=action,

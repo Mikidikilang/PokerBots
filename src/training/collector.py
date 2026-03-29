@@ -58,12 +58,14 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-_FOLD       = 0
-_CHECK_CALL = 1
-_MIN_RAISE  = 2
-_ALL_IN     = 9   # [Action Space Fix] shifted from 8; includes new RAISE_THIRD_POT (3)
+_FOLD        = 0
+_CHECK       = 1
+_CALL        = 2
+_MIN_RAISE   = 3
+_ALL_IN      = 11   # [Action Space Fix] Now 12 buckets: FOLD(0), CHECK(1), CALL(2), MIN_RAISE(3), ..., ALL_IN(11)
+_PASSIVE_ACTIONS: frozenset[int] = frozenset({_FOLD, _CHECK, _CALL})  # Passive actions (no aggressive raise)
 _RAISE_ACTIONS: frozenset[int] = frozenset(range(_MIN_RAISE, _ALL_IN + 1))
-# = {2, 3, 4, 5, 6, 7, 8, 9} — includes the new 33% pot block bet (index 3)
+# = {3, 4, 5, 6, 7, 8, 9, 10, 11} — all raise sizes and all-in
 
 
 @runtime_checkable
@@ -534,7 +536,7 @@ def _build_hand_record(
     three_bet = any(a in _RAISE_ACTIONS for a in preflop_actions) and pf_raises_before >= 1
 
     total_aggressive = sum(1 for a in actions if a in _RAISE_ACTIONS)
-    total_passive    = sum(1 for a in actions if a == _CHECK_CALL)
+    total_passive    = sum(1 for a in actions if a in _PASSIVE_ACTIONS)
     total_folds      = sum(1 for a in actions if a == _FOLD)
 
     safe_bb   = max(big_blind, 1e-6)

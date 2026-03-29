@@ -29,6 +29,8 @@ venv/
 .pytest_cache/
 .coverage
 htmlcov/
+coverage.xml
+*.cover
 
 # =========================
 # IDE / Szerkesztő / OS fájlok
@@ -36,7 +38,10 @@ htmlcov/
 .vscode/
 .idea/
 *.swp
+*.swo
+*~
 .DS_Store
+Thumbs.db
 
 # =========================
 # Projekt specifikus (PokerBots ML/AI)
@@ -46,9 +51,27 @@ checkpoints/
 *.pt
 *.pth
 *.safetensors
+models/
+model_cache/
+
+# Hugging Face / Model Hub
+hf_cache/
+.cache/
 
 # Log fájlok és tréning kimenetek
 logs/
 *.log
+training_logs/
+wandb/
 
-config_test.yaml
+# Kaggle / Training artifacts
+kaggle_submissions/
+*.csv  # Except if explicitly tracked
+
+# Temp / Development
+*.tmp
+*.temp
+.ipynb_checkpoints/
+
+# Config - Keep only production config
+config_test.yaml  # Tests use their own config

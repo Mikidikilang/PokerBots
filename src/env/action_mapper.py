@@ -215,7 +215,8 @@ class ActionMapper:
         """Inicializálja az ActionMapper-t."""
         self._action_names: dict[PokerAction, str] = {
             PokerAction.FOLD: "Fold",
-            PokerAction.CHECK_CALL: "Check/Call",
+            PokerAction.CHECK: "Check",
+            PokerAction.CALL: "Call",
             PokerAction.MIN_RAISE: "Min-Raise",
             PokerAction.RAISE_QUARTER_POT: "Raise 0.25x Pot",
             PokerAction.RAISE_THIRD_POT: "Raise 0.33x Pot",
@@ -266,16 +267,42 @@ class ActionMapper:
                 description="Fold — A játékos feladja a leosztást.",
             )
 
-        if action == PokerAction.CHECK_CALL:
+        if action == PokerAction.CHECK:
+            # CHECK: only valid if amount_to_call == 0
+            if context.amount_to_call == 0:
+                return ResolvedAction(
+                    action=PokerAction.CHECK,
+                    amount=0.0,
+                    description="Check — A játékos passzív lépést választ.",
+                )
+            else:
+                # Invalid CHECK with outstanding bet → fallback to CALL
+                logger.debug(
+                    "CHECK kérés amount_to_call > 0 mellett → CALL-ra visszaváltás"
+                )
+                call_amount: float = min(context.amount_to_call, context.my_stack)
+                return ResolvedAction(
+                    action=PokerAction.CALL,
+                    amount=call_amount,
+                    description=f"Call — {call_amount:.0f} chip",
+                )
+
+        if action == PokerAction.CALL:
+            # CALL: any amount_to_call, but fallback to CHECK if no bet
             call_amount: float = min(context.amount_to_call, context.my_stack)
-            verb: str = "Check" if context.amount_to_call == 0 else "Call"
+            if call_amount == 0:
+                return ResolvedAction(
+                    action=PokerAction.CHECK,
+                    amount=0.0,
+                    description="Check — A játékos passzív lépést választ.",
+                )
             return ResolvedAction(
-                action=PokerAction.CHECK_CALL,
+                action=PokerAction.CALL,
                 amount=call_amount,
-                description=f"{verb} — {call_amount:.0f} chip",
+                description=f"Call — {call_amount:.0f} chip",
             )
 
-        if action == PokerAction.ALL_IN:  # index 9 (was 8)
+        if action == PokerAction.ALL_IN:  # index 11
             return ResolvedAction(
                 action=PokerAction.ALL_IN,
                 amount=context.my_stack,
@@ -328,9 +355,9 @@ class ActionMapper:
         """Meghatározza a jelenlegi játékszituációban legális akciók listáját.
 
         Szabályok:
-            - Fold: Mindig legális (kivéve ha Check is lehetséges, de
-              stratégiailag a hálózat dönt)
-            - Check/Call: Mindig legális
+            - Fold: Mindig legális
+            - Check: Legális ha amount_to_call == 0
+            - Call: Legális ha amount_to_call > 0
             - Emelések: Csak ha a stack elegendő a minimális emeléshez
             - All-in: Mindig legális, ha van chip a stackben
 
@@ -342,9 +369,14 @@ class ActionMapper:
         """
         legal: list[PokerAction] = []
 
-        # Fold és Check/Call mindig elérhetők
+        # Fold mindig legális
         legal.append(PokerAction.FOLD)
-        legal.append(PokerAction.CHECK_CALL)
+        
+        # CHECK vagy CALL: kontextustól függő
+        if context.amount_to_call == 0:
+            legal.append(PokerAction.CHECK)
+        else:
+            legal.append(PokerAction.CALL)
 
         # Emelések: csak ha van elég chip a minimális emeléshez
         remaining_after_call: float = context.my_stack - context.amount_to_call
