@@ -289,7 +289,7 @@ class RolloutBuffer:
 
         # Advantage normalizalas (zero-mean, unit-variance)
         adv_mean: float = float(self._advantages.mean().item())
-        adv_std: float = float(self._advantages.std().item()) + 1e-8
+        adv_std: float = max(float(self._advantages.std().item()), 0.1) + 1e-8
         self._advantages = (self._advantages - adv_mean) / adv_std
 
         logger.info(

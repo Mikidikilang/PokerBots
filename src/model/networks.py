@@ -698,23 +698,18 @@ class PokerActorCritic(nn.Module):
             torch.tensor(mask_value, dtype=logits.dtype, device=logits.device),
         )
 
-        # Biztonsági ellenőrzés: üres maszk -> Fold kényszerítés
+        # Biztonsági ellenőrzés: üres maszk -> ValueError
         valid_count: torch.Tensor = action_mask.sum(dim=-1)
         if (valid_count == 0).any():
             empty_rows = valid_count == 0
             n_empty = int(empty_rows.sum().item())
-            logger.error(
-                "KRITIKUS: %d minta üres maszkkal! Fold (index 0) kényszerítve.",
+            logger.critical(
+                "KRITIKUS: %d minta üres maszkkal! Ez egy parseléshiba vagy környezet inkonzisztencia.",
                 n_empty,
             )
-            action_mask = action_mask.clone()
-            action_mask[empty_rows, 0] = 1.0
-            masked_logits = torch.where(
-                action_mask.bool(),
-                logits,
-                torch.tensor(
-                    mask_value, dtype=logits.dtype, device=logits.device
-                ),
+            raise ValueError(
+                f"Empty action mask detected for {n_empty} samples. "
+                "This indicates a parsing failure or environment inconsistency in RTA/inference context."
             )
 
         # Numerikusan stabil Softmax -> valószínűség eloszlás

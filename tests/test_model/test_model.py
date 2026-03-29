@@ -48,7 +48,7 @@ class TestNetworkConfig:
             from src.model.networks import NetworkConfig
             num_players = sample_config["environment"]["num_players"]
             cfg = NetworkConfig.from_dict(sample_config, num_players=num_players)
-            assert cfg.num_actions == 9
+            assert cfg.num_actions == 11
             assert cfg.card_input_dim == 52
             assert cfg.position_dim == num_players
             assert cfg.env_metrics_dim == 4 + (num_players - 1)
@@ -85,7 +85,7 @@ class TestNetworkConfig:
     def test_action_space_matches_network_output(self, sample_config: dict) -> None:
         """Az akciok szama egyezik a halozat kimenetevel."""
         num_actions = sample_config["environment"]["action_space"]["num_actions"]
-        assert num_actions == 9
+        assert num_actions == 11
 
 
 # =============================================================================

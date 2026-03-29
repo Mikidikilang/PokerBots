@@ -26,6 +26,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from src.env.action_mapper import PokerAction
+
 logger = logging.getLogger(__name__)
 
 
@@ -111,6 +113,20 @@ class RewardShaper:
         )
 
     # =========================================================================
+    # Position-Weight Mapping for Positional Aggression Bonus
+    # =========================================================================
+    # In 6-max: seats are [BTN=5, CO=4, HJ=3, MP=2, LP=1, SB=0]
+    # Higher seat indexing = closer to button = better position
+    _POSITION_WEIGHTS = {
+        "BTN": 1.0,   # Seat 5
+        "CO": 1.0,    # Seat 4
+        "HJ": 0.7,    # Seat 3
+        "MP": 0.3,    # Seat 2
+        "LP": 0.3,    # Seat 1
+        "SB": 0.3,    # Seat 0
+    }
+
+    # =========================================================================
     # Fo Jutalom Formatas
     # =========================================================================
 
@@ -123,6 +139,7 @@ class RewardShaper:
         hand_strength: float = 0.5,
         lost_showdown: bool = False,
         is_preflop_raise: bool = False,
+        position: str | None = None,
         street: int = 0,
     ) -> float:
         """A nyers jutalmat modositja a patologia-korrigalo tagokkal.
@@ -130,16 +147,17 @@ class RewardShaper:
         A formula:
             R_mod = R_base
                   - lambda * bluff_intensity * I(lost_showdown)
-                  + bonus * I(preflop_raise)
+                  + bonus * position_weight * I(preflop_raise)
 
         Args:
             base_reward: A kornyezet altal adott nyers jutalom (chip EV).
-            action_index: Az agens altal valasztott akcio (0-8).
+            action_index: Az agens altal valasztott akcio (0-9).
             bet_amount: A tet merete absolut chip ertekben.
             pot_size: A pot aktualis merete (a bloff intenzitas szamitashoz).
             hand_strength: A kez ereje [0.0, 1.0] (equity proxy).
             lost_showdown: True ha az agens vesztett a showdown-ban.
             is_preflop_raise: True ha pre-flop emelest hajtott vegre.
+            position: Pozicio nev ("BTN", "CO", "HJ", "MP", "LP", "SB").
             street: A leosztas fazisa (0=preflop, 1=flop, stb.).
 
         Returns:
@@ -169,16 +187,20 @@ class RewardShaper:
                         penalty, base_reward, modified_reward,
                     )
 
-        # === Passzivitas Bonus ===
+        # === Positionally-Weighted Aggression Bonus ===
         if self.config.preflop_aggression_bonus > 0.0 and is_preflop_raise:
-            bonus = self.config.preflop_aggression_bonus
+            # Get position weight (default to 0.3 if position not recognized)
+            position_weight: float = self._POSITION_WEIGHTS.get(position or "SB", 0.3)
+            bonus = self.config.preflop_aggression_bonus * position_weight
             modified_reward += bonus
             self._total_bonuses += bonus
 
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
-                    "Agresszio bonus: +%.4f, reward: %.4f -> %.4f",
-                    bonus, base_reward, modified_reward,
+                    "Pozicionalt agresszio bonus: position=%s, weight=%.2f, bonus=%.4f, "
+                    "reward: %.4f -> %.4f",
+                    position or "unknown", position_weight, bonus,
+                    base_reward, modified_reward,
                 )
 
         return modified_reward
@@ -214,8 +236,8 @@ class RewardShaper:
         bet_ratio: float = bet_amount / pot_size
         weakness: float = max(0.0, 1.0 - hand_strength)
 
-        # All-in (index 8) extra sulyozast kap
-        if action_index == 8:
+        # All-in extra sulyozast kap
+        if action_index == PokerAction.ALL_IN.value:
             bet_ratio = max(bet_ratio, 2.0)
 
         intensity: float = bet_ratio * weakness

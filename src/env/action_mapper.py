@@ -12,17 +12,18 @@ Ez a modul egy 9-dimenziós diszkretizált akcióteret implementál, amely:
     3. Érvényesíti a legális akciók maszkját a Softmax logitok szintjén
     4. Kezeli az edge case-eket (nem elegendő stack, minimum raise szabály)
 
-Akció Index Tábla (10 diszkrét akció):
+Akció Index Tábla (11 diszkrét akció):
     0 = Fold (Dobás)
     1 = Check / Call (Passz / Megadás)
     2 = Min-Raise (Legkisebb legális emelés)
-    3 = Raise 0.33x Pot (GTO range bet / block bet)
-    4 = Raise 0.5x Pot
-    5 = Raise 0.75x Pot
-    6 = Raise 1.0x Pot
-    7 = Raise 1.5x Pot (Overbet)
-    8 = Raise 2.0x Pot (Deep Overbet)
-    9 = All-in (Teljes stack betolás)
+    3 = Raise 0.25x Pot (25% pot — early position sizing)
+    4 = Raise 0.33x Pot (GTO range bet / block bet)
+    5 = Raise 0.5x Pot
+    6 = Raise 0.75x Pot
+    7 = Raise 1.0x Pot
+    8 = Raise 1.5x Pot (Overbet)
+    9 = Raise 2.0x Pot (Deep Overbet)
+    10 = All-in (Teljes stack betolás)
 
 Hivatkozások:
     - Specifikáció: Akciótér szekció (9 diszkrét akció)
@@ -47,39 +48,42 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 class PokerAction(IntEnum):
-    """A diszkretizált akciótér 10 lehetséges lépésének enumerációja.
+    """A diszkretizált akciótér 11 lehetséges lépésének enumerációja.
 
     Minden akció egy egyértelmű indexet kap, amelyet a Softmax kimeneti
     réteg valószínűségi eloszlásként ad vissza.
 
-    Action space (10 buckets — checkpoint-breaking change from v0.3.x):
+    Action space (11 buckets — checkpoint-breaking change):
         0  Fold
         1  Check / Call
         2  Min-Raise
-        3  Raise 0.33x Pot  ← NEW: GTO range bet / block bet bucket (Priority-3 fix)
-        4  Raise 0.50x Pot
-        5  Raise 0.75x Pot
-        6  Raise 1.0x Pot
-        7  Raise 1.5x Pot   (overbet)
-        8  Raise 2.0x Pot   (deep overbet)
-        9  All-in
+        3  Raise 0.25x Pot  ← NEW: 25% pot early position sizing
+        4  Raise 0.33x Pot  (GTO range bet / block bet)
+        5  Raise 0.50x Pot
+        6  Raise 0.75x Pot
+        7  Raise 1.0x Pot
+        8  Raise 1.5x Pot   (overbet)
+        9  Raise 2.0x Pot   (deep overbet)
+        10 All-in
     """
 
     FOLD = 0
     CHECK_CALL = 1
     MIN_RAISE = 2
-    RAISE_THIRD_POT = 3          # NEW — 33% pot block/range bet
-    RAISE_HALF_POT = 4
-    RAISE_THREE_QUARTER_POT = 5
-    RAISE_FULL_POT = 6
-    RAISE_1_5X_POT = 7
-    RAISE_2X_POT = 8
-    ALL_IN = 9
+    RAISE_QUARTER_POT = 3              # NEW — 25% pot early position sizing
+    RAISE_THIRD_POT = 4                # 33% pot block/range bet
+    RAISE_HALF_POT = 5
+    RAISE_THREE_QUARTER_POT = 6
+    RAISE_FULL_POT = 7
+    RAISE_1_5X_POT = 8
+    RAISE_2X_POT = 9
+    ALL_IN = 10
 
 
 # Pot-relatív szorzók az emelési akciókhoz
 _RAISE_MULTIPLIERS: dict[PokerAction, float] = {
-    PokerAction.RAISE_THIRD_POT: 0.33,            # block bet / range bet
+    PokerAction.RAISE_QUARTER_POT: 0.25,           # NEW — 25% pot early position sizing
+    PokerAction.RAISE_THIRD_POT: 0.33,             # block bet / range bet
     PokerAction.RAISE_HALF_POT: 0.50,
     PokerAction.RAISE_THREE_QUARTER_POT: 0.75,
     PokerAction.RAISE_FULL_POT: 1.00,
@@ -87,8 +91,8 @@ _RAISE_MULTIPLIERS: dict[PokerAction, float] = {
     PokerAction.RAISE_2X_POT: 2.00,
 }
 
-NUM_ACTIONS: int = 10
-"""Az akciótér teljes dimenziója (10 — expanded from 9 with 0.33x pot block bet)."""
+NUM_ACTIONS: int = 11
+"""Az akciótér teljes dimenziója (11 — expanded from 10 with 0.25x pot)."""
 
 ILLEGAL_ACTION_LOGIT: float = -1.0e8
 """Az illegális akciók logitjaihoz hozzáadott extrém negatív szám.
@@ -202,6 +206,7 @@ class ActionMapper:
             PokerAction.FOLD: "Fold",
             PokerAction.CHECK_CALL: "Check/Call",
             PokerAction.MIN_RAISE: "Min-Raise",
+            PokerAction.RAISE_QUARTER_POT: "Raise 0.25x Pot",
             PokerAction.RAISE_THIRD_POT: "Raise 0.33x Pot",
             PokerAction.RAISE_HALF_POT: "Raise 0.5x Pot",
             PokerAction.RAISE_THREE_QUARTER_POT: "Raise 0.75x Pot",

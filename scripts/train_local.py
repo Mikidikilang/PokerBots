@@ -13,18 +13,6 @@ Lokalis Training CLI Belepesi Pont (train_local.py).
          env.set_active_opponent() so the correct bot is in place for
          the NEXT rollout.
 
-[FIX P1-A — 2025-03-28] Average-strategy network added (NFSP).
-
-    A second network avg_network is kept as an exponential moving average
-    of the best-response network:
-        α  = 1 / max(iteration, 1)   (time-decaying, exact FSP average)
-        avg_p ← lerp(avg_p, br_p, α)
-
-    This is the minimal NFSP implementation that prevents the RPS cycling
-    (rock-paper-scissors dynamics) in Phase 2 self-play.  The avg_network
-    is registered as a NeuralOpponentAgent ("avg_strategy") in the
-    opponent pool so Phase 2 can sample from it.
-
 [FIX R-1 — 2025-03-28] DDP Checkpoint Deadlock fixed in on_checkpoint.
 [FIX C-2 — 2025-03-28] Shutdown signal broadcast to all DDP ranks.
 [FIX H-1 — 2025-03-28] _session_start captured BEFORE build_training_pipeline().
@@ -34,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import datetime
 import logging
 import os
 import sys
@@ -203,7 +192,6 @@ def build_training_pipeline(
     """Assemble the full training pipeline.
 
     [FIX P0-A] Creates an OpponentPool and wires it into the environment.
-    [FIX P1-A] Creates an average-strategy network for NFSP convergence.
 
     Args:
         start_time: Monotonic clock captured BEFORE this call. [FIX H-1]
@@ -295,42 +283,13 @@ def build_training_pipeline(
         )
 
     # =========================================================================
-    # [FIX P1-A] Average-Strategy Network (NFSP)
-    # =========================================================================
-    # We maintain a second network whose parameters are the time-average of
-    # all past best-response networks.  This implements Fictitious Self-Play
-    # (Heinrich & Silver 2015) at the weight level: the average strategy
-    # cannot be exploited by any single counter-strategy, so Phase-2
-    # training converges toward Nash instead of cycling.
-    #
-    # The EMA update in on_iteration_end():
-    #     α = 1 / max(iteration, 1)       (exact FSP time-average)
-    #     avg_p ← lerp(avg_p, br_p, α)
+    # Network Extraction
     # =========================================================================
     _base_net = (
         network.module
         if isinstance(network, torch.nn.parallel.DistributedDataParallel)
         else network
     )
-    avg_network = copy.deepcopy(_base_net)
-    avg_network.eval()
-    for p in avg_network.parameters():
-        p.requires_grad_(False)
-    logger.info("[P1-A] Average-strategy network created (NFSP)")
-
-    # Register avg_network as a NeuralOpponentAgent in the pool so that
-    # Phase-2 FSP opponent sampling can use it.
-    from src.training.opponent_pool import NeuralOpponentAgent
-    # Build a fresh obs_builder for the avg agent (no state shared with hero)
-    avg_obs_builder = ObservationBuilder(obs_config)
-    avg_agent = NeuralOpponentAgent(
-        name="avg_strategy",
-        network=avg_network,
-        obs_builder=avg_obs_builder,
-        device=device,
-    )
-    opponent_pool.archetypes["avg_strategy"] = avg_agent
-    logger.info("[P1-A] avg_strategy agent registered in OpponentPool")
 
     # --- Config objects ---
     from src.training.buffer import RolloutBufferConfig
@@ -380,33 +339,6 @@ def build_training_pipeline(
             network.load_state_dict(model_state_dict)
             start_iteration = resumed_iteration
             orchestrator_state = checkpoint_to_resume.get("orchestrator_state", {})
-
-            # [P1-A] Restore avg_network from its dedicated file (saved
-            # alongside every main checkpoint as avg_network_latest.pt).
-            ckpt_dir = Path(
-                cfg.get("mlops", {})
-                .get("checkpoint", {})
-                .get("local_checkpoint_dir", "checkpoints")
-            )
-            avg_latest = ckpt_dir / "avg_network_latest.pt"
-            if avg_latest.exists():
-                try:
-                    avg_state = torch.load(
-                        str(avg_latest), map_location=device, weights_only=True
-                    )
-                    avg_network.load_state_dict(avg_state)
-                    logger.info("[P1-A] avg_network restored from %s", avg_latest)
-                except Exception as avg_exc:
-                    logger.warning(
-                        "[P1-A] avg_network restore failed (%s); "
-                        "starting from fresh deepcopy of main network.",
-                        avg_exc,
-                    )
-            else:
-                logger.info(
-                    "[P1-A] No avg_network_latest.pt found; "
-                    "avg_network stays as fresh deepcopy."
-                )
 
             logger.info("✓ RESUME SUCCESSFUL: iteration=%d", start_iteration)
         else:
@@ -627,33 +559,6 @@ def build_training_pipeline(
                     _ddp_opponent_state["selected_idx"], opp_name,
                 )
 
-        # =====================================================================
-        # [FIX P1-A] Update average-strategy network via EMA (NFSP).
-        #
-        # α = 1 / max(iteration, 1) implements the exact FSP time-average:
-        #     σ̄(t) = (1/t) Σ_{k=1}^t σ(k)
-        # which can be written as the recursive update:
-        #     σ̄(t) = (1 - 1/t) * σ̄(t-1) + (1/t) * σ(t)
-        #
-        # This runs on rank 0 only.  All gradient operations are disabled.
-        # =====================================================================
-        if rank == 0:
-            actual_net = (
-                network.module
-                if isinstance(network, torch.nn.parallel.DistributedDataParallel)
-                else network
-            )
-            ema_alpha = 1.0 / max(float(iteration), 1.0)
-            with torch.no_grad():
-                for avg_p, br_p in zip(
-                    avg_network.parameters(), actual_net.parameters()
-                ):
-                    avg_p.data.lerp_(br_p.data, ema_alpha)
-            logger.debug(
-                "[P1-A] avg_network EMA updated: α=%.6f (iter=%d)",
-                ema_alpha, iteration,
-            )
-
         # Shutdown check (rank 0 only)
         if rank == 0 and shutdown_monitor is not None:
             if shutdown_monitor.should_shutdown():
@@ -703,7 +608,7 @@ def build_training_pipeline(
         # stored in _ddp_opponent_state["selected_idx"]. Broadcast it and
         # set on each rank's environment.
         opponent_idx_tensor = torch.tensor(
-            [float(_ddp_opponent_state.get("selected_idx", _FSP_SENTINEL_IDX))],
+            [int(_ddp_opponent_state.get("selected_idx", _FSP_SENTINEL_IDX))],
             dtype=torch.long,
             device=device,
         )
@@ -744,28 +649,6 @@ def build_training_pipeline(
                 rng_states: dict[str, Any] = RNGStateManager.capture_states(
                     dataloader_generator=dl_generator
                 )
-
-                # [P1-A] Save avg_network state separately.
-                # StateManager.save_training_state() has a fixed signature and
-                # does not accept arbitrary extra keys, so we persist the
-                # average-strategy network to a dedicated file alongside the
-                # main checkpoint.  A single "latest" file is sufficient — we
-                # only ever need to resume from the most recent avg state.
-                try:
-                    avg_ckpt_dir = Path(
-                        ckpt_cfg.get("local_checkpoint_dir", "checkpoints")
-                    )
-                    avg_ckpt_dir.mkdir(parents=True, exist_ok=True)
-                    avg_tmp  = avg_ckpt_dir / "avg_network_latest.pt.tmp"
-                    avg_path = avg_ckpt_dir / "avg_network_latest.pt"
-                    torch.save(avg_network.state_dict(), str(avg_tmp))
-                    os.replace(str(avg_tmp), str(avg_path))   # atomic (SIGKILL-safe)
-                    logger.info("[P1-A] avg_network saved: %s", avg_path)
-                except Exception as avg_exc:
-                    logger.error(
-                        "[P1-A] avg_network save failed at iter %d: %s",
-                        iteration, avg_exc,
-                    )
 
                 state_manager.save_training_state(
                     network=net,
@@ -872,7 +755,6 @@ def build_training_pipeline(
     return {
         "runner":           runner,
         "network":          network,
-        "avg_network":      avg_network,    # [P1-A] average-strategy network
         "opponent_pool":    opponent_pool,  # [P0-A] wired opponent pool
         "orchestrator":     orchestrator,
         "state_manager":    state_manager,
@@ -981,8 +863,15 @@ def main() -> None:
                 pipeline["monitor"].finish()
 
         if world_size > 1:
+            # Wrap barrier with timeout to prevent deadlock
             try:
-                dist.barrier()
+                dist.barrier(timeout=datetime.timedelta(minutes=5))
+            except Exception as e:
+                if rank == 0:
+                    logger.warning("[Rank %d] dist.barrier() timed out: %s", rank, e)
+            
+            # Separate try/except for process group destruction
+            try:
                 dist.destroy_process_group()
                 if rank == 0:
                     logger.info("DDP process group destroyed cleanly.")

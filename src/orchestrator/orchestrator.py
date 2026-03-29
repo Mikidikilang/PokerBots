@@ -121,7 +121,7 @@ class AutoAdaptiveOrchestrator:
         self._intervention_count: int = 0
         self._last_anomalies: list[str] = []
         self._last_intervention_iter: int = -1000
-        self._intervention_cooldown: int = 10
+        self._intervention_cooldown: int = 50
         self._max_entropy_coef: float = 0.1
 
         logger.info(
@@ -191,8 +191,8 @@ class AutoAdaptiveOrchestrator:
 
         metrics: dict[str, float] = self.telemetry.get_current_metrics()
 
-        if metrics["hands_in_window"] < 1000:
-            logger.debug("Orchestrator: nincs eleg adat (<%d hands), kihagyas.", 1000)
+        if metrics["hands_in_window"] < 5000:
+            logger.debug("Orchestrator: nincs eleg adat (<%d hands), kihagyas.", 5000)
             return result
 
         anomalies: list[str] = self.telemetry.detect_anomalies(

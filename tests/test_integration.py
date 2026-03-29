@@ -39,7 +39,7 @@ class TestConfigIntegrity:
         assert gto["6"]["vpip"][1] > gto["9"]["vpip"][1]
 
     def test_action_space_consistency(self, sample_config: dict) -> None:
-        assert sample_config["environment"]["action_space"]["num_actions"] == 9
+        assert sample_config["environment"]["action_space"]["num_actions"] == 11
 
     def test_ppo_params_valid(self, sample_config: dict) -> None:
         ppo = sample_config["ppo"]
@@ -72,7 +72,7 @@ class TestCrossModuleWiring:
             from src.model.networks import NetworkConfig
             num_players = sample_config["environment"]["num_players"]
             net_cfg = NetworkConfig.from_dict(sample_config, num_players=num_players)
-            assert net_cfg.num_actions == 9
+            assert net_cfg.num_actions == 11
             assert net_cfg.card_input_dim == 52
             assert net_cfg.trunk_input_dim == (
                 net_cfg.card_embed_dim * 2 + net_cfg.context_embed_dim + net_cfg.history_embed_dim

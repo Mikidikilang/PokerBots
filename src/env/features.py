@@ -75,20 +75,23 @@ ACTION_DIM_V2: int = 11
 """Intermediate extended dimension: hero indicator + street (no bet encoding).
 Used for loading checkpoints trained before the RTA-1 bet-size fix."""
 
-ACTION_DIM_EXTENDED: int = 12
-"""Full extended action feature dimension with player attribution, street, and bet size.
+ACTION_DIM_EXTENDED: int = 13
+"""Full extended action feature dimension with player attribution, street, bet size, and SPR.
 
-Layout of the 12 dimensions per betting-history step:
+Layout of the 13 dimensions per betting-history step:
 
-    Indices 0-8:  One-hot encoding of the action type  (9 dims — matches NUM_ACTIONS-1
-                  since All-in occupies the last one-hot slot even with 10 actions;
-                  raise type is captured, all-in is a separate class).
+    Indices 0-8:  One-hot encoding of the action type  (9 dims — FOLD, CHECK/CALL, and 7 raise buckets;
+                  All-in at index 10 is not one-hot encoded).
     Index 9:      Hero indicator (1.0 = hero's action, 0.0 = opponent's).
     Index 10:     Normalized street (0.00=preflop, 0.33=flop, 0.67=turn, 1.00=river).
     Index 11:     Normalized bet ratio: min(bet_amount / pot_before_action, 3.0) / 3.0
                   Captures bet sizing information critical for RTA opponent modelling.
                   0.0 = no bet/check, ~0.11 = min-raise, ~0.33 = pot-sized, 1.0 = 3x pot+.
                   [RTA-1 FIX — checkpoint-breaking change]
+    Index 12:     Normalized SPR (stack-to-pot ratio): min(SPR, 20.0) / 20.0
+                  Captures effective stacks relative to pot (0.0 = pushed-in, 1.0 = 20+ BB).
+                  Critical for deep-stack vs shallow-stack decision-making.
+                  [NEW — checkpoint-breaking change]
 """
 
 _STREET_NORMALIZATION: dict[int, float] = {
@@ -106,16 +109,17 @@ class ObservationConfig:
     action_feature_dim valid values:
         9  (ACTION_DIM_LEGACY)   — original, action type only
         11 (ACTION_DIM_V2)       — hero indicator + street (pre-RTA-1 checkpoints)
-        12 (ACTION_DIM_EXTENDED) — full: hero indicator + street + bet ratio [default]
+        12 (ACTION_DIM_EXTENDED) — full: hero indicator + street + bet ratio [old default]
+        13 (ACTION_DIM_EXTENDED) — full+SPR: hero + street + bet ratio + SPR [new default]
     """
 
     num_players:          int   = 6
     max_betting_actions:  int   = 18
-    action_feature_dim:   int   = ACTION_DIM_EXTENDED   # 12 (was 11 in v0.3.x)
+    action_feature_dim:   int   = ACTION_DIM_EXTENDED   # 13 (was 12 in v0.4.x)
     initial_stack_bb:     float = 200.0
     normalization_range:  tuple[float, float] = (0.0, 1.0)
-    use_extended_history: bool  = True    # enables dims 9 and 10
-    use_bet_encoding:     bool  = True    # [RTA-1] enables dim 11 (bet ratio)
+    use_extended_history: bool  = True    # enables dims 9, 10, 12
+    use_bet_encoding:     bool  = True    # enables dim 11 (bet ratio)
 
     def __post_init__(self) -> None:
         if not 2 <= self.num_players <= 9:
@@ -147,16 +151,16 @@ class ObservationBuilder:
     """Converts raw game state to a structured, normalized tensor dict.
 
     [FIX Y-1] get_observation_dim() and _encode_betting_history() updated
-    for the 11-dim extended history format.
+    for the 13-dim extended history format with SPR tracking.
 
-    6-Max, extended history (action_feature_dim=11):
+    6-Max, extended history (action_feature_dim=13):
         hole_cards:      52
         community_cards: 52
         env_metrics:      4 + (6-1) = 9
-        betting_history: 18 × 11   = 198   (was 162 with dim=9)
+        betting_history: 18 × 13   = 234   (was 216 with dim=12)
         position:         6
         ──────────────────────────────────
-        Total:           317                (was 281)
+        Total:           353                (was 335 with dim=12)
 
     [FIX H1] Chip normalization bounded to [0, 1] via 5x stack cap.
     """
@@ -267,14 +271,14 @@ class ObservationBuilder:
     def get_observation_dim(self) -> int:
         """Compute the flat observation dimension from current config.
 
-        With action_feature_dim=12 (default, 6-Max):
+        With action_feature_dim=13 (default, 6-Max):
             hole_cards:       52
             community_cards:  52
             env_metrics:       4 + (num_players - 1)  = 9
-            betting_history:  18 × 12                  = 216  (was 198 with dim=11)
+            betting_history:  18 × 13                  = 234  (was 216 with dim=12)
             position:          6
             ──────────────────────────────────────────────────
-            Total:            335                       (was 317 with dim=11)
+            Total:            353                       (was 335 with dim=12)
         """
         card_dim:     int = DECK_SIZE * 2
         metrics_dim:  int = 4 + (self.config.num_players - 1)
@@ -362,17 +366,19 @@ class ObservationBuilder:
     ) -> torch.Tensor:
         """Encode the hand's betting history into a fixed-size 2D tensor.
 
-        [FIX Y-1] When use_extended_history=True (action_feature_dim=11):
+        [FIX Y-1] When use_extended_history=True (action_feature_dim=13):
             - Columns 0-8: one-hot action type
             - Column 9:    hero indicator (1.0 = hero's action, 0.0 = opponent's)
             - Column 10:   normalized street (0.0=preflop, 0.33=flop, etc.)
+            - Column 11:   normalized bet ratio (bet / pot, capped at 3x)
+            - Column 12:   normalized SPR (stack / pot, capped at 20)
 
         When use_extended_history=False (action_feature_dim=9, legacy):
             - Columns 0-8 only — backward compatible with old checkpoints.
 
-        The "player" and "street" keys are emitted by the updated
-        RLCardWrapper.step() method. Old wrappers that don't emit them
-        produce correct but partial encodings (columns 9 and 10 = 0.0).
+        The "player", "street", "pot_before", and "spr_before" keys are emitted 
+        by the updated RLCardWrapper.step() method. Old wrappers that don't emit 
+        them produce correct but partial encodings (missing dimensions = 0.0).
 
         Args:
             history:   List of action dicts.
@@ -431,6 +437,16 @@ class ObservationBuilder:
                     # pot_before absent (legacy wrapper) — degrade gracefully
                     normalized_bet = 0.0
                 history_tensor[step_idx, 11] = normalized_bet
+
+            # ── Dimension 12: normalized SPR (Stack-to-Pot Ratio) ─────────
+            # [NEW] Encodes effective stack relative to pot at decision point.
+            # SPR = effective_stack / pot_before_action
+            # Normalized: min(SPR, 20.0) / 20.0 → [0, 1]
+            # Critical for deep-stack vs pushed-in decision making.
+            if action_dim >= 13:
+                spr_before = float(step.get("spr_before", 0.0))
+                normalized_spr = min(spr_before, 20.0) / 20.0
+                history_tensor[step_idx, 12] = normalized_spr
 
         if logger.isEnabledFor(logging.DEBUG):
             hero_actions: int = (

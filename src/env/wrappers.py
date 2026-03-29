@@ -118,14 +118,15 @@ class WrapperConfig:
 _FOLD        = 0
 _CHECK_CALL  = 1
 _MIN_RAISE   = 2
-_RAISE_THIRD = 3   # NEW — 33% pot block bet (Priority-3 fix)
-_RAISE_HALF  = 4
-_RAISE_75    = 5
-_RAISE_POT   = 6
-_RAISE_150   = 7
-_RAISE_2X    = 8
-_ALL_IN      = 9   # shifted from 8 (checkpoint-breaking)
-_N_RAISE_LEVELS: int = _RAISE_2X - _MIN_RAISE  # == 6 (was 5)
+_RAISE_QUARTER = 3   # NEW — 25% pot early position sizing
+_RAISE_THIRD = 4     # 33% pot block bet
+_RAISE_HALF  = 5
+_RAISE_75    = 6
+_RAISE_POT   = 7
+_RAISE_150   = 8
+_RAISE_2X    = 9
+_ALL_IN      = 10    # shifted from 9 (checkpoint-breaking)
+_N_RAISE_LEVELS: int = _RAISE_2X - _MIN_RAISE  # == 7 (was 6)
 
 
 # =============================================================================
@@ -245,6 +246,20 @@ class RLCardWrapper:
         n_public = len(raw.get("public_cards", []))
         self._current_street = _PUBLIC_CARDS_TO_STREET.get(n_public, 0)
 
+        # Calculate SPR (Stack-to-Pot Ratio) before the action
+        # SPR = effective_stack / pot_before_action
+        all_chips = self._extract_all_chips(raw)
+        while len(all_chips) < self.config.num_players:
+            all_chips.append(self.config.initial_stack)
+        
+        my_chips = float(all_chips[self._current_player_id])
+        opp_chips = float(all_chips[1 - self._current_player_id]) if self.config.num_players == 2 else max(
+            all_chips[i] for i in range(len(all_chips)) if i != self._current_player_id
+        )
+        effective_stack = min(my_chips, opp_chips)
+        pot_before = float(raw.get("pot", 0.0))
+        spr_before = effective_stack / pot_before if pot_before > 0.0 else 0.0
+
         self._hand_history.append({
             "action":     action,
             "amount":     chip_amount,
@@ -253,7 +268,10 @@ class RLCardWrapper:
             # [RTA-1 FIX] pot_before is the pot size BEFORE this action.
             # Required by ObservationBuilder dim-11 bet-ratio encoding.
             # Computed from raw obs state captured before env.step() is called.
-            "pot_before": float(raw.get("pot", 0.0)),
+            "pot_before": pot_before,
+            # [NEW] SPR (Stack-to-Pot Ratio) before this action.
+            # Used for opponent range assessment and bet sizing heuristics.
+            "spr_before": spr_before,
         })
 
         legal = self._current_state.get("legal_actions", {})
@@ -393,8 +411,8 @@ class RLCardWrapper:
         if not raise_ids:
             return sorted_ids[min(1, n - 1)]
 
-        # Map our raise indices (MIN_RAISE..RAISE_2X inclusive = 2..8) linearly
-        # onto RLCard's available raise slots. _ALL_IN (9) is handled above.
+        # Map our raise indices (MIN_RAISE..RAISE_2X inclusive = 2..9) linearly
+        # onto RLCard's available raise slots. _ALL_IN (10) is handled above.
         proportion = (action - _MIN_RAISE) / max(_RAISE_2X - _MIN_RAISE, 1)  # 0.0 -> 1.0
         mapped_idx = round(proportion * (len(raise_ids) - 1))
         mapped_idx = max(0, min(mapped_idx, len(raise_ids) - 1))
@@ -420,9 +438,11 @@ class RLCardWrapper:
         if n_raises >= 1:
             legal.add(_MIN_RAISE)
         if n_raises >= 2:
-            legal.add(_RAISE_THIRD)   # 33% pot block bet
+            legal.add(_RAISE_QUARTER)  # 25% pot early position sizing
+        if n_raises >= 2:
+            legal.add(_RAISE_THIRD)    # 33% pot block bet
         if n_raises >= 3:
-            legal.add(_RAISE_HALF)    # 50% pot
+            legal.add(_RAISE_HALF)     # 50% pot
         if n_raises >= 4:
             legal.add(_RAISE_75)
             legal.add(_RAISE_POT)
@@ -431,7 +451,7 @@ class RLCardWrapper:
         if n_raises >= 6:
             legal.add(_RAISE_2X)
         if n_raises >= 1 and my_chips > 0:
-            legal.add(_ALL_IN)        # index 9
+            legal.add(_ALL_IN)         # index 10
 
         return sorted(legal)
 
