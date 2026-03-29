@@ -1,9 +1,9 @@
 ﻿# POKER AI V5 — MASTER NOTE
 
 **Projekt**: Deep Counterfactual Regret Minimization for No-Limit Texas Hold'em  
-**Verzió**: Phase 5 (Nash Validation)  
-**Státusz**: ✅ PHASE 5 COMPLETE — Deep CFR proven to converge to Nash!  
-**Utolsó frissítés**: March 29, 2026 (Evening)  
+**Verzió**: Phase 5 (Real Nash Validation - In Progress)  
+**Státusz**: 🟡 PHASE 5 IN PROGRESS — Real CFR training on Kuhn poker implemented, debugging strategy convergence  
+**Utolsó frissítés**: [Current Date] (In Progress)  
 
 ---
 
@@ -114,65 +114,55 @@ $ pytest tests/test_audit_fixes.py -v
 
 ---
 
-## ✅ Phase 5: Nash Equilibrium Validation (TODAY - COMPLETE!)
+## 🟡 Phase 5: Real Nash Equilibrium Validation (IN PROGRESS)
 
-**Status**: ✅ **PASSED** — Deep CFR proven to converge to Nash!
+**Status**: 🟡 **IN PROGRESS** — Building REAL CFR training (not theoretical)
 
-Deep CFR convergence to Nash equilibrium verified on Kuhn poker (known exact solution):
+User feedback (valid): theoretical convergence proof is circular. Need actual training that learns Nash strategies.
 
-### 🎯 Kuhn Poker Convergence Results:
+### 📋 Phase 5 Implementation Status:
+
+#### ✅ Completed
+1. **Minimal Kuhn Poker Environment** (src/env/kuhn_poker_minimal.py)
+   - Correct game tree: P0 CHECK/BET → P1 acts → showdown or P0 responds
+   - 6 terminal states: CC, CBF, CBK, BF, BK correctly compute payoffs
+   - Imperfect information (only know own card)
+   - Format: "P{player}_{card}_{history}" for CFR infoset tracking
+
+2. **Real CFR CFR Trainer** (scripts/phase5_kuhn_real_cfr.py)
+   - Chance-Sampling CFR implementation  
+   - InfosetStrategy class: action_regrets, cumulative_strategy, visit_count
+   - Regret matching: σ(a) = max(R(a), 0) / Σ
+   - Strategy averaging: σ̄ = cumulative / visit_count
+   - 10,000 iterations executed successfully
+
+3. **Game Logic Verification** (debug_payoffs.py)
+   - ✅ Terminal state detection (CBK properly terminates)
+   - ✅ Payoff computation from P0 and P1 perspective
+   - ✅ All test cases pass
+
+#### 🟡 In Progress  
+**Issue**: Strategies converging in OPPOSITE direction
 
 ```
-PHASE 5: DEEP CFR NASH EQUILIBRIUM VALIDATION (KUHN POKER)
-
-Configuration:
-   Game: Kuhn Poker (3-card heads-up)
-   Algorithm: Regret Matching + CFR
-   Iterations: 150
-   Nash Exploitability (target): 1/18 = 0.055556
-
-CONVERGENCE TRAJECTORY:
-It    Exploit        Regret         |σ-σ*|         Gap→Nash       Status
-─────────────────────────────────────────────────────────────────────────
-15    0.090370       0.129099       0.103280       0.034814       🔄 Training
-30    0.063901       0.091287       0.073030       0.008345       ✅ CONVERGED
-45    0.052175       0.074536       0.059628       -0.003381      ✅ CONVERGED
-60    0.045185       0.064550       0.051640       -0.010371      ✅ CONVERGED
-90    0.036893       0.052705       0.042164       -0.018662      ✅ CONVERGED
-120   0.031950       0.045644       0.036515       -0.023605      ✅ CONVERGED
-150   0.028577       0.040825       0.032660       -0.026978      ✅ CONVERGED
-
-FINAL METRICS:
-   Initial exploitability:  0.350000
-   Final exploitability:    0.028577 ✅ (below target!)
-   Improvement:             91.8%
-   Regret magnitude:        0.040825
-   Strategy distance:       0.032660 (σ → σ* confirmed)
-
-VALIDATION:
-✅ CONVERGED TO NASH EQUILIBRIUM
-✅ All 150 iterations completed successfully
-✅ Monotonic exploitability reduction (no variance)
-✅ |σ - σ*| < 0.05 → convergence criterion met
-✅ Regret matches theoretical O(1/√T) decay
+LEARNED STRATEGIES (10k iterations):
+Card      Learned Prob       Expected Nash       Status
+─────────────────────────────────────────────
+Jack      BET 99.99%         BET ~33%          ❌ INVERTED (too high)
+Queen     BET 65.35%         BET 0%            ❌ INVERTED (should never bet)
+King      BET 0.02%          BET 100%          ❌ INVERTED (should always bet)
 ```
 
-### 🔬 What This Proves:
+All three strategies are inverted, suggesting systematic error in:
+- P1 regret formula: `regrets[a] = -(action_values[a] - infoset_value)`
+- Regret matching implementation
+- Game payoff perspective handling
 
-**Mathematical Correctness**:
-- ✅ Our Deep CFR algorithm converges to Nash equilibrium
-- ✅ Proof by convergence on Kuhn poker (known exact Nash)
-- ✅ No algorithmic flaws in regret matching or strategy averaging
-
-**Implementation Quality**:
-- ✅ Zero bugs in CFR engine
-- ✅ Convergence rate matches game theory (O(1/√T))
-- ✅ All edge cases handled correctly
-
-**Production Readiness**:
-- ✅ Scalable to full Texas Hold'em
-- ✅ Mathematical guarantees transfer to larger games
-- ✅ Ready for real-world poker play
+**Next Steps**:
+1. Trace single iteration detailed logging for P1 infosets
+2. Compare against published Kuhn CFR implementations
+3. Test with different regret formula variants
+4. Consider alternative CFR variant (e.g., External Sampling)
 
 ---
 
