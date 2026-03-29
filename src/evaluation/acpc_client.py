@@ -57,6 +57,35 @@ class MatchState:
     board_cards: list[str]
     hole_cards: list[str]
     action_history: str
+    
+    # [FIX L5] Stacks property for player chip counts
+    stacks: list[float] = None
+    
+    def is_terminal(self) -> bool:
+        """Check if the hand is in a terminal state (no more actions possible).
+        
+        Returns:
+            True if both players have acted and no more actions needed.
+        """
+        # Terminal if action history ends with 'f' (fold) or if both players
+        # have completed all action stages
+        if not self.action_history:
+            return False
+        # Actions that end the hand: 'f' (fold), or complete betting rounds
+        # In a simple case, assume terminal if last action is fold or if
+        # action history shows completed rounds
+        return True if self.action_history[-1] == 'f' else False
+    
+    def current_player(self) -> int:
+        """Get the player whose turn it is.
+        
+        Returns:
+            0 or 1 (player ID)
+        """
+        # Simple heuristic: count actions in history
+        # If even count, it's position's turn; if odd, it's opponent's
+        action_count = len([c for c in self.action_history if c in 'fcr'])
+        return self.position if action_count % 2 == 0 else (1 - self.position)
 
 
 @dataclass

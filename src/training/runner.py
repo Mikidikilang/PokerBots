@@ -33,6 +33,7 @@ from src.training.collector import RolloutCollector
 from src.training.trainer import PPOTrainer, TrainerConfig
 from src.training.cfr_adapter import CFRTrajectoryAdapter  # [PHASE 2.5B] CFR support
 from src.training.cfr_engine import CFREngine, CFRConfig    # [PHASE 2.5B] CFR support
+from src.evaluation.nash_evaluator import LocalBestResponseEvaluator, NashEvalConfig  # [PHASE 6] Oracle evaluation
 
 logger = logging.getLogger(__name__)
 
@@ -113,8 +114,12 @@ class TrainingRunner:
         if training_algorithm == "cfr":
             # [PHASE 2.5B] Instantiate Deep CFR engine
             cfr_config = CFRConfig.from_dict(yaml_config)
+            # [PHASE 3] Pass dynamic obs_dim from observation builder
+            # [FIX] Also pass num_actions from the network config
+            obs_dim = obs_builder.get_observation_dim()
+            num_actions = network.config.num_actions if hasattr(network, 'config') else 9
             self.trainer: CFREngine | PPOTrainer = CFREngine(
-                cfr_config, network, self.device
+                cfr_config, network, self.device, obs_dim=obs_dim, num_actions=num_actions
             )
             self.cfr_adapter = CFRTrajectoryAdapter()
         else:
@@ -145,6 +150,45 @@ class TrainingRunner:
         self._checkpoint_dir: str = checkpoint_dir
         self._should_stop: bool = False
         self._nan_error_occurred: bool = False
+        
+        # [PHASE 6] Oracle Best-Response Evaluator (optional periodic evaluation)
+        self.oracle_evaluator: LocalBestResponseEvaluator | None = None
+        self.oracle_eval_interval: int = yaml_config.get("evaluation", {}).get(
+            "oracle_eval_interval", 0  # 0 = disabled
+        )
+        if self.oracle_eval_interval > 0:
+            try:
+                from src.env.action_mapper import ActionMapper
+                from src.env.equity import EquityCalculator
+                
+                oracle_config = NashEvalConfig(
+                    eval_hands=yaml_config.get("evaluation", {}).get("oracle_hands", 20),
+                    target_pct=0.3,
+                    equity_iterations=yaml_config.get("evaluation", {}).get("equity_iterations", 500),
+                    model_deterministic=True,
+                    use_improved_ev=True,
+                )
+                
+                # Create EquityCalculator for oracle evaluator
+                equity_calc = EquityCalculator()
+                
+                self.oracle_evaluator = LocalBestResponseEvaluator(
+                    model=network,
+                    env=env,
+                    obs_builder=obs_builder,
+                    action_mapper=ActionMapper(),
+                    equity_calc=equity_calc,
+                    config=oracle_config,
+                    device=str(self.device),
+                )
+                logger.info(
+                    "[PHASE 6] Oracle evaluator initialized: eval every %d iters, %d hands",
+                    self.oracle_eval_interval,
+                    oracle_config.eval_hands,
+                )
+            except Exception as e:
+                logger.warning("[PHASE 6] Failed to initialize oracle evaluator: %s", e)
+                self.oracle_evaluator = None
 
         logger.info(
             "TrainingRunner inicializalva: device=%s, max_iter=%d, "
@@ -208,6 +252,28 @@ class TrainingRunner:
                             logger.info(
                                 "Eval iter #%d: %s", self.iteration, eval_result
                             )
+                
+                # [PHASE 6] Oracle evaluation (if enabled)
+                if (self.oracle_eval_interval > 0 
+                    and self.iteration % self.oracle_eval_interval == 0 
+                    and self.oracle_evaluator is not None):
+                    try:
+                        logger.info("[PHASE 6] Oracle evaluation starting (iter #%d)...", self.iteration)
+                        oracle_results = self.oracle_evaluator.run_evaluation()
+                        logger.info(
+                            "[PHASE 6] Oracle Results (iter #%d): "
+                            "MBB/hand=%.2f, Nash Distance=%.2f%%, Win Rate=%.1f%%",
+                            self.iteration,
+                            oracle_results.oracle_mbb_hand,
+                            oracle_results.nash_distance_pct,
+                            oracle_results.oracle_win_rate_pct,
+                        )
+                        # Log to iter_stats for monitoring
+                        iter_stats[f"oracle/mbb_hand"] = oracle_results.oracle_mbb_hand
+                        iter_stats[f"oracle/nash_distance_pct"] = oracle_results.nash_distance_pct
+                        iter_stats[f"oracle/win_rate_pct"] = oracle_results.oracle_win_rate_pct
+                    except Exception as e:
+                        logger.warning("[PHASE 6] Oracle evaluation failed: %s", e)
 
                 if self.iteration % self.config.save_interval == 0:
                     self._save_checkpoint()

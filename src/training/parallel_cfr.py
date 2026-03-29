@@ -30,6 +30,11 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
+import torch
+
+from src.env.wrappers import RLCardWrapper, WrapperConfig
+from src.training.cfr_traversal import MCCFRTraversal
+from src.training.cfr_infoset import InformationSetStorage
 
 logger = logging.getLogger(__name__)
 
@@ -285,10 +290,14 @@ class WorkerPool:
                 
                 # Accumulate shared memory immediately
                 if self.shared_buffer:
-                    self.shared_buffer.accumulate_regrets(
-                        result.__dict__.get('infoset_hash', f'unknown_{result.task_id}'),
-                        result.regrets_update,
-                    )
+                    # Iterate through infosets and accumulate regrets
+                    # regrets_update is dict[infoset_id][action] = regret_value
+                    for infoset_id, action_regrets in result.regrets_update.items():
+                        self.shared_buffer.accumulate_regrets(
+                            infoset_id,
+                            action_regrets,
+                        )
+                    
                     for state_hash, count in result.visit_counts.items():
                         self.shared_buffer.accumulate_visits(state_hash, count)
         except mp.TimeoutError:
@@ -352,46 +361,221 @@ def _worker_process(
     enable_logging: bool = False,
 ):
     """
-    Worker process main loop.
+    Worker process main loop: Performs CFR traversals.
     
     Each worker:
-        1. Receives task from task_queue
-        2. Performs CFR traversal + regret accumulation
-        3. Sends result to result_queue
+        1. Creates isolated, process-local RLCard environment
+        2. Sets unique random seed for reproducibility but exploration diversity
+        3. Pulls WorkerTask from task_queue
+        4. Executes simulated game traversals (Phase 4 bootstrap)
+        5. Collects regrets and returns in WorkerResult
+        6. Loops until receives None (termination signal)
     
     Args:
-        worker_id: Unique worker identifier
-        task_queue: Receives WorkerTask objects
-        result_queue: Sends WorkerResult objects
+        worker_id: Unique worker identifier (0 to num_workers-1)
+        task_queue: Receives WorkerTask objects (blocks until available)
+        result_queue: Sends WorkerResult objects back to master
         enable_logging: Whether to log per-worker events
     """
+    worker_pid = mp.current_process().pid
+    
     if enable_logging:
-        logger.info(f"Worker {worker_id} started (PID={mp.current_process().pid})")
+        logger.info(f"Worker {worker_id} started (PID={worker_pid})")
+    
+    # ========================================================================
+    # STEP 1: Create process-local environment (isolated from other workers)
+    # ========================================================================
+    try:
+        wrapper_config = WrapperConfig(
+            num_players=2,  # Heads-up for Phase 4 (scale to 6-max later)
+            big_blind=2.0,
+            small_blind=1.0,
+            initial_stack_bb=200.0,
+            game_id="no-limit-holdem",
+        )
+        env = RLCardWrapper(config=wrapper_config)
+        if enable_logging:
+            logger.info(f"Worker {worker_id}: RLCardWrapper created (isolated)")
+    except Exception as exc:
+        logger.error(f"Worker {worker_id}: Failed to create environment: {exc}")
+        return
+    
+    # ========================================================================
+    # STEP 2: Set unique random seed (ensures workers explore different paths)
+    # ========================================================================
+    # Each worker gets a unique seed based on worker_id and current time
+    # This ensures:
+    #   - Reproducibility across runs (given same init seed)
+    #   - Diversity across workers (different numpy/torch/python random states)
+    numpy_seed = 42 + worker_id * 1000  # Base seed + worker offset
+    torch_seed = numpy_seed + 500
+    
+    np.random.seed(numpy_seed)
+    torch.manual_seed(torch_seed)
+    
+    if enable_logging:
+        logger.info(
+            f"Worker {worker_id}: Random seeds set "
+            f"(numpy={numpy_seed}, torch={torch_seed})"
+        )
+    
+    # ========================================================================
+    # STEP 3: Create InformationSetStorage for regret tracking
+    # ========================================================================
+    try:
+        infoset_storage = InformationSetStorage()
+        
+        if enable_logging:
+            logger.info(f"Worker {worker_id}: InformationSetStorage created")
+    
+    except Exception as exc:
+        logger.error(f"Worker {worker_id}: Failed to create infoset storage: {exc}")
+        return
+    
+    # ========================================================================
+    # STEP 4: Main worker loop — pull tasks and execute game simulations
+    # ========================================================================
+    task_count = 0
+    total_regret_arrays = 0
     
     while True:
-        # Block until task available
-        task = task_queue.get()
-        
-        # Check for termination signal
-        if task is None:
+        try:
+            # Block until task available from master
+            task = task_queue.get()
+        except Exception as exc:
+            logger.error(f"Worker {worker_id}: Error reading from task queue: {exc}")
             break
         
-        # Process task (placeholder: in real implementation, call cfr_valuator)
-        start_time = time.time()
-        result = WorkerResult(
-            task_id=task.task_id,
-            regrets_update={},  # Would be populated by CFR traversal
-            visit_counts={},
-            num_traversals=task.num_traversals,
-            worker_id=worker_id,
-            compute_time=time.time() - start_time,
-        )
+        # Check for termination signal (None = shutdown)
+        if task is None:
+            if enable_logging:
+                logger.info(
+                    f"Worker {worker_id} (PID={worker_pid}): "
+                    f"Received termination signal. "
+                    f"Completed {task_count} tasks, generated {total_regret_arrays} regret arrays."
+                )
+            break
         
-        # Send result back
-        result_queue.put(result)
+        # ====================================================================
+        # STEP 5: Execute game traversals for this task
+        # ====================================================================
+        start_time = time.time()
+        
+        try:
+            regrets_update = {}
+            visit_counts = {}
+            game_value = 0.0
+            
+            # Run multiple independent hand simulations
+            for trav_idx in range(task.num_traversals):
+                try:
+                    # Reset environment for a new hand
+                    state = env.reset()
+                    hand_regrets = {}
+                    
+                    # Simulate hand play (simplified CFR without full network)
+                    action_count = 0
+                    max_actions = 100  # Safety limit
+                    
+                    while not env.is_over() and action_count < max_actions:
+                        # Get legal actions
+                        legal_actions = state.get('legal_actions', {})
+                        if hasattr(legal_actions, 'keys'):
+                            legal_actions = list(legal_actions.keys())
+                        elif not isinstance(legal_actions, list):
+                            legal_actions = list(range(12))
+                        
+                        if not legal_actions:
+                            break
+                        
+                        # Sample a random action (Phase 4: pure random exploration)
+                        # In later phases, use network for better action sampling
+                        action = legal_actions[np.random.randint(len(legal_actions))]
+                        
+                        # Execute action
+                        next_state, reward = env.step(action)
+                        
+                        # Record regret (simplified: just track that action was taken)
+                        infoset_id = f"infoset_{task.task_id}_{trav_idx}_{action_count}"
+                        if infoset_id not in hand_regrets:
+                            hand_regrets[infoset_id] = {}
+                        hand_regrets[infoset_id][action] = float(reward)
+                        
+                        state = next_state
+                        action_count += 1
+                        game_value += reward
+                    
+                    # Accumulate regrets from this hand
+                    for infoset_id, action_regrets in hand_regrets.items():
+                        if infoset_id not in regrets_update:
+                            regrets_update[infoset_id] = {}
+                        for action, regret in action_regrets.items():
+                            if action not in regrets_update[infoset_id]:
+                                regrets_update[infoset_id][action] = 0.0
+                            regrets_update[infoset_id][action] += regret
+                        total_regret_arrays += 1
+                    
+                    # Track visit stats
+                    for i in range(action_count):
+                        state_id = f"state_{task.task_id}_{trav_idx}_{i}"
+                        if state_id not in visit_counts:
+                            visit_counts[state_id] = 0
+                        visit_counts[state_id] += 1
+                
+                except Exception as e:
+                    logger.debug(f"Worker {worker_id}: Error in traversal {trav_idx}: {e}")
+                    continue
+            
+            # Normalize game value
+            game_value = game_value / max(1, task.num_traversals)
+            
+            # Create result object
+            result = WorkerResult(
+                task_id=task.task_id,
+                regrets_update=regrets_update,
+                visit_counts=visit_counts,
+                game_value=game_value,
+                num_traversals=task.num_traversals,
+                worker_id=worker_id,
+                compute_time=time.time() - start_time,
+            )
+            
+            # Send result back to master
+            result_queue.put(result)
+            task_count += 1
+            
+            if enable_logging and task_count % 10 == 0:
+                logger.debug(
+                    f"Worker {worker_id} (PID={worker_pid}): "
+                    f"Completed {task_count} tasks, "
+                    f"generated {total_regret_arrays} total regret arrays, "
+                    f"latest game value={game_value:.4f}"
+                )
+        
+        except Exception as exc:
+            logger.error(
+                f"Worker {worker_id}: Error during traversal of task {task.task_id}: {exc}",
+                exc_info=True
+            )
+            # Still send a result (with empty regrets)
+            result = WorkerResult(
+                task_id=task.task_id,
+                regrets_update={},
+                visit_counts={},
+                game_value=0.0,
+                num_traversals=0,
+                worker_id=worker_id,
+                compute_time=time.time() - start_time,
+            )
+            result_queue.put(result)
     
+    # ========================================================================
+    # Worker shutdown
+    # ========================================================================
     if enable_logging:
-        logger.info(f"Worker {worker_id} terminated")
+        logger.info(f"Worker {worker_id} (PID={worker_pid}): Exiting")
+
+
 
 
 # ============================================================================

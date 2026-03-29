@@ -17,8 +17,8 @@ project:
 runtime:
   platform: "local"
   device: "cpu"                         # Teszthez a CPU is tökéletes és gyors
-  num_workers: 1
-  log_level: "DEBUG"
+  num_workers: 2                        # [PHASE 3] Just 2 workers for test
+  log_level: "INFO"
   log_dir: "logs_test/"
 
 environment:
@@ -35,38 +35,41 @@ environment:
     total_card_dim: 104
     max_betting_rounds: 4
     max_actions_per_round: 18
-    betting_history_dim: [18, 9]
+    betting_history_dim: [18, 13]       # Must match ObservationConfig.action_feature_dim default (13)
     position_encoding: "one_hot"
     normalization_method: "big_blind"
     normalization_range: [0.0, 1.0]
   action_space:
     type: "discrete"
-    num_actions: 9
+    num_actions: 12                      # Must match ActionMapper.NUM_ACTIONS
     actions:
       0: "fold"
-      1: "check_call"
-      2: "min_raise"
-      3: "raise_0.5x_pot"
-      4: "raise_0.75x_pot"
-      5: "raise_1.0x_pot"
-      6: "raise_1.5x_pot"
-      7: "raise_2.0x_pot"
-      8: "all_in"
+      1: "check"
+      2: "call"
+      3: "min_raise"
+      4: "raise_0.25x_pot"
+      5: "raise_0.33x_pot"
+      6: "raise_0.5x_pot"
+      7: "raise_0.75x_pot"
+      8: "raise_1.0x_pot"
+      9: "raise_1.5x_pot"
+      10: "raise_2.0x_pot"
+      11: "all_in"
     illegal_action_logit_mask: -1.0e+8
 
 model:
   architecture: "mlp_actor_critic"
   embedding:
-    card_embed_dim: 16                  # Drasztikusan lecsökkentve
-    context_embed_dim: 8                # Drasztikusan lecsökkentve
-    history_embed_dim: 16               # Drasztikusan lecsökkentve
+    card_embed_dim: 32                  # Reduced from 64 for test speed
+    context_embed_dim: 16               # Reduced from 32 for test speed
+    history_embed_dim: 32               # Reduced from 64 for test speed
   actor:
-    hidden_layers: [64, 64]             # Mini MLP
+    hidden_layers: [128, 64]             # Mini MLP
     activation: "relu"
     dropout: 0.0                        # Teszthez nem kell dropout
     output_activation: "softmax"
   critic:
-    hidden_layers: [64, 64]             # Mini MLP
+    hidden_layers: [128, 64]             # Mini MLP
     activation: "relu"
     dropout: 0.0
     output_dim: 1
@@ -94,6 +97,28 @@ ppo:
     max_capacity: 10_000
     compression: "zstandard"
     compression_level: 1
+
+# =========================================================================
+# [PHASE 2.5B] Deep CFR Configuration
+# =========================================================================
+cfr:
+  # Use CFR instead of PPO for this test
+  training_algorithm: "cfr"             # Switch from "ppo" to "cfr"
+  
+  learning_rate: 1.0e-3
+  adam_epsilon: 1.0e-5
+  max_grad_norm: 0.5
+  entropy_coefficient: 0.01
+  num_epochs: 1                         # Minimal training per iteration
+  
+  # Deep CFR specifics
+  regret_discount: 1.0
+  regret_min_threshold: 0.0
+  regret_scaling: 1.0
+  
+  # Convergence tracking
+  track_exploitability: true
+  exploitability_update_freq: 2         # Every iteration for test
 
 orchestrator:
   phases:
@@ -179,6 +204,13 @@ mlops:
       - "torch_cpu"
 
 evaluation:
+  # ========================================================================
+  # [PHASE 6] Oracle Evaluation Configuration
+  # ========================================================================
+  oracle_eval_interval: 1               # Run oracle every iteration (for test)
+  oracle_hands: 10                      # Just 10 hands per evaluation (minimal)
+  equity_iterations: 200                # Fast equity calculation
+  
   slumbot:
     enabled: false
     stack_size_bb: 200

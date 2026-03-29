@@ -64,20 +64,75 @@ _PUBLIC_CARDS_TO_STREET: dict[int, int] = {0: 0, 3: 1, 4: 2, 5: 3}
 
 
 def _to_suitrank(card: str) -> str:
+    """Convert card to SUIT+RANK uppercase format (e.g., 'S2', 'HD', 'CA').
+    
+    features.py _encode_cards() expects SUIT+RANK format where:
+    - First character is suit from SUIT_MAP: {'S', 'H', 'D', 'C'}
+    - Second character is rank from RANK_MAP: {'2'-'9', 'T', 'J', 'Q', 'K', 'A'}
+    """
     card = card.strip().upper()
     if len(card) != 2:
         return card
     c0, c1 = card[0], card[1]
+    
+    # If already suit+rank format (e.g., 'S2'), keep as is
     if c0 in _SUITS and c1 in _RANKS:
         return card
+    
+    # If rank+suit format (e.g., '2S'), swap to suit+rank
     if c0 in _RANKS and c1 in _SUITS:
         return c1 + c0
+    
     logger.debug("Unrecognised card format '%s'; passing through as-is.", card)
     return card
 
 
-def _normalise_cards(cards: list[str]) -> list[str]:
-    return [_to_suitrank(c) for c in cards if c and c.strip()]
+def _normalise_cards(cards) -> list[str]:
+    """Normalize cards to SUIT+RANK uppercase format (e.g., 'S2', 'HD', 'CA').
+    
+    Handles RLCard Card objects and various string formats.
+    Returns standard SUIT+RANK format for features._encode_cards().
+    """
+    result = []
+    for c in cards:
+        if not c:
+            continue
+        
+        # Convert to string and uppercase for processing
+        card_str = str(c).strip().upper()
+        
+        # Try standard 2-char format first
+        if len(card_str) == 2:
+            normalized = _to_suitrank(card_str)
+            if normalized and len(normalized) == 2:
+                result.append(normalized)
+                continue
+        
+        # Extract suit and rank from any format
+        suit = None
+        rank = None
+        
+        # Find suit (single letter)
+        for s in _SUITS:
+            if s in card_str:
+                suit = s
+                break
+        
+        # Find rank (could be 2-char like 10, or 1-char)
+        for r in ["10"] + list(_RANKS):
+            if r in card_str:
+                rank = r
+                break
+        
+        # Construct SUIT+RANK uppercase format
+        if suit and rank:
+            result.append(suit + rank)
+        else:
+            # Fallback: just use as-is
+            logger.warning("Could not normalize card '%s', using as-is", card_str)
+            result.append(card_str)
+    
+    return result
 
 
 # =============================================================================

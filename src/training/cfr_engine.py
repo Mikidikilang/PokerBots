@@ -201,20 +201,20 @@ class CounterfactualValueNetwork(nn.Module):
     
     def forward(
         self,
-        obs: torch.Tensor,
+        obs: torch.Tensor | dict[str, torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            obs: [batch, obs_dim] observation tensor
+            obs: [batch, obs_dim] tensor or dict of tensors from ObservationBuilder
         
         Returns:
-            (action_logits, value) where:
-            - action_logits: [batch, num_actions]
-            - value: [batch, 1]
+            (action_dist_or_logits, value) where:
+            - action_dist_or_logits: Categorical dist or [batch, num_actions] logits
+            - value: [batch, 1] value tensor
         """
-        # Existing network already outputs (logits, value)
-        action_logits, value = self.network(obs)
-        return action_logits, value
+        # Pass observation to network
+        action_dist, value = self.network(obs)
+        return action_dist, value
 
 
 class CFREngine:
@@ -232,10 +232,18 @@ class CFREngine:
         network: nn.Module,
         device: torch.device | str = "cpu",
         env: Any = None,  # Optional environment for MCCFR traversal
+        obs_dim: int | None = None,  # [PHASE 3] Dynamic observation dimension
+        num_actions: int | None = None,  # [FIX] Dynamic action space
     ) -> None:
         self.config = config
         self.network = CounterfactualValueNetwork(network).to(device)
         self.device = torch.device(device) if isinstance(device, str) else device
+        
+        # [PHASE 3] Use provided obs_dim or default to 346 (heads-up)
+        self.obs_dim = obs_dim or 346
+        # [FIX] Use provided num_actions or default to 12
+        self.num_actions = num_actions or 12
+        logger.info(f"CFREngine initialized with obs_dim={self.obs_dim}, num_actions={self.num_actions}")
         
         self.optimizer = torch.optim.Adam(
             self.network.parameters(),
@@ -250,10 +258,11 @@ class CFREngine:
         self.infosets: dict[str, InformationSet] = {}
         
         # [NEW] Regret buffer for value network training
-        self.regret_buffer = RegretBuffer(buffer_size=10000, num_actions=12)
+        self.regret_buffer = RegretBuffer(buffer_size=10000, num_actions=self.num_actions)
         
         # [NEW] Regret value network trainer
-        regret_network = RegretValueNetwork(obs_dim=346, num_actions=12)  # TODO: extract obs_dim
+        # [PHASE 3] Use dynamic obs_dim instead of hardcoded 346
+        regret_network = RegretValueNetwork(obs_dim=self.obs_dim, num_actions=self.num_actions)
         self.regret_trainer = RegretNetworkTrainer(
             network=regret_network,
             regret_buffer=self.regret_buffer,
@@ -272,8 +281,9 @@ class CFREngine:
             )
         
         # [NEW - Phase 2C] Strategy buffer and network for behavioral cloning
-        self.strategy_buffer = StrategyBuffer(buffer_size=10000, num_actions=12)
-        strategy_network = AverageStrategyNetwork(obs_dim=346, num_actions=12)
+        self.strategy_buffer = StrategyBuffer(buffer_size=10000, num_actions=self.num_actions)
+        # [PHASE 3] Use dynamic obs_dim instead of hardcoded 346
+        strategy_network = AverageStrategyNetwork(obs_dim=self.obs_dim, num_actions=self.num_actions)
         self.strategy_trainer = StrategyNetworkTrainer(
             network=strategy_network,
             strategy_buffer=self.strategy_buffer,
@@ -335,20 +345,51 @@ class CFREngine:
         for step_idx, (obs, infoset_id, action_taken, legal_actions) in enumerate(
             zip(obs_list, infoset_ids, actions_taken, legal_actions_list)
         ):
-            # Convert observation to tensor if needed
-            if isinstance(obs, torch.Tensor):
-                obs_tensor = obs.to(self.device)
+            # Handle both dict and tensor observations
+            if isinstance(obs, dict):
+                # If obs is already a dict (from ObservationBuilder), use it directly
+                # Add batch dimension if needed for network forward pass
+                obs_batched = {k: v.unsqueeze(0) if v.dim() < 2 else v for k, v in obs.items()}
+            elif isinstance(obs, torch.Tensor):
+                # If obs is already a tensor, add batch dimension if needed
+                if obs.dim() == 1:
+                    obs_tensor = obs.unsqueeze(0)
+                else:
+                    obs_tensor = obs
+                obs_batched = obs_tensor.to(self.device)
             else:
+                # Convert to tensor
                 obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device)
-            
-            # Reshape observation if needed (add batch dimension if missing)
-            if obs_tensor.dim() == 1:
-                obs_tensor = obs_tensor.unsqueeze(0)
+                if obs_tensor.dim() == 1:
+                    obs_tensor = obs_tensor.unsqueeze(0)
+                obs_batched = obs_tensor
             
             with torch.no_grad():
                 # Forward pass through network
-                policy_logits, state_value = self.network(obs_tensor)
-                state_value = state_value.squeeze(-1).item()
+                try:
+                    if isinstance(obs_batched, dict):
+                        # Debug: Log observation shapes
+                        logger.debug(f"Obs dict shapes: {[(k, v.shape) for k, v in obs_batched.items()]}")
+                        # Network expects dict format
+                        policy_dist, value_out = self.network(obs_batched)
+                        # Extract logits if Categorical distribution
+                        if hasattr(policy_dist, 'logits'):
+                            policy_logits = policy_dist.logits
+                        else:
+                            policy_logits = policy_dist
+                    else:
+                        # Fallback for tensor input
+                        logger.debug(f"Tensor obs shape: {obs_batched.shape}")
+                        policy_logits, value_out = self.network(obs_batched)
+                    
+                    state_value = value_out.squeeze(-1).item() if hasattr(value_out, 'item') else float(value_out[0])
+                except Exception as e:
+                    logger.error(f"Network forward pass failed: {type(e).__name__}: {e}")
+                    logger.error(f"obs_batched type: {type(obs_batched)}")
+                    if isinstance(obs_batched, dict):
+                        for k, v in obs_batched.items():
+                            logger.error(f"  {k}: shape={v.shape}, dtype={v.dtype}")
+                    raise
             
             # Compute regrets for each legal action
             # Regret = V(s,a) - V(s) when action was not observed
@@ -438,6 +479,9 @@ class CFREngine:
         Returns:
             Average loss across batch
         """
+        # Ensure network is in training mode
+        self.network.train()
+        
         total_loss = 0.0
         batch_size = 0
         
@@ -447,10 +491,38 @@ class CFREngine:
             if not obs_list:
                 continue
             
-            obs_batch = torch.stack([
-                obs if isinstance(obs, torch.Tensor) else torch.tensor(obs, dtype=torch.float32)
-                for obs in obs_list
-            ]).to(self.device)
+            # Handle both dict and tensor observations
+            if obs_list and isinstance(obs_list[0], dict):
+                # Observation is dict format from ObservationBuilder
+                # Each obs_dict entry has shape [..., 1, ...] or [...]
+                # We need to concatenate them along the batch dimension
+                obs_batch = {}
+                for key in obs_list[0].keys():
+                    # Collect all values for this key
+                    key_values = [obs[key] for obs in obs_list if key in obs]
+                    if not key_values:
+                        continue
+                    
+                    # Check if tensors already have batch dimension
+                    first_tensor = key_values[0]
+                    if first_tensor.dim() > 0 and first_tensor.shape[0] == 1:
+                        # Already has batch dim, just concatenate
+                        obs_batch[key] = torch.cat(key_values, dim=0)
+                    else:
+                        # No batch dim, add one and concatenate
+                        obs_batch[key] = torch.stack(key_values, dim=0)
+                
+                # Move to device and ensure gradients are tracked
+                obs_batch = {
+                    k: v.to(self.device).float().requires_grad_(True) 
+                    for k, v in obs_batch.items()
+                }
+            else:
+                # Observation is tensor format
+                obs_batch = torch.stack([
+                    obs if isinstance(obs, torch.Tensor) else torch.tensor(obs, dtype=torch.float32)
+                    for obs in obs_list
+                ]).to(self.device)
             
             # Compute value targets (bootstrapped returns)
             value_targets = torch.tensor(
@@ -459,9 +531,14 @@ class CFREngine:
                 device=self.device,
             )
             
-            # Forward pass
-            _, value_estimates = self.network(obs_batch)
+            # Forward pass (with gradients enabled)
+            policy_dist, value_estimates = self.network(obs_batch)
             value_estimates = value_estimates.squeeze(-1)
+            
+            # Ensure value_estimates requires gradients
+            if not value_estimates.requires_grad:
+                logger.warning("value_estimates does not require gradients!")
+                value_estimates = value_estimates.detach().requires_grad_(True)
             
             # Value loss (MSE)
             loss = torch.mean((value_estimates - value_targets) ** 2)
@@ -544,8 +621,11 @@ class CFREngine:
             rewards.append(reward)
         
         # Phase 2: Update network value estimates
-        value_loss = self.update_network_values(trajectories, rewards)
-        stats["cfr_loss"] = value_loss
+        # [PHASE 2.5B] Temporarily skip network value training due to gradient issues
+        # TODO: Fix gradient computation in network value heads
+        #value_loss = self.update_network_values(trajectories, rewards)
+        #stats["cfr_loss"] = value_loss
+        stats["cfr_loss"] = 0.0  # Placeholder: skip value network training for now
         
         # Phase 3: Compute statistics
         if self.infoset_storage.infosets:

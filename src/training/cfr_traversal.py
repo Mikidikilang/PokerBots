@@ -116,14 +116,14 @@ class MCCFRTraversal:
         self.env_state_manager = EnvStateManager(env)  # ★ AUDIT FIX #2 ★
         
         self.traversal_count = 0
-        self.max_depth = 10  # ~1000-59000 nodes per game depending on branching
+        self.max_actions = 60  # Maximum actions in NLHE hand (poker-theoretic limit)
     
     def external_sampling_traversal(
         self,
         state: dict[str, Any],
         player_to_update: int,
         reach_probs: dict[int, float],
-        depth: int = 0,
+        action_count: int = 0,
     ) -> float:
         """
         [CORE MCCFR ALGORITHM]
@@ -144,19 +144,20 @@ class MCCFRTraversal:
             state: Current game state (obs_dict from environment)
             player_to_update: Which player's regrets to update (0 or 1)
             reach_probs: {player_id: probability of reaching this state}
-            depth: Current recursion depth (prevent infinite loops)
+            action_count: Total actions taken so far (prevent infinite loops via stalemate guard)
         
         Returns:
             Utility value from player_to_update's perspective
         """
-        # Termination conditions
-        if depth > self.max_depth:
-            logger.warning(f"Max depth {self.max_depth} reached at depth={depth}, returning 0")
+        # Stalemate guard: break if too many actions (max 60 in heads-up NLHE)
+        if action_count >= self.max_actions:
+            logger.warning(f"Max actions {self.max_actions} reached at action_count={action_count}, returning 0")
             return 0.0
         
+        # Termination conditions
         if self.env.is_over():
             # Terminal state: return the reward
-            logger.debug(f"[D{depth}] Terminal state reached, returning 0.0")
+            logger.debug(f"[A{action_count}] Terminal state reached, returning 0.0")
             return 0.0
         
         # Determine whose turn it is
@@ -203,9 +204,9 @@ class MCCFRTraversal:
         # This ensures we use the EXACT same hash as get_or_create_infoset() computed
         infoset_id = infoset.infoset_id
         
-        # Only log nodes at depth 0-5 to reduce output volume
-        if depth <= 5:
-            logger.debug(f"[D{depth}] Node: player={current_player}, actions={len(legal_actions)}, "
+        # Only log nodes at action_count 0-20 to reduce output volume
+        if action_count <= 20:
+            logger.debug(f"[A{action_count}] Node: player={current_player}, actions={len(legal_actions)}, "
                         f"infoset={infoset_id[:8]}..., hero={hero_cards}, board={board_cards}")
         
         if current_player == player_to_update:
@@ -241,7 +242,7 @@ class MCCFRTraversal:
                         state=next_state,
                         player_to_update=player_to_update,
                         reach_probs=new_reach_probs,
-                        depth=depth + 1,
+                        action_count=action_count + 1,
                     )
                     # Auto-restore environment state on context exit
                 
@@ -310,7 +311,7 @@ class MCCFRTraversal:
             sampled_action_idx = legal_actions_list.index(sampled_action)
             sampled_prob = action_probs[sampled_action_idx]
             
-            logger.debug(f"[D{depth}] Opponent turn: sampled action={sampled_action} (prob={sampled_prob:.3f})")
+            logger.debug(f"[A{action_count}] Opponent turn: sampled action={sampled_action} (prob={sampled_prob:.3f})")
             
             # Take sampled action
             next_state, reward = self.env.step(sampled_action)
@@ -324,7 +325,7 @@ class MCCFRTraversal:
                 state=next_state,
                 player_to_update=player_to_update,
                 reach_probs=new_reach_probs,
-                depth=depth + 1,
+                action_count=action_count + 1,
             )
             
             # Scale by probability of sampling this action (importance weighting)
@@ -356,27 +357,27 @@ class MCCFRTraversal:
         values_p1 = []
         
         for trav_idx in range(num_traversals):
-            # Reset environment
-            root_state, _ = self.env.reset()
+            # Reset environment (returns dict, not tuple)
+            root_state = self.env.reset()
             
             # Traversal for player 0
             value_p0 = self.external_sampling_traversal(
                 state=root_state,
                 player_to_update=0,
                 reach_probs={0: 1.0, 1: 1.0},
-                depth=0,
+                action_count=0,
             )
             values_p0.append(value_p0)
             
             # Reset environment again
-            root_state, _ = self.env.reset()
+            root_state = self.env.reset()
             
             # Traversal for player 1
             value_p1 = self.external_sampling_traversal(
                 state=root_state,
                 player_to_update=1,
                 reach_probs={0: 1.0, 1: 1.0},
-                depth=0,
+                action_count=0,
             )
             values_p1.append(value_p1)
             
@@ -435,8 +436,8 @@ class MCCFRTraversal:
             betting_hist = state["betting_history"]
             if isinstance(betting_hist, torch.Tensor):
                 # Each action is ~13 dims if extended history enabled
-                action_count = int((betting_hist.nonzero().shape[0] / 13).item())
-                action_history = tuple(range(action_count))  # Placeholder actions
+                action_count = int(betting_hist.nonzero().shape[0] / 13)
+                action_history = tuple(str(i) for i in range(action_count))  # String actions
         
         return hash_infoset(player, hole_cards, board_cards, action_history)
     

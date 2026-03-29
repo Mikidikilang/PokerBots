@@ -130,10 +130,11 @@ class CFRTrajectoryAdapter:
                     legal_actions = legal_actions.tolist()
             
             # Convert single obs_flat entry back to tensor for CFREngine
-            obs_tensor = self._obs_dict_to_tensor(obs_single)
+            # [PHASE 2.5B] IMPORTANT: Keep obs as dict, not flattened tensor!
+            # CFREngine.network expects dict{hole_cards, community_cards, env_metrics, betting_history, position, action_mask}
             
             trajectory = {
-                "states": [obs_tensor],  # Single state (1-step trajectory)
+                "states": [obs_single],  # Keep as dict, NOT flattened!
                 "actions": [action_int],
                 "infoset_ids": [infoset_id],
                 "legal_actions_per_node": [legal_actions],
@@ -201,8 +202,8 @@ class CFRTrajectoryAdapter:
         action_history = ()
         if "betting_history" in obs_dicts:
             betting_hist_tensor = obs_dicts["betting_history"][idx].flatten()
-            action_count = int((betting_hist_tensor.nonzero().shape[0] / 13).item())
-            action_history = tuple(range(action_count))  # Placeholder actions
+            action_count = int(betting_hist_tensor.nonzero().shape[0] / 13)
+            action_history = tuple(str(i) for i in range(action_count))  # String actions
         
         return hash_infoset(
             player=0,  # Always hero in our setup (training poker player)

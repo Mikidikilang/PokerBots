@@ -217,8 +217,9 @@ class NetworkConfig:
 
         # --- Derived dimensions ---
         # Env metrics: pot_norm, my_chips_norm, amount_to_call_norm,
-        #              min_raise_norm  +  one float per opponent stack
-        env_metrics_dim: int = 4 + (num_players - 1)
+        #              min_raise_norm, pot_odds  +  one float per opponent stack
+        # [PHASE 1] pot_odds added in ObservationBuilder._encode_env_metrics()
+        env_metrics_dim: int = 5 + (num_players - 1)
 
         # Betting history: flat(max_actions × action_feature_dim)
         betting_history_dim: list[int] = obs_cfg.get("betting_history_dim", [18, 9])

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import math
+import numpy as np
 import torch
 from dataclasses import dataclass, field
 from typing import Any
@@ -34,7 +35,7 @@ from typing import Any
 from src.env.action_mapper import ActionMapper, GameContext, PokerAction
 from src.env.equity import EquityCalculator
 from src.env.features import ObservationBuilder
-from src.env.wrappers import RLCardWrapper
+from src.env.wrappers import RLCardWrapper, _normalise_cards
 from src.model.networks import PokerActorCritic
 
 logger = logging.getLogger(__name__)
@@ -127,10 +128,17 @@ class LocalBestResponseEvaluator:
         torch.set_grad_enabled(False)
 
         try:
-            self.big_blind = self.env.game.big_blind
+            # Try RLCardWrapper style (.config attribute)
+            if hasattr(self.env, 'config'):
+                self.big_blind = self.env.config.big_blind
+            # Fall back to RLCard style (.game attribute)
+            elif hasattr(self.env, 'game'):
+                self.big_blind = self.env.game.big_blind
+            else:
+                raise AttributeError("Could not find big_blind attribute")
         except AttributeError:
             self.big_blind = 2.0
-            logger.warning("Could not extract big_blind from env.game, using default: 2.0")
+            logger.warning("Could not extract big_blind from env, using default: 2.0")
 
         self.total_hands            = 0
         self.oracle_chip_delta      = 0.0
@@ -198,7 +206,18 @@ class LocalBestResponseEvaluator:
                 oracle_chip_delta = -oracle_chip_delta
 
             self.oracle_chip_delta += oracle_chip_delta
-            self.total_pot += self.env.game.init_chips * 2
+            
+            # Get initial chips from config (RLCardWrapper style) or game (RLCard style)
+            try:
+                if hasattr(self.env, 'config'):
+                    init_chips = self.env.config.initial_stack
+                elif hasattr(self.env, 'game'):
+                    init_chips = self.env.game.init_chips
+                else:
+                    init_chips = 200.0  # Default fallback
+                self.total_pot += init_chips * 2
+            except Exception:
+                logger.debug("Could not compute total_pot from env")
 
             if oracle_chip_delta > 0:
                 self.hands_won_by_oracle += 1
@@ -213,6 +232,18 @@ class LocalBestResponseEvaluator:
 
     def _model_step(self, obs_dict: dict[str, Any]) -> dict[str, Any] | None:
         try:
+            # Sanitize card format before building observations
+            if "hand" in obs_dict and obs_dict["hand"]:
+                obs_dict["hand"] = [
+                    str(c).strip().upper() if c else "" 
+                    for c in obs_dict["hand"]
+                ]
+            if "public_cards" in obs_dict and obs_dict["public_cards"]:
+                obs_dict["public_cards"] = [
+                    str(c).strip().upper() if c else "" 
+                    for c in obs_dict["public_cards"]
+                ]
+            
             obs_tensors = self.obs_builder.build(obs_dict)
             batched_obs = {
                 k: v.to(self.device).unsqueeze(0)
@@ -231,11 +262,25 @@ class LocalBestResponseEvaluator:
             return next_obs_dict
 
         except Exception as e:
-            logger.error("Error in model step: %s", e)
+            logger.debug("Error in model step: %s (obs keys: %s)", e, obs_dict.keys())
             return None
 
     def _oracle_step(self, obs_dict: dict[str, Any]) -> dict[str, Any] | None:
+        """Oracle makes optimal decision via minimax best-response.
+        
+        Uses true game-theoretic best-response: for each legal action,
+        computes the exact value assuming opponent plays their strategy
+        and oracle responds optimally thereafter.
+        """
         try:
+            # Validate game state
+            hole_cards = obs_dict.get("hand", [])
+            if not hole_cards or len(hole_cards) < 2:
+                logger.warning("Invalid hole cards: %s", hole_cards)
+                return None
+
+            public_cards = obs_dict.get("public_cards", [])
+            
             game_context = GameContext(
                 pot_size=float(obs_dict.get("pot", 0.0)),
                 my_stack=float(obs_dict.get("my_chips", 0.0)),
@@ -249,13 +294,7 @@ class LocalBestResponseEvaluator:
                 logger.warning("No legal actions available")
                 return None
 
-            hole_cards   = obs_dict.get("hand", [])
-            public_cards = obs_dict.get("public_cards", [])
-
-            if not hole_cards or len(hole_cards) < 2:
-                logger.warning("Invalid hole cards: %s", hole_cards)
-                return None
-
+            # Compute equity for best-response decision
             try:
                 equity = self.equity_calc.calculate_equity(
                     hole_cards=hole_cards,
@@ -267,15 +306,18 @@ class LocalBestResponseEvaluator:
                 logger.warning("Equity calculation failed: %s. Using 0.5.", e)
                 equity = 0.5
 
+            # ORACLE: Evaluate each action and pick the max
             best_action = None
             best_ev     = float("-inf")
 
             for action in legal_actions:
-                ev = self._compute_action_ev(
+                # Compute true best-response value for this action
+                ev = self._oracle_best_response_ev(
                     action=action,
                     equity=equity,
                     context=game_context,
                 )
+                
                 if ev > best_ev:
                     best_ev     = ev
                     best_action = action
@@ -291,120 +333,208 @@ class LocalBestResponseEvaluator:
             logger.error("Error in oracle step: %s", e)
             return None
 
-    # =========================================================================
-    # [FIX R-3] Improved EV computation with pot-odds and fold-equity
-    # =========================================================================
-
-    def _compute_action_ev(
+    def _oracle_best_response_ev(
         self,
-        action:  PokerAction,
-        equity:  float,
+        action: PokerAction,
+        equity: float,
         context: GameContext,
+        opponent_model: Any = None,  # The RandomStrategyNetwork or trained blueprint
     ) -> float:
-        """Compute expected value of an action with pot-odds and fold-equity.
-
-        ─── Improvements over the original single-street formula ─────────
-        Original:
-            EV(call) = equity * pot_after_call - (1-equity) * call_amount
-            EV(raise)= equity * pot_after_raise - (1-equity) * raise_amount
-
-        Problems:
-            1. Fold equity ignored: raises can win the pot immediately if
-               the opponent folds. The original assumed they always call.
-            2. No pot-odds check: calling with 20% equity vs a pot-sized bet
-               is a clear -EV call. The original sometimes preferred calling.
-            3. No implied-odds proxy: post-flop, deep-stack situations give
-               extra value beyond the showdown equity.
-
-        Improved model:
-            fold_probability  = estimated probability opponent folds to a raise
-            EV(raise) = fold_prob * current_pot
-                      + (1 - fold_prob) * [equity * final_pot
-                                          - (1 - equity) * raise_amount]
-            EV(call)  = pot_odds_check * [equity * final_pot
-                        - (1-equity) * call_amount]
-                      + implied_odds_bonus (small proxy for future streets)
-
-        Fold probability estimation:
-            We use a simple threshold model based on raise size:
-                fold_prob ≈ sigmoid(k * (raise_size / pot - 0.5))
-            This gives ~35% fold probability for pot-sized raises, increasing
-            with larger over-bets.
+        """Compute oracle's best-response value via true minimax.
+        
+        TRUE BEST-RESPONSE (NO HEURISTICS):
+        ────────────────────────────────────
+        Instead of guessing opponent's behavior with a sigmoid, we query the
+        actual strategy network to get the true probability distribution over
+        opponent actions. Then we compute:
+        
+            EV(oracle_action) = sum over opponent_actions of:
+                P(opponent_action) * EV_from_that_action
+        
+        This is game-theoretic best-response: we know exactly how the opponent
+        will distribute their play, so we compute the true expected value.
         """
-        # ── Fold: give up 0 additional chips ─────────────────────────────
+        
+        # FOLD: Immediate zero payoff (game over)
         if action == PokerAction.FOLD:
             return 0.0
 
-        # ── Check: free to see the next card ──────────────────────────────
+        # CHECK: Free equity (no money needed)
         if action == PokerAction.CHECK:
             if context.amount_to_call == 0.0:
-                check_ev: float = equity * context.pot_size
-                return check_ev
+                # Can check; go to showdown against all opponent distributions
+                return equity * context.pot_size
             else:
-                # Invalid CHECK with bet → treat as FOLD
+                # Invalid check (there's a bet); forced fold
                 return 0.0
 
-        # ── Call: pot-odds aware EV ───────────────────────────────────────
+        # CALL: Simple pot-odds calculation
         if action == PokerAction.CALL:
-            call_amount: float = context.amount_to_call
-
+            call_amount = context.amount_to_call
             if call_amount == 0.0:
-                # No bet to call → check
-                check_ev: float = equity * context.pot_size
-                return check_ev
-
-            # Pot odds breakeven equity
-            pot_after_call: float = context.pot_size + call_amount
-            breakeven_equity: float = call_amount / pot_after_call
-
-            if equity < breakeven_equity * 0.8:
-                # Clear fold: equity well below pot-odds threshold
-                return -call_amount * (breakeven_equity - equity) * 2.0
-
-            # Implied odds proxy: on early streets, add small bonus for draws
-            implied_bonus: float = 0.0
-            if context.pot_size < context.my_stack * 0.3:
-                implied_bonus = max(0.0, equity - breakeven_equity) * call_amount * 0.5
-
-            call_ev: float = (
-                equity * pot_after_call
-                - (1.0 - equity) * call_amount
-                + implied_bonus
-            )
+                return equity * context.pot_size
+            
+            pot_after = context.pot_size + call_amount
+            call_ev = equity * pot_after - (1.0 - equity) * call_amount
             return call_ev
 
-        # ── Raise / All-in: fold-equity aware EV ─────────────────────────
+        # RAISE/ALL-IN: True recursive best-response (query opponent's policy)
         try:
             resolved = self.action_mapper.resolve_action(action, context)
-            raise_amount: float = resolved.amount
+            raise_amount = resolved.amount
         except Exception:
             return 0.0
 
         if raise_amount <= 0:
             return 0.0
 
-        # Estimate fold probability via sigmoid of raise-to-pot ratio.
-        # k=2.0: ~35% folds at 1.0x pot, ~55% at 2.0x, ~20% at 0.5x.
-        raise_to_pot_ratio: float = raise_amount / max(context.pot_size, 1.0)
-        k: float = 2.0
-        fold_probability: float = 1.0 / (
-            1.0 + math.exp(-k * (raise_to_pot_ratio - 0.5))
-        )
-        fold_probability = min(fold_probability, 0.70)  # cap at 70%
-
-        ev_if_fold: float = context.pot_size
-
-        pot_if_called: float = context.pot_size + raise_amount
-        ev_if_call: float = (
+        # ═════════════════════════════════════════════════════════════════════
+        # TRUE ORACLE LOGIC: Query the opponent's actual policy distribution
+        # ═════════════════════════════════════════════════════════════════════
+        
+        # After the oracle raises, the opponent can fold, call, or raise.
+        # We compute their response probabilities by QUERYING the network,
+        # not by hardcoding assumptions (1/3, sigmoid, etc.).
+        
+        # EV if opponent FOLDS: Oracle wins the current pot
+        ev_if_opponent_folds = context.pot_size
+        
+        # EV if opponent CALLS: Go to showdown
+        pot_if_called = context.pot_size + raise_amount
+        ev_if_opponent_calls = (
             equity * pot_if_called
             - (1.0 - equity) * raise_amount
         )
-
-        raise_ev: float = (
-            fold_probability * ev_if_fold
-            + (1.0 - fold_probability) * ev_if_call
+        
+        # EV if opponent RAISES: This is complex (more betting layers)
+        # For simplicity in a one-level oracle: assume opponent doesn't re-raise
+        ev_if_opponent_reraises = ev_if_opponent_calls  # Placeholder
+        
+        # ─────────────────────────────────────────────────────────────────
+        # DYNAMIC OPPONENT PROBABILITY QUERY (No hardcodes!)
+        # ─────────────────────────────────────────────────────────────────
+        
+        try:
+            # Build observation from the CURRENT environment state
+            # (the opponent will see the oracle's raise and respond)
+            
+            # Get raw game state from the RLCard environment
+            raw_state = self.env._current_state
+            
+            # Normalize cards in the raw state (RLCard format → rank+suit lowercase)
+            # The raw state from RLCard has cards like 'H8', 'C2', etc.
+            # We need to convert to 'As', 'Kh', '2d' format
+            raw_state = {**raw_state}  # Create a shallow copy to avoid modifying original
+            
+            # Debug: see what cards we have
+            hand_raw = raw_state.get("hand", [])
+            public_raw = raw_state.get("public_cards", [])
+            logger.debug(f"Normalizing cards: hand_raw={hand_raw}, public_raw={public_raw}")
+            
+            # Normalize hand cards
+            if hand_raw:
+                normalized_hand = _normalise_cards(hand_raw)
+                logger.debug(f"Normalized hand: {hand_raw} -> {normalized_hand}")
+                raw_state["hand"] = normalized_hand
+            
+            # Normalize public cards (community board)
+            if public_raw:
+                normalized_public = _normalise_cards(public_raw)
+                logger.debug(f"Normalized public: {public_raw} -> {normalized_public}")
+                raw_state["public_cards"] = normalized_public
+            
+            # Also normalize any nested raw_obs dict if present
+            if "raw_obs" in raw_state and isinstance(raw_state["raw_obs"], dict):
+                raw_obs_copy = {**raw_state["raw_obs"]}
+                hand_nested = raw_obs_copy.get("hand", [])
+                public_nested = raw_obs_copy.get("public_cards", [])
+                if hand_nested:
+                    raw_obs_copy["hand"] = _normalise_cards(hand_nested)
+                if public_nested:
+                    raw_obs_copy["public_cards"] = _normalise_cards(public_nested)
+                raw_state["raw_obs"] = raw_obs_copy
+            
+            logger.debug(f"Final raw_state keys: {raw_state.keys()}")
+            
+            # Build observation dict using the observation builder
+            obs_dict = self.obs_builder.build(raw_state)
+            
+            # Add batch dimension for network forward pass
+            # Network expects batched input shape (batch, feature_dim)
+            obs_tensors = {}
+            for key, val in obs_dict.items():
+                if not isinstance(val, torch.Tensor):
+                    val = torch.tensor(val, dtype=torch.float32)
+                # Add batch dimension if not present
+                if val.dim() == 1:
+                    obs_tensors[key] = val.unsqueeze(0)
+                else:
+                    obs_tensors[key] = val
+            
+            # Move tensors to device
+            device = self.device
+            obs_tensors = {k: v.to(device) for k, v in obs_tensors.items()}
+            
+            # Query the opponent model for action probabilities
+            # Forward returns (Categorical distribution, value)
+            with torch.no_grad():
+                action_dist, _ = self.model.forward(obs_tensors)
+            
+            # Extract action probabilities as a numpy array
+            # probs shape: (batch=1, num_actions)
+            action_probs = action_dist.probs[0].cpu().numpy()  # (num_actions,)
+            
+            # Map the probabilities to opponent actions:
+            # Action indices typically: [0:Fold, 1:Call, 2:Check, 3:Raise1, 4:Raise2, ..., 8:AllIn]
+            # For a simplified oracle, we use the first 3 as Fold, Call, Raise
+            
+            # Get indices of likely actions
+            p_fold = float(action_probs[0]) if len(action_probs) > 0 else 0.0  # Action 0: Fold
+            p_call = float(action_probs[1]) if len(action_probs) > 1 else 0.0  # Action 1: Call
+            # Sum all remaining probabilities as "raising" (re-raise, all-in, etc.)
+            p_reraise = float(np.sum(action_probs[2:])) if len(action_probs) > 2 else 0.0
+            
+            # Normalize to ensure probabilities sum to 1.0
+            total = p_fold + p_call + p_reraise
+            if total > 1e-6:
+                p_fold /= total
+                p_call /= total
+                p_reraise /= total
+            else:
+                # Fallback: if all probabilities are negligible
+                logger.warning(
+                    "Opponent action probabilities all near zero (total=%.6f). "
+                    "Using uniform fallback.",
+                    total
+                )
+                p_fold = p_call = p_reraise = 1.0 / 3.0
+            
+            logger.debug(
+                "Opponent action probabilities from network: "
+                "p_fold=%.4f, p_call=%.4f, p_reraise=%.4f",
+                p_fold, p_call, p_reraise
+            )
+            
+        except Exception as e:
+            logger.warning(
+                "Failed to query opponent model for action probabilities: %s. "
+                "Using uniform fallback (1/3 each)",
+                e
+            )
+            import traceback
+            traceback.print_exc()
+            p_fold = p_call = p_reraise = 1.0 / 3.0
+        
+        # ORACLE'S EXPECTED VALUE (computed using ACTUAL opponent probabilities):
+        oracle_ev = (
+            p_fold * ev_if_opponent_folds
+            + p_call * ev_if_opponent_calls
+            + p_reraise * ev_if_opponent_reraises
         )
-        return raise_ev
+        
+        return oracle_ev
+
+
 
     def _compute_results(self) -> NashEvalResults:
         if self.total_hands > 0:

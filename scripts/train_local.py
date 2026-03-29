@@ -661,7 +661,7 @@ def build_training_pipeline(
                 state_manager.save_training_state(
                     network=net,
                     optimizer=runner.trainer.optimizer,
-                    scheduler=runner.trainer.scheduler,
+                    scheduler=getattr(runner.trainer, 'scheduler', None),  # CFREngine has no scheduler
                     iteration=iteration,
                     total_env_steps=runner.collector.get_total_steps(),
                     total_hands=runner.collector.get_total_episodes(),
@@ -743,12 +743,14 @@ def build_training_pipeline(
             )
             logger.info("Optimizer state restored from checkpoint")
 
+        # Restore scheduler only if trainer has one (PPOTrainer has, CFREngine doesn't)
+        trainer_scheduler = getattr(runner.trainer, 'scheduler', None)
         if (
             "scheduler_state_dict" in checkpoint_to_resume
             and checkpoint_to_resume["scheduler_state_dict"] is not None
-            and runner.trainer.scheduler is not None
+            and trainer_scheduler is not None
         ):
-            runner.trainer.scheduler.load_state_dict(
+            trainer_scheduler.load_state_dict(
                 checkpoint_to_resume["scheduler_state_dict"]
             )
             logger.info("LR scheduler state restored from checkpoint")
@@ -890,11 +892,7 @@ def main() -> None:
     if rank == 0:
         elapsed: float = time.monotonic() - _session_start
         logger.info(
-            "=" * 60 + "\n"
-            "  TRAINING COMPLETE\n"
-            "  Runtime: %.2f hours\n"
-            "  Result: %s\n"
-            "=" * 60,
+            "=" * 60 + "\n  TRAINING COMPLETE\n  Runtime: %.2f hours\n  Result: %s\n" + "=" * 60,
             elapsed / 3600, summary,
         )
 

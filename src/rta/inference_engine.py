@@ -194,8 +194,8 @@ class RTAInferenceEngine:
                 f"Failed to load checkpoint {self.checkpoint_path}: {e}"
             ) from e
         
-        # [FIX] Strict validation: require BOTH "config" and "model_state" keys
-        required_keys = {"config", "model_state"}
+        # [FIX] Strict validation: require BOTH "config" and "model_state_dict" keys
+        required_keys = {"config", "model_state_dict"}
         missing_keys = required_keys - set(checkpoint.keys())
         
         if missing_keys:
@@ -224,8 +224,8 @@ class RTAInferenceEngine:
         # Instantiate model
         self.model = PokerActorCritic(self.config)
         
-        # Load weights (STRICT: require "model_state" key)
-        state_dict = checkpoint["model_state"]
+        # Load weights (STRICT: require "model_state_dict" key)
+        state_dict = checkpoint["model_state_dict"]
         try:
             self.model.load_state_dict(state_dict, strict=False)
         except Exception as e:
