@@ -116,16 +116,17 @@ class WrapperConfig:
 # =============================================================================
 
 _FOLD        = 0
-_CHECK_CALL  = 1
-_MIN_RAISE   = 2
-_RAISE_QUARTER = 3   # NEW — 25% pot early position sizing
-_RAISE_THIRD = 4     # 33% pot block bet
-_RAISE_HALF  = 5
-_RAISE_75    = 6
-_RAISE_POT   = 7
-_RAISE_150   = 8
-_RAISE_2X    = 9
-_ALL_IN      = 10    # shifted from 9 (checkpoint-breaking)
+_CHECK       = 1      # NEW — separated from CALL for check-raise learning
+_CALL        = 2      # NEW — separated from CHECK
+_MIN_RAISE   = 3
+_RAISE_QUARTER = 4    # 25% pot early position sizing
+_RAISE_THIRD = 5      # 33% pot block bet
+_RAISE_HALF  = 6
+_RAISE_75    = 7
+_RAISE_POT   = 8
+_RAISE_150   = 9
+_RAISE_2X    = 10
+_ALL_IN      = 11     # shifted from 10 (checkpoint-breaking)
 _N_RAISE_LEVELS: int = _RAISE_2X - _MIN_RAISE  # == 7 (was 6)
 
 
@@ -402,7 +403,11 @@ class RLCardWrapper:
 
         if action == _FOLD:
             return sorted_ids[0]
-        if action == _CHECK_CALL:
+        if action == _CHECK:
+            # CHECK: find check action (no bet required)
+            return sorted_ids[1] if n > 1 else sorted_ids[0]
+        if action == _CALL:
+            # CALL: find call action (match bet required)
             return sorted_ids[1] if n > 1 else sorted_ids[0]
         if action == _ALL_IN:
             return sorted_ids[-1]
@@ -411,8 +416,8 @@ class RLCardWrapper:
         if not raise_ids:
             return sorted_ids[min(1, n - 1)]
 
-        # Map our raise indices (MIN_RAISE..RAISE_2X inclusive = 2..9) linearly
-        # onto RLCard's available raise slots. _ALL_IN (10) is handled above.
+        # Map our raise indices (MIN_RAISE..RAISE_2X inclusive = 3..10) linearly
+        # onto RLCard's available raise slots. _ALL_IN (11) is handled above.
         proportion = (action - _MIN_RAISE) / max(_RAISE_2X - _MIN_RAISE, 1)  # 0.0 -> 1.0
         mapped_idx = round(proportion * (len(raise_ids) - 1))
         mapped_idx = max(0, min(mapped_idx, len(raise_ids) - 1))
@@ -433,8 +438,14 @@ class RLCardWrapper:
 
         legal: set[int] = set()
         legal.add(_FOLD)
+        
+        # [PHASE 1] Separate CHECK and CALL for Deep CFR check-raise learning
         if n_total >= 2:
-            legal.add(_CHECK_CALL)
+            if amount_to_call <= 0.0:
+                legal.add(_CHECK)       # No bet required -> CHECK legal
+            else:
+                legal.add(_CALL)        # Bet required -> CALL legal
+        
         if n_raises >= 1:
             legal.add(_MIN_RAISE)
         if n_raises >= 2:
@@ -451,7 +462,7 @@ class RLCardWrapper:
         if n_raises >= 6:
             legal.add(_RAISE_2X)
         if n_raises >= 1 and my_chips > 0:
-            legal.add(_ALL_IN)         # index 10
+            legal.add(_ALL_IN)         # index 11
 
         return sorted(legal)
 

@@ -51,6 +51,12 @@ logger = logging.getLogger(__name__)
 # Avoid circular imports: action_mapper does not import from features.
 from src.env.action_mapper import NUM_ACTIONS as _ACTION_SPACE_SIZE  # noqa: E402
 
+# [PHASE 3] Card Abstraction imports
+from src.env.card_abstraction import (
+    SuitIsomorphismAbstraction,
+    CombinedCardAbstraction,
+)
+
 DECK_SIZE:  int = 52
 NUM_SUITS:  int = 4
 NUM_RANKS:  int = 13
@@ -111,6 +117,11 @@ class ObservationConfig:
         11 (ACTION_DIM_V2)       — hero indicator + street (pre-RTA-1 checkpoints)
         12 (ACTION_DIM_EXTENDED) — full: hero indicator + street + bet ratio [old default]
         13 (ACTION_DIM_EXTENDED) — full+SPR: hero + street + bet ratio + SPR [new default]
+
+    [PHASE 3] card_abstraction options:
+        use_suit_isomorphism: If True, canonicalize cards (1,326 → 169 preflop hands)
+        use_equity_bucketing: If True, bucket hands by equity (postflop abstraction)
+        num_equity_buckets: Number of equity buckets (0-99, with 100 = no bucketing)
     """
 
     num_players:          int   = 6
@@ -120,6 +131,11 @@ class ObservationConfig:
     normalization_range:  tuple[float, float] = (0.0, 1.0)
     use_extended_history: bool  = True    # enables dims 9, 10, 12
     use_bet_encoding:     bool  = True    # enables dim 11 (bet ratio)
+    
+    # [PHASE 3] Card abstraction options
+    use_suit_isomorphism: bool  = False   # Lossless: 1,326 → 169 hands
+    use_equity_bucketing: bool  = False   # Lossy: discretize by equity
+    num_equity_buckets:   int   = 100     # Bucket count (0-99)
 
     def __post_init__(self) -> None:
         if not 2 <= self.num_players <= 9:
@@ -136,14 +152,22 @@ class ObservationConfig:
                 f"{ACTION_DIM_V2} (v2 extended), or {ACTION_DIM_EXTENDED} (full), "
                 f"got {self.action_feature_dim}"
             )
+        if self.use_equity_bucketing and not (0 < self.num_equity_buckets <= 100):
+            raise ValueError(
+                f"num_equity_buckets must be in (0, 100], got {self.num_equity_buckets}"
+            )
         logger.debug(
             "ObservationConfig: players=%d, max_betting=%d, "
-            "action_dim=%d, extended=%s, bet_encoding=%s",
+            "action_dim=%d, extended=%s, bet_encoding=%s, "
+            "suit_iso=%s, eq_bucket=%s, num_buckets=%d",
             self.num_players,
             self.max_betting_actions,
             self.action_feature_dim,
             self.use_extended_history,
             self.use_bet_encoding,
+            self.use_suit_isomorphism,
+            self.use_equity_bucketing,
+            self.num_equity_buckets,
         )
 
 
@@ -156,11 +180,11 @@ class ObservationBuilder:
     6-Max, extended history (action_feature_dim=13):
         hole_cards:      52
         community_cards: 52
-        env_metrics:      4 + (6-1) = 9
-        betting_history: 18 × 13   = 234   (was 216 with dim=12)
+        env_metrics:      5 + (6-1) = 10        (new: pot_odds added)
+        betting_history: 18 × 13   = 234
         position:         6
         ──────────────────────────────────
-        Total:           353                (was 335 with dim=12)
+        Total:           354
 
     [FIX H1] Chip normalization bounded to [0, 1] via 5x stack cap.
     """
@@ -178,15 +202,24 @@ class ObservationBuilder:
         self._norm_min: float = self.config.normalization_range[0]
         self._norm_max: float = self.config.normalization_range[1]
 
+        # [PHASE 3] Initialize card abstraction (if enabled)
+        self._card_abstractor: CombinedCardAbstraction | None = None
+        if self.config.use_suit_isomorphism or self.config.use_equity_bucketing:
+            self._card_abstractor = CombinedCardAbstraction(
+                num_equity_buckets=self.config.num_equity_buckets
+            )
+
         logger.info(
             "ObservationBuilder initialized: %d players, %d max actions, "
-            "action_dim=%d (extended=%s, bet_encoding=%s), obs_dim=%d",
+            "action_dim=%d (extended=%s, bet_encoding=%s), obs_dim=%d, "
+            "card_abstraction=%s",
             self.config.num_players,
             self.config.max_betting_actions,
             self.config.action_feature_dim,
             self.config.use_extended_history,
             self.config.use_bet_encoding,
             self.get_observation_dim(),
+            "enabled" if self._card_abstractor else "disabled",
         )
 
     # =========================================================================
@@ -274,14 +307,23 @@ class ObservationBuilder:
         With action_feature_dim=13 (default, 6-Max):
             hole_cards:       52
             community_cards:  52
-            env_metrics:       4 + (num_players - 1)  = 9
-            betting_history:  18 × 13                  = 234  (was 216 with dim=12)
+            env_metrics:       5 + (num_players - 1)  = 10       (new: pot_odds added)
+            betting_history:  18 × 13                  = 234
             position:          6
-            ──────────────────────────────────────────────────
-            Total:            353                       (was 335 with dim=12)
+            ──────────────────────────────────────────────────────
+            Total:            354                       (was 353)
+        
+        Heads-up (2-player):
+            hole_cards:       52
+            community_cards:  52
+            env_metrics:       5 + 1                   = 6
+            betting_history:  18 × 13                  = 234
+            position:          2
+            ──────────────────────────────────────────────────────
+            Total:            346
         """
         card_dim:     int = DECK_SIZE * 2
-        metrics_dim:  int = 4 + (self.config.num_players - 1)
+        metrics_dim:  int = 5 + (self.config.num_players - 1)  # 5 base metrics (was 4) + opponents
         history_dim:  int = (
             self.config.max_betting_actions * self.config.action_feature_dim
         )
@@ -293,7 +335,10 @@ class ObservationBuilder:
     # =========================================================================
 
     def _encode_cards(self, cards: list[str]) -> torch.Tensor:
-        """Multi-hot encode a list of cards into a 52-dim binary vector."""
+        """Multi-hot encode a list of cards into a 52-dim binary vector.
+        
+        [PHASE 3] If suit isomorphism enabled, canonicalize cards first.
+        """
         encoding: torch.Tensor = torch.zeros(DECK_SIZE, dtype=torch.float32)
 
         for card_str in cards:
@@ -309,6 +354,14 @@ class ObservationBuilder:
             if suit_char not in SUIT_MAP:
                 raise ValueError(f"Unknown suit: '{suit_char}' in '{card_str}'")
 
+            # [PHASE 3] Canonicalize if suit isomorphism enabled
+            if self._card_abstractor and len(cards) <= 2:
+                # For hole cards: canonicalize the pair
+                if len(cards) == 2 and card_str == cards[0]:
+                    card1, card2 = cards[0], cards[1]
+                    canon1, canon2 = self._card_abstractor.canonicalize_hole_cards(card1, card2)
+                    card_str = canon1  # Use first canonical card
+            
             rank_idx: int = RANK_MAP[rank_char]
             suit_idx: int = SUIT_MAP[suit_char]
             card_index: int = rank_idx * NUM_SUITS + suit_idx
@@ -316,11 +369,44 @@ class ObservationBuilder:
 
         return encoding
 
+    def get_abstracted_hand_info(
+        self,
+        hole_cards: list[str],
+        community_cards: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """
+        [PHASE 3] Get abstracted hand information (canonical + bucket).
+        
+        Args:
+            hole_cards: List of 2 hole cards
+            community_cards: Community cards (for postflop bucketing)
+        
+        Returns:
+            {
+                'canonical_hole': (card, card),
+                'canonical_board': (card, ...) or None,
+                'equity_bucket': int (0-99) or None,
+                'hand_name': str (e.g., 'AKs'),
+            }
+        """
+        if not self._card_abstractor or len(hole_cards) != 2:
+            return {}
+        
+        board = tuple(community_cards) if community_cards else None
+        return self._card_abstractor.abstract_observation(
+            tuple(hole_cards),
+            board,
+        )
+
     def _encode_env_metrics(self, raw_state: dict[str, Any]) -> torch.Tensor:
         """Encode environment metrics as a normalized float vector.
 
         [FIX H1] Chip normalization is bounded to [0, 1] via 5x stack cap,
         replacing the previous unbounded log-scale approach.
+        
+        [PHASE 1] pot_odds added as explicit feature for Deep CFR.
+        pot_odds = pot / amount_to_call (capped at 20.0 for normalization).
+        Critical for correct fold/call decisions without implicit deduction.
         """
         big_blind: float = float(raw_state.get("big_blind", 2.0))
         if big_blind <= 0:
@@ -342,11 +428,21 @@ class ObservationBuilder:
         amount_to_call: float = float(raw_state.get("amount_to_call", 0.0))
         min_raise:      float = float(raw_state.get("min_raise", big_blind))
 
+        # [PHASE 1] pot_odds for Deep CFR: pot / amount_to_call
+        # Normalized: min(pot_odds, 20.0) / 20.0 → [0, 1]
+        # 0.0 = folding for free, 20+ = getting great odds
+        if amount_to_call > 0:
+            pot_odds: float = pot / amount_to_call
+        else:
+            pot_odds: float = 0.0  # Free check (no call required)
+        normalized_pot_odds: float = min(pot_odds, 20.0) / 20.0
+
         metrics: list[float] = [
             _normalize_chips(pot),
             _normalize_chips(my_chips),
             _normalize_chips(amount_to_call),
             _normalize_chips(min_raise),
+            normalized_pot_odds,  # NEW: pot_odds for Deep CFR
         ]
 
         opponent_chips: list[float] = raw_state.get("opponent_chips", [])
@@ -354,7 +450,7 @@ class ObservationBuilder:
             metrics.append(_normalize_chips(float(opp_stack)))
 
         expected_opponents: int = self.config.num_players - 1
-        while len(metrics) < 4 + expected_opponents:
+        while len(metrics) < 5 + expected_opponents:  # 5 base metrics (was 4)
             metrics.append(0.0)
 
         return torch.tensor(metrics, dtype=torch.float32)

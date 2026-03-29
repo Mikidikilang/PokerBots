@@ -1,6 +1,27 @@
 # =============================================================================
 # PokerAI-Project: Központi Hiperparaméter és Konfigurációs Fájl
 # =============================================================================
+#
+# [PHASE 1 - DEEP CFR TRANSITION] MAJOR BREAKING CHANGES:
+# 
+# 1. REWARD SHAPING REMOVED: RewardShaper class deleted entirely.
+#    Pure chip EV learning only (no bluff penalties, no aggression bonuses).
+#
+# 2. ACTION SPACE EXPANDED: 11 -> 12 actions (CHECK/CALL separated).
+#    FOLD (0), CHECK (1), CALL (2), MIN_RAISE (3), ...
+#    Critical for learning check-raise dynamics.
+#
+# 3. POT_ODDS ADDED: Explicit feature in env_metrics for Deep CFR.
+#    pot_odds = pot / amount_to_call (normalized to [0, 1]).
+#
+# 4. HEADS-UP ONLY (PHASE 1): num_players = 2 exclusively.
+#    CFR has mathematical convergence guarantees in 2-player zero-sum games.
+#    6-Max support will be re-enabled in Phase 2 after proving CFR stability.
+#
+# ALL EXISTING CHECKPOINTS ARE INCOMPATIBLE. RETRAIN FROM SCRATCH.
+#
+# =============================================================================
+
 # Ez a fájl a rendszer EGYETLEN IGAZSÁGFORRÁSA (Single Source of Truth) az
 # összes hiperparaméter, küszöbérték, elérési út és architektúra beállítás
 # számára. A DynamicConfigReloader (src/orchestrator/orchestrator.py) figyeli
@@ -36,7 +57,7 @@ runtime:
 environment:
   game_engine: "rlcard"                 # Játékmotor backend: "rlcard" vagy "pettingzoo"
   game_type: "no-limit-holdem"
-  num_players: 6                        # Asztalméret: 2, 3, 4, 6, 8, 9
+  num_players: 2                        # [PHASE 1] Heads-up only (was 6). CFR has guaranteed convergence in 2-player zero-sum games.
   initial_stack_bb: 200                 # Induló zsetonkészlet Big Blind egységben
   small_blind: 1                        # Kisvak mérete (abszolút chip érték)
   big_blind: 2                          # Nagyvak mérete (abszolút chip érték)
@@ -57,19 +78,20 @@ environment:
   # --- Akciótér (Action Space) ---
   action_space:
     type: "discrete"                    # Diszkretizált akciótér
-    num_actions: 11                     # 11 lehetséges akció (0-10 index)
+    num_actions: 12                     # 12 lehetséges akció (0-11 index) — CHECK és CALL szeparálva Deep CFR-hez
     actions:
       0: "fold"                         # Dobás
-      1: "check_call"                   # Passz / Megadás
-      2: "min_raise"                    # Minimum emelés
-      3: "raise_0.25x_pot"             # 1/4 pot — early position sizing
-      4: "raise_0.33x_pot"             # 1/3 pot block bet (GTO range bet / blocker bet)
-      5: "raise_0.5x_pot"              # Fél pot emelés
-      6: "raise_0.75x_pot"             # 3/4 pot emelés
-      7: "raise_1.0x_pot"              # Teljes pot emelés
-      8: "raise_1.5x_pot"              # Másfélszeres pot (overbet)
-      9: "raise_2.0x_pot"              # Kétszeres pot (deep overbet)
-      10: "all_in"                      # Teljes zsetonkészlet betolása
+      1: "check"                        # Passz (amount_to_call = 0) — NEW for check-raise learning
+      2: "call"                         # Megadás (amount_to_call > 0) — NEW for check-raise learning
+      3: "min_raise"                    # Minimum emelés
+      4: "raise_0.25x_pot"             # 1/4 pot — early position sizing
+      5: "raise_0.33x_pot"             # 1/3 pot block bet (GTO range bet / blocker bet)
+      6: "raise_0.5x_pot"              # Fél pot emelés
+      7: "raise_0.75x_pot"             # 3/4 pot emelés
+      8: "raise_1.0x_pot"              # Teljes pot emelés
+      9: "raise_1.5x_pot"              # Másfélszeres pot (overbet)
+      10: "raise_2.0x_pot"             # Kétszeres pot (deep overbet)
+      11: "all_in"                     # Teljes zsetonkészlet betolása
     illegal_action_logit_mask: -1.0e+8  # LEGACY fallback; a kód torch.finfo(dtype).min-t használ (AMP-safe)
 
 # ---------------------------------------------------------------------------

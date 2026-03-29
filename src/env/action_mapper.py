@@ -6,24 +6,26 @@ mivel bármilyen összeg emelhető a minimális emelés és az all-in között.
 A gyakorlatban és a csúcsmodell AI-k (Libratus, Pluribus) esetében a folytonos
 akciótér instabil, nehezen optimalizálható stratégiákat eredményez.
 
-Ez a modul egy 9-dimenziós diszkretizált akcióteret implementál, amely:
+Ez a modul egy 12-dimenziós diszkretizált akcióteret implementál, amely:
     1. A hálózat Softmax kimeneti indexét szemantikai póker akcióvá fordítja
     2. Kiszámítja a pot-relatív tétméreteket chip értékekben
     3. Érvényesíti a legális akciók maszkját a Softmax logitok szintjén
     4. Kezeli az edge case-eket (nem elegendő stack, minimum raise szabály)
+    5. Különösen kezeli a CHECK és CALL akciókat (Deep CFR feltételezés)
 
-Akció Index Tábla (11 diszkrét akció):
+Akció Index Tábla (12 diszkrét akció):
     0 = Fold (Dobás)
-    1 = Check / Call (Passz / Megadás)
-    2 = Min-Raise (Legkisebb legális emelés)
-    3 = Raise 0.25x Pot (25% pot — early position sizing)
-    4 = Raise 0.33x Pot (GTO range bet / block bet)
-    5 = Raise 0.5x Pot
-    6 = Raise 0.75x Pot
-    7 = Raise 1.0x Pot
-    8 = Raise 1.5x Pot (Overbet)
-    9 = Raise 2.0x Pot (Deep Overbet)
-    10 = All-in (Teljes stack betolás)
+    1 = Check (Passz — csak ha nincs bet)
+    2 = Call (Megadás — szükséges ha van bet)
+    3 = Min-Raise (Legkisebb legális emelés)
+    4 = Raise 0.25x Pot (25% pot — early position sizing)
+    5 = Raise 0.33x Pot (GTO range bet / block bet)
+    6 = Raise 0.5x Pot
+    7 = Raise 0.75x Pot
+    8 = Raise 1.0x Pot
+    9 = Raise 1.5x Pot (Overbet)
+    10 = Raise 2.0x Pot (Deep Overbet)
+    11 = All-in (Teljes stack betolás)
 
 Hivatkozások:
     - Specifikáció: Akciótér szekció (9 diszkrét akció)
@@ -48,36 +50,45 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 class PokerAction(IntEnum):
-    """A diszkretizált akciótér 11 lehetséges lépésének enumerációja.
+    """A diszkretizált akciótér 12 lehetséges lépésének enumerációja.
 
     Minden akció egy egyértelmű indexet kap, amelyet a Softmax kimeneti
     réteg valószínűségi eloszlásként ad vissza.
 
-    Action space (11 buckets — checkpoint-breaking change):
+    CHECK és CALL szeparálása kritikus Deep CFR-hez:
+    - CHECK (1): passzív akció, ha amount_to_call = 0
+    - CALL (2): passzív akció, ha amount_to_call > 0
+
+    Ez lehetővé teszi a hálózatnak, hogy megtanuljon check-raise dinamikát
+    és pontos pozíciós alkalmazkodást.
+
+    Action space (12 buckets — checkpoint-breaking change):
         0  Fold
-        1  Check / Call
-        2  Min-Raise
-        3  Raise 0.25x Pot  ← NEW: 25% pot early position sizing
-        4  Raise 0.33x Pot  (GTO range bet / block bet)
-        5  Raise 0.50x Pot
-        6  Raise 0.75x Pot
-        7  Raise 1.0x Pot
-        8  Raise 1.5x Pot   (overbet)
-        9  Raise 2.0x Pot   (deep overbet)
-        10 All-in
+        1  Check  ← NEW: separated from CALL for check-raise learning
+        2  Call   ← NEW: separated from CHECK
+        3  Min-Raise
+        4  Raise 0.25x Pot
+        5  Raise 0.33x Pot  (GTO range bet / block bet)
+        6  Raise 0.50x Pot
+        7  Raise 0.75x Pot
+        8  Raise 1.0x Pot
+        9  Raise 1.5x Pot   (overbet)
+        10 Raise 2.0x Pot   (deep overbet)
+        11 All-in
     """
 
     FOLD = 0
-    CHECK_CALL = 1
-    MIN_RAISE = 2
-    RAISE_QUARTER_POT = 3              # NEW — 25% pot early position sizing
-    RAISE_THIRD_POT = 4                # 33% pot block/range bet
-    RAISE_HALF_POT = 5
-    RAISE_THREE_QUARTER_POT = 6
-    RAISE_FULL_POT = 7
-    RAISE_1_5X_POT = 8
-    RAISE_2X_POT = 9
-    ALL_IN = 10
+    CHECK = 1
+    CALL = 2
+    MIN_RAISE = 3
+    RAISE_QUARTER_POT = 4              # 25% pot early position sizing
+    RAISE_THIRD_POT = 5                # 33% pot block/range bet
+    RAISE_HALF_POT = 6
+    RAISE_THREE_QUARTER_POT = 7
+    RAISE_FULL_POT = 8
+    RAISE_1_5X_POT = 9
+    RAISE_2X_POT = 10
+    ALL_IN = 11
 
 
 # Pot-relatív szorzók az emelési akciókhoz
@@ -91,8 +102,8 @@ _RAISE_MULTIPLIERS: dict[PokerAction, float] = {
     PokerAction.RAISE_2X_POT: 2.00,
 }
 
-NUM_ACTIONS: int = 11
-"""Az akciótér teljes dimenziója (11 — expanded from 10 with 0.25x pot)."""
+NUM_ACTIONS: int = 12
+"""Az akciótér teljes dimenziója (12 — CHECK és CALL szeparálva Deep CFR-hez)."""
 
 ILLEGAL_ACTION_LOGIT: float = -1.0e8
 """Az illegális akciók logitjaihoz hozzáadott extrém negatív szám.

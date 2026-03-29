@@ -39,7 +39,7 @@ class TestConfigIntegrity:
         assert gto["6"]["vpip"][1] > gto["9"]["vpip"][1]
 
     def test_action_space_consistency(self, sample_config: dict) -> None:
-        assert sample_config["environment"]["action_space"]["num_actions"] == 11
+        assert sample_config["environment"]["action_space"]["num_actions"] == 12
 
     def test_ppo_params_valid(self, sample_config: dict) -> None:
         ppo = sample_config["ppo"]
@@ -72,7 +72,7 @@ class TestCrossModuleWiring:
             from src.model.networks import NetworkConfig
             num_players = sample_config["environment"]["num_players"]
             net_cfg = NetworkConfig.from_dict(sample_config, num_players=num_players)
-            assert net_cfg.num_actions == 11
+            assert net_cfg.num_actions == 12
             assert net_cfg.card_input_dim == 52
             assert net_cfg.trunk_input_dim == (
                 net_cfg.card_embed_dim * 2 + net_cfg.context_embed_dim + net_cfg.history_embed_dim
@@ -99,11 +99,6 @@ class TestCrossModuleWiring:
         mgr = CurriculumManager.from_dict(sample_config)
         assert len(mgr.phases) == 3  # Phase 0, 1, 2
 
-    def test_reward_shaper_from_yaml(self, sample_config: dict) -> None:
-        from src.orchestrator.reward_shaper import RewardShapingConfig
-        cfg = RewardShapingConfig.from_dict(sample_config)
-        assert cfg.bluff_penalty_lambda == sample_config["reward_shaping"]["bluff_penalty_lambda"]
-
     def test_shutdown_from_yaml(self, sample_config: dict) -> None:
         from src.mlops.fault_tolerance import ShutdownConfig
         cfg = ShutdownConfig.from_dict(sample_config)
@@ -120,7 +115,6 @@ class TestCrossModuleWiring:
         from src.training.runner import RunnerConfig
         from src.orchestrator.telemetry import TelemetryAnalyzer
         from src.orchestrator.curriculum import CurriculumManager
-        from src.orchestrator.reward_shaper import RewardShaper
         from src.mlops.state_manager import RNGStateManager, CheckpointManager
         from src.mlops.fault_tolerance import GracefulShutdownMonitor, FaultHandler
         from src.mlops.hf_sync import configure_headless_auth

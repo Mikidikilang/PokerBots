@@ -34,7 +34,6 @@ import yaml
 
 from src.orchestrator.telemetry import TelemetryAnalyzer, HandRecord
 from src.orchestrator.curriculum import CurriculumManager, CurriculumPhase
-from src.orchestrator.reward_shaper import RewardShaper, RewardShapingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -92,10 +91,6 @@ class AutoAdaptiveOrchestrator:
         )
 
         self.curriculum: CurriculumManager = CurriculumManager.from_dict(yaml_config)
-
-        self.reward_shaper: RewardShaper = RewardShaper(
-            RewardShapingConfig.from_dict(yaml_config)
-        )
 
         table_key: str = str(config.num_players)
         self._gto_targets: dict[str, list[float]] = yaml_config.get(
@@ -201,10 +196,9 @@ class AutoAdaptiveOrchestrator:
         result["anomalies"] = anomalies
         self._last_anomalies = anomalies
 
-        rs_cfg = self.reward_shaper.config
         if self.telemetry.check_stagnation(
-            reward_window=rs_cfg.stagnation_window,
-            threshold=rs_cfg.stagnation_threshold,
+            reward_window=2000,
+            threshold=0.02,
         ):
             anomalies.append("stagnation")
 
@@ -243,13 +237,6 @@ class AutoAdaptiveOrchestrator:
         interventions: list[str] = []
 
         if not anomalies:
-            current_lambda = self.reward_shaper.config.bluff_penalty_lambda
-            current_bonus = self.reward_shaper.config.preflop_aggression_bonus
-            if current_lambda > 0.0 or current_bonus > 0.0:
-                self.reward_shaper.update_penalty_lambda(current_lambda * 0.5)
-                self.reward_shaper.update_aggression_bonus(current_bonus * 0.5)
-                if self.reward_shaper.config.bluff_penalty_lambda < 0.01:
-                    self.reward_shaper.deactivate_all_shaping()
             return []
 
         if (iteration - self._last_intervention_iter) < self._intervention_cooldown:
@@ -266,11 +253,8 @@ class AutoAdaptiveOrchestrator:
         if "passivity" in anomalies:
             self._intervene_passivity(metrics)
             interventions.append("entropy_boost")
-            interventions.append("aggression_bonus_activated")
 
-        if "maniac" in anomalies:
-            self._intervene_maniac(metrics)
-            interventions.append("bluff_penalty_activated")
+
 
         if "stagnation" in anomalies:
             self._intervene_stagnation()
@@ -288,21 +272,22 @@ class AutoAdaptiveOrchestrator:
         return interventions
 
     def _intervene_passivity(self, metrics: dict[str, float]) -> None:
-        """Passzivitas korrekcios beavatkozas.
+        """Passzivitas korrekcios beavatkozas (entropia boost only).
 
-        [FIX M5] Entropy CAP logging moved to DEBUG (normal operation, not a warning).
+        Reward shaping has been removed for Deep CFR compatibility.
+        [PHASE 1] Entropy boost only.
         """
         if self._trainer_ref is not None:
             current_ent: float = getattr(
                 getattr(self._trainer_ref, "config", None),
                 "entropy_coef", 0.01,
             )
-            boost: float = self.reward_shaper.config.entropy_boost_factor
+            # Fixed boost factor (removed from reward_shaper.config)
+            boost: float = 1.5
             new_ent: float = min(current_ent * boost, self._max_entropy_coef)
             at_cap = new_ent >= self._max_entropy_coef
 
             if at_cap:
-                # [FIX M5] DEBUG not WARNING — hitting the cap is normal
                 logger.debug(
                     "Entropy CAP reached (normal operation): %.4f >= %.4f max. "
                     "Further boost blocked — this is expected behaviour.",
@@ -310,8 +295,7 @@ class AutoAdaptiveOrchestrator:
                 )
             else:
                 logger.info(
-                    "Passzivitas intervencio: entropia %.4f -> %.4f "
-                    "(x%.1f, max=%.4f)",
+                    "Passzivitas intervencio: entropia %.4f -> %.4f (x%.1f, max=%.4f)",
                     current_ent, new_ent, boost, self._max_entropy_coef,
                 )
 
@@ -322,37 +306,30 @@ class AutoAdaptiveOrchestrator:
                 "Hivasad a set_trainer_reference()-t?"
             )
 
-        self.reward_shaper.update_aggression_bonus(0.1)
-        logger.info("Passzivitas intervencio: agresszio bonus aktivalva: +0.1")
-
-    def _intervene_maniac(self, metrics: dict[str, float]) -> None:
-        self.reward_shaper.update_penalty_lambda(0.5)
-        logger.info("Maniac intervencio: bloff buntetes lambda=0.5 aktiválva")
-
     def _intervene_stagnation(self) -> None:
-        """Stagnacio korrekcios beavatkozas.
+        """Stagnacio korrekcios beavatkozas (entropia boost only).
 
-        [FIX M5] Entropy CAP logging moved to DEBUG (normal operation).
+        Reward shaping has been removed for Deep CFR compatibility.
+        [PHASE 1] Entropy boost only.
         """
         if self._trainer_ref is not None:
             current_ent: float = getattr(
                 getattr(self._trainer_ref, "config", None),
                 "entropy_coef", 0.01,
             )
-            boost: float = self.reward_shaper.config.entropy_boost_factor
+            # Fixed boost factor (removed from reward_shaper.config)
+            boost: float = 1.5
             new_ent: float = min(current_ent * boost, self._max_entropy_coef)
             at_cap = new_ent >= self._max_entropy_coef
 
             if at_cap:
-                # [FIX M5] DEBUG not WARNING
                 logger.debug(
                     "Stagnacio: Entropy CAP reached (normal): %.4f >= %.4f max.",
                     new_ent, self._max_entropy_coef,
                 )
             else:
                 logger.info(
-                    "Stagnacio intervencio: entropia %.4f -> %.4f "
-                    "(x%.1f, max=%.4f)",
+                    "Stagnacio intervencio: entropia %.4f -> %.4f (x%.1f, max=%.4f)",
                     current_ent, new_ent, boost, self._max_entropy_coef,
                 )
 
@@ -360,13 +337,11 @@ class AutoAdaptiveOrchestrator:
 
     def _on_phase_transition(self) -> None:
         """Callback a fazisatmenet utan."""
-        self.reward_shaper.deactivate_all_shaping()
-
         if self.curriculum.current_phase.value == 2:
             self._save_fsp_snapshot()
 
         logger.info(
-            "Fazisatmenet utomunkak: reward shaping resetelve, "
+            "Fazisatmenet utomunkak: "
             "uj fazis: %s, opponents: %s",
             self.curriculum.current_phase.name,
             self.curriculum.get_current_opponents(),
@@ -484,13 +459,8 @@ class AutoAdaptiveOrchestrator:
             self._trainer_ref.update_learning_rate(new_lr)
             self._trainer_ref.update_entropy_coef(new_ent)
 
-        new_lambda: float = rs_cfg.get("bluff_penalty_lambda", 0.0)
-        new_bonus: float = rs_cfg.get("preflop_aggression_bonus", 0.0)
-        self.reward_shaper.update_penalty_lambda(new_lambda)
-        self.reward_shaper.update_aggression_bonus(new_bonus)
-
         self._yaml_config = new_cfg
-        logger.debug("Hot-reload alkalmazva: lr, entropy, lambda, bonus frissitve.")
+        logger.debug("Hot-reload alkalmazva: lr, entropy frissitve.")
 
     # =========================================================================
     # Allapot Mentes / Betoltes
@@ -499,7 +469,6 @@ class AutoAdaptiveOrchestrator:
     def get_state(self) -> dict[str, Any]:
         return {
             "curriculum_state": self.curriculum.get_state(),
-            "reward_shaper_stats": self.reward_shaper.get_stats(),
             "intervention_count": self._intervention_count,
             "last_anomalies": self._last_anomalies,
             "telemetry_total_hands": self.telemetry._total_hands,
@@ -524,6 +493,5 @@ class AutoAdaptiveOrchestrator:
             "gto_distance": self.telemetry.compute_gto_distance(self._gto_targets),
             "intervention_count": self._intervention_count,
             "last_anomalies": self._last_anomalies,
-            "reward_shaper_stats": self.reward_shaper.get_stats(),
             "ucb_stats": self.curriculum.get_ucb_stats(),
         }

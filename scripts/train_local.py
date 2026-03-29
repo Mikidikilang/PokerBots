@@ -13,7 +13,15 @@ Lokalis Training CLI Belepesi Pont (train_local.py).
          env.set_active_opponent() so the correct bot is in place for
          the NEXT rollout.
 
-[FIX R-1 — 2025-03-28] DDP Checkpoint Deadlock fixed in on_checkpoint.
+
+
+
+
+
+
+
+
+         [FIX R-1 — 2025-03-28] DDP Checkpoint Deadlock fixed in on_checkpoint.
 [FIX C-2 — 2025-03-28] Shutdown signal broadcast to all DDP ranks.
 [FIX H-1 — 2025-03-28] _session_start captured BEFORE build_training_pipeline().
 """
