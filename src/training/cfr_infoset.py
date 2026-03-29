@@ -62,6 +62,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
+import torch
+
 from .dcfr_params import DCFRParameters, apply_dcfr_update
 
 logger = logging.getLogger(__name__)
@@ -94,6 +96,13 @@ class InformationSet:
     hole_cards: tuple[str, str]              # e.g., ('A', 'K')
     board_cards: tuple[str, ...]             # e.g., ('Q', 'J', 'T') or ()
     action_history: tuple[str, ...]          # e.g., ('check', 'raise')
+    
+    # ★ AUDIT FIX #4 ★: Store observation tensor for this infoset
+    # This is populated during tree traversal when the infoset is first visited.
+    # Required for strategy network training via behavioral cloning:
+    #   inputs: obs_tensor (flattened state representation)
+    #   targets: average_strategy (action probability distribution)
+    obs_tensor: Optional[torch.Tensor] = None  # Shape [obs_dim], populated on first visit
     
     # Regret tracking
     cumulative_regret: dict[int, float] = field(default_factory=dict)
@@ -189,6 +198,12 @@ class InformationSet:
             regret_updated = (
                 self.regret_discount_factor * regret_old + regret_value
             )
+        
+        # ★ AUDIT FIX #5 ★: CFR+ (Regret Matching Plus) — Clamp to zero
+        # CFR+ convergence is 10–1000× faster than vanilla CFR.
+        # This clamps cumulative regrets to [0, ∞) each iteration.
+        # Reference: "Regret Matching+" (Burch et al., 2014)
+        regret_updated = max(regret_updated, 0.0)
         
         self.cumulative_regret[action] = regret_updated
         self.regret_sum_squared[action] += regret_value ** 2
@@ -346,15 +361,22 @@ class InformationSetStorage:
         hole_cards: tuple[str, str],
         board_cards: tuple[str, ...],
         action_history: tuple[str, ...],
+        obs_tensor: Optional[torch.Tensor] = None,
     ) -> InformationSet:
         """
         Get existing infoset or create new one.
+        
+        ★ AUDIT FIX #4.5 ★: Optional obs_tensor parameter for behavioral cloning.
+        If provided and infoset is newly created, store the observation tensor.
+        This tensor is used later for strategy network training.
         
         Args:
             player: 0 or 1 (heads-up)
             hole_cards: Tuple of two card strings
             board_cards: Tuple of 0-5 card strings
             action_history: Tuple of action names
+            obs_tensor: Optional[torch.Tensor] of shape [obs_dim] for this infoset.
+                       Stored for behavioral cloning of average strategy.
         
         Returns:
             InformationSet object
@@ -362,13 +384,17 @@ class InformationSetStorage:
         infoset_id = hash_infoset(player, hole_cards, board_cards, action_history)
         
         if infoset_id not in self.infosets:
-            self.infosets[infoset_id] = InformationSet(
+            infoset = InformationSet(
                 infoset_id=infoset_id,
                 player=player,
                 hole_cards=hole_cards,
                 board_cards=board_cards,
                 action_history=action_history,
             )
+            # Populate obs_tensor if provided (first visit to this infoset)
+            if obs_tensor is not None:
+                infoset.obs_tensor = obs_tensor
+            self.infosets[infoset_id] = infoset
             self.created_count += 1
         
         return self.infosets[infoset_id]

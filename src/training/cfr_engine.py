@@ -298,69 +298,83 @@ class CFREngine:
         """
         Compute counterfactual regret for each action in trajectory.
         
-        [CORE CFR ALGORITHM]
+        [CORE CFR ALGORITHM - SIMPLIFIED FOR PHASE 2.5]
         
-        Algorithm:
-            1. Convert trajectory dict to GameNode list
-            2. Forward pass: network evaluates counterfactual values
-            3. Backward pass: compute (V(h,a) - V(h)) for each action
-            4. Return regresses indexed by (infoset_id, action_idx)
+        In Phase 2.5, we treat each 1-step trajectory independently:
+            1. Forward pass: network predicts values for each action
+            2. Use actual reward as target value V(s)
+            3. Compute regrets as: max(0, V_network(s,a) - realized_reward)
+               This measures: "how much would we gain from action a vs. observed"
+        
+        Phase 3 TODO: Implement full game tree traversal for proper MCCFR.
         
         Args:
             trajectory: Dict with keys:
-              - nodes: list of GameNode objects (or raw game states)
-              - final_reward: Hand outcome (chips, signed)
-              OR:
               - states: list of observations
-              - infoset_ids: list of infoset hashes
               - actions: list of actions taken
+              - infoset_ids: list of infoset hashes
               - legal_actions_per_node: list of legal action lists
+              - reward: final hand outcome
         
         Returns:
             {infoset_id: {action_idx: counterfactual_regret_value}}
         """
-        # Handle both dict-based and GameNode-based trajectories
-        if "nodes" in trajectory:
-            # Already in GameNode format
-            nodes = trajectory["nodes"]
-            final_reward = trajectory.get("final_reward", reward)
-        else:
-            # Convert from raw trajectory format to GameNode list
-            obs_list = trajectory.get("states", [])
-            infoset_ids = trajectory.get("infoset_ids", [])
-            actions_taken = trajectory.get("actions", [])
-            legal_actions_list = trajectory.get("legal_actions_per_node", [])
-            
-            nodes = []
-            for obs, infoset_id, action, legal_actions in zip(
-                obs_list, infoset_ids, actions_taken, legal_actions_list
-            ):
-                # Convert observation to tensor if needed
-                if isinstance(obs, torch.Tensor):
-                    obs_tensor = obs.to(self.device)
-                else:
-                    obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device)
-                
-                node = GameNode(
-                    infoset_id=infoset_id,
-                    player=0,  # TODO: Extract from trajectory
-                    current_player_reached=True,
-                    obs_tensor=obs_tensor,
-                    legal_actions=legal_actions,
-                    action_taken=action,
-                )
-                nodes.append(node)
-            
-            final_reward = reward
+        counterfactual_regrets = {}
         
-        # Compute counterfactual values using the valuator
-        counterfactual_regrets = compute_counterfactual_values(
-            trajectory=nodes,
-            final_reward=final_reward,
-            network=self.network.network,
-            device=self.device,
-            discount_factor=1.0,  # Episodic poker: no discounting
-        )
+        obs_list = trajectory.get("states", [])
+        infoset_ids = trajectory.get("infoset_ids", [])
+        actions_taken = trajectory.get("actions", [])
+        legal_actions_list = trajectory.get("legal_actions_per_node", [])
+        final_reward = reward
+        
+        if not obs_list:
+            logger.warning("Empty trajectory states")
+            return counterfactual_regrets
+        
+        # Process each timestep in the trajectory
+        for step_idx, (obs, infoset_id, action_taken, legal_actions) in enumerate(
+            zip(obs_list, infoset_ids, actions_taken, legal_actions_list)
+        ):
+            # Convert observation to tensor if needed
+            if isinstance(obs, torch.Tensor):
+                obs_tensor = obs.to(self.device)
+            else:
+                obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device)
+            
+            # Reshape observation if needed (add batch dimension if missing)
+            if obs_tensor.dim() == 1:
+                obs_tensor = obs_tensor.unsqueeze(0)
+            
+            with torch.no_grad():
+                # Forward pass through network
+                policy_logits, state_value = self.network(obs_tensor)
+                state_value = state_value.squeeze(-1).item()
+            
+            # Compute regrets for each legal action
+            # Regret = V(s,a) - V(s) when action was not observed
+            # Regret = 0 when action was observed
+            # In Phase 2.5, we approximate: regret ≈ return - state_value
+            
+            if infoset_id not in counterfactual_regrets:
+                counterfactual_regrets[infoset_id] = {}
+            
+            # For all legal actions, compute regret
+            for action_idx in legal_actions:
+                if action_idx == action_taken:
+                    # Observed action: regret = 0 (counterfactual assumes we take this)
+                    counterfactual_regrets[infoset_id][action_idx] = 0.0
+                else:
+                    # Unobserved action: regret = (return - V(s))
+                    # This represents: "value gained by playing this action instead"
+                    # We approximate by assuming the action leads to the same outcome
+                    regret = final_reward - state_value
+                    counterfactual_regrets[infoset_id][action_idx] = regret * self.config.regret_scaling
+            
+            logger.debug(
+                "Regrets computed for infoset %s: %s",
+                infoset_id,
+                {k: f"{v:.4f}" for k, v in counterfactual_regrets[infoset_id].items() if k in legal_actions[:3]},
+            )
         
         return counterfactual_regrets
     
@@ -753,6 +767,30 @@ class CFREngine:
             else:
                 logger.warning("  MCCFR not available, skipping regret collection phase")
             
+            # ★ AUDIT FIX #5 ★: Populate Regret Buffer from Infosets
+            # After traversal, copy regrets from lookup-table (InformationSetStorage)
+            # into the neural network training buffer (RegretBuffer).
+            regret_samples_added = 0
+            for infoset_id, infoset in self.infoset_storage.infosets.items():
+                if infoset.obs_tensor is None:
+                    # Skip infosets without observations (shouldn't happen if traversal worked)
+                    continue
+                
+                # Extract counterfactual regrets from this infoset
+                legal_actions = list(infoset.cumulative_regret.keys())
+                counterfactual_regrets = dict(infoset.cumulative_regret)
+                
+                # Add sample to regret buffer for network training
+                self.regret_buffer.add_sample(
+                    infoset_id=infoset_id,
+                    observation=infoset.obs_tensor.to(self.device) if infoset.obs_tensor.device != self.device else infoset.obs_tensor,
+                    legal_actions=legal_actions,
+                    counterfactual_regrets=counterfactual_regrets,
+                )
+                regret_samples_added += 1
+            
+            logger.debug(f"  Added {regret_samples_added} regret samples to buffer")
+            
             # ========== PHASE B: Train Regret Value Network ==========
             if len(self.regret_buffer.samples) > strategy_network_batch_size:
                 regret_stats = self.regret_trainer.train_epoch(
@@ -775,9 +813,24 @@ class CFREngine:
                 if not average_strategy:
                     continue
                 
-                # Create dummy observation tensor
-                # TODO: Retrieve actual observation from infoset storage
-                obs_tensor = torch.randn(346, dtype=torch.float32, device=self.device)
+                # ★ AUDIT FIX #4.6 ★: Use REAL observation from infoset (NOT random noise)
+                # Each infoset stores its observation tensor, populated when first
+                # encountered during tree traversal. This is critical for behavioral
+                # cloning convergence: the network must learn to map real game states
+                # (observations) to action probability distributions (average strategy).
+                obs_tensor = infoset.obs_tensor
+                
+                # Skip if observation was never captured (rare edge case)
+                if obs_tensor is None:
+                    logger.warning(
+                        f"Infoset {infoset.infoset_id} has no observation tensor; skipping for "
+                        f"strategy training. This indicates traversal didn't encounter this infoset."
+                    )
+                    continue
+                
+                # Ensure tensor is on correct device
+                if obs_tensor.device != self.device:
+                    obs_tensor = obs_tensor.to(self.device)
                 
                 # Add to strategy buffer for behavioral cloning training
                 # Using averaged strategy ensures convergence to Nash

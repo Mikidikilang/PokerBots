@@ -31,6 +31,8 @@ import torch
 from src.training.buffer import RolloutBuffer, RolloutBufferConfig
 from src.training.collector import RolloutCollector
 from src.training.trainer import PPOTrainer, TrainerConfig
+from src.training.cfr_adapter import CFRTrajectoryAdapter  # [PHASE 2.5B] CFR support
+from src.training.cfr_engine import CFREngine, CFRConfig    # [PHASE 2.5B] CFR support
 
 logger = logging.getLogger(__name__)
 
@@ -102,16 +104,33 @@ class TrainingRunner:
         self.buffer: RolloutBuffer = RolloutBuffer(
             buffer_config or RolloutBufferConfig()
         )
-        self.trainer: PPOTrainer = PPOTrainer(
-            trainer_config or TrainerConfig(),
-            network, self.device,
-        )
+        
+        # [PHASE 2.5B] Algorithm selection: PPO (legacy) vs CFR (new)
+        yaml_config = yaml_config or {}
+        cfr_cfg = yaml_config.get("cfr", {})
+        training_algorithm = cfr_cfg.get("training_algorithm", "ppo")
+        
+        if training_algorithm == "cfr":
+            # [PHASE 2.5B] Instantiate Deep CFR engine
+            cfr_config = CFRConfig.from_dict(yaml_config)
+            self.trainer: CFREngine | PPOTrainer = CFREngine(
+                cfr_config, network, self.device
+            )
+            self.cfr_adapter = CFRTrajectoryAdapter()
+        else:
+            # Backward compatible: default to PPO training
+            self.trainer: CFREngine | PPOTrainer = PPOTrainer(
+                trainer_config or TrainerConfig(),
+                network, self.device,
+            )
+            self.cfr_adapter = None
+        
         self.collector: RolloutCollector = RolloutCollector(
             network=network,
             env=env,
             obs_builder=obs_builder,
             buffer=self.buffer,
-            config=yaml_config or {},
+            config=yaml_config,
             orchestrator=orchestrator,
             device=self.device,
         )
@@ -294,11 +313,17 @@ class TrainingRunner:
             )
             raise
 
-        # 3. PPO Gradiens frissites — NaN/Inf detektalas
+        # 3. PPO/CFR Gradiens frissites — NaN/Inf detektalas
         try:
-            train_stats: dict[str, float] = self.trainer.train_on_buffer(self.buffer)
+            # [PHASE 2.5B] Dispatch based on training algorithm
+            if isinstance(self.trainer, CFREngine):
+                # Deep CFR path: convert buffer to CFR trajectories and train
+                train_stats: dict[str, float] = self._train_cfr_step()
+            else:
+                # PPO path (backward compatible)
+                train_stats: dict[str, float] = self.trainer.train_on_buffer(self.buffer)
 
-            for key in ("policy_loss", "value_loss", "total_loss"):
+            for key in ("policy_loss", "value_loss", "total_loss", "cfr_loss"):
                 loss_val: float = train_stats.get(key, 0.0)
                 if loss_val != loss_val or abs(loss_val) == float("inf"):
                     raise FloatingPointError(
@@ -344,6 +369,39 @@ class TrainingRunner:
         self.buffer.reset()
 
         return iter_stats
+
+    # =========================================================================
+    # [PHASE 2.5B] Deep CFR Training Step
+    # =========================================================================
+
+    def _train_cfr_step(self) -> dict[str, float]:
+        """
+        Converts buffer to CFR trajectories and trains regret/strategy networks.
+        
+        Flow:
+            1. Get mini-batches from buffer
+            2. Convert each batch to CFR trajectory format via adapter
+            3. Accumulate all trajectories
+            4. Call CFREngine.train_on_rollouts() with full trajectory list
+        
+        Returns:
+            Training stats dict with CFR-specific metrics
+        """
+        all_trajectories = []
+        
+        # Iterate through mini-batches from buffer
+        for batch in self.buffer.get_mini_batches():
+            # Convert PPO batch format to CFR trajectory format
+            trajectories = self.cfr_adapter.batch_to_cfr_trajectories(batch)
+            all_trajectories.extend(trajectories)
+        
+        # Train CFR networks on accumulated trajectories
+        if not all_trajectories:
+            logger.warning("No trajectories generated for CFR training")
+            return {"cfr_loss": 0.0, "avg_regret": 0.0}
+        
+        train_stats = self.trainer.train_on_rollouts(all_trajectories)
+        return train_stats
 
     # =========================================================================
     # Checkpoint Kezeles

@@ -64,20 +64,38 @@ class EnvStateSnapshot:
         Capture complete game state from RLCard environment.
         
         Args:
-            env: RLCard environment instance
+            env: RLCard environment instance (or wrapper with ._env.game)
         
         Returns:
             EnvStateSnapshot with deep copies of all mutable state
         """
-        # RLCard structure: env._env.game contains game-specific state
-        game_state_copy = copy.deepcopy(env._env.game)
-        history_copy = copy.deepcopy(env._env.history)
-        payoffs_copy = copy.deepcopy(env._env.payoffs)
+        # Handle both wrapped and direct RLCard environments
+        game_obj = env
+        if hasattr(env, '_env'):
+            # Wrapped environment (RLCardWrapper)
+            game_obj = env._env
+        
+        # Deep copy game state
+        game_state_copy = copy.deepcopy(game_obj.game if hasattr(game_obj, 'game') else game_obj)
+        history_copy = copy.deepcopy(game_obj.history if hasattr(game_obj, 'history') else [])
+        payoffs_copy = copy.deepcopy(game_obj.payoffs if hasattr(game_obj, 'payoffs') else [])
+        
+        # Get current player
+        current_player = 0
+        if hasattr(game_obj, 'get_player_num'):
+            current_player = game_obj.get_player_num()
+        
+        # Get legal actions
+        legal_actions = []
+        if hasattr(game_obj, 'legal_actions'):
+            legal_actions = list(game_obj.legal_actions)
+        elif hasattr(env, 'get_legal_actions'):
+            legal_actions = list(env.get_legal_actions())
         
         return cls(
             game_state=game_state_copy,
-            current_player=env._env.game.get_player_num() if hasattr(env._env.game, 'get_player_num') else 0,
-            legal_actions=list(env._env.legal_actions) if hasattr(env._env, 'legal_actions') else [],
+            current_player=current_player,
+            legal_actions=legal_actions,
             history=history_copy,
             payoffs=payoffs_copy,
         )
@@ -87,15 +105,33 @@ class EnvStateSnapshot:
         Restore RLCard environment to this snapshot state.
         
         Args:
-            env: RLCard environment to restore into
+            env: RLCard environment to restore into (or wrapper)
         """
-        env._env.game = copy.deepcopy(self.game_state)
-        env._env.history = copy.deepcopy(self.history)
-        env._env.payoffs = copy.deepcopy(self.payoffs)
-        logger.debug(
-            "Restored env state: current_player=%s, legal_actions=%d",
-            self.current_player, len(self.legal_actions)
-        )
+        # Handle both wrapped and direct RLCard environments
+        game_obj = env
+        if hasattr(env, '_env'):
+            game_obj = env._env
+        
+        # Restore game state
+        if hasattr(game_obj, 'game'):
+            game_obj.game = copy.deepcopy(self.game_state)
+        else:
+            # Direct game environment
+            for attr_name in dir(self.game_state):
+                if not attr_name.startswith('_') and not callable(getattr(self.game_state, attr_name, None)):
+                    try:
+                        setattr(game_obj, attr_name, copy.deepcopy(getattr(self.game_state, attr_name)))
+                    except (AttributeError, TypeError):
+                        pass
+        
+        # Restore history and payoffs
+        if hasattr(game_obj, 'history'):
+            game_obj.history = copy.deepcopy(self.history)
+        if hasattr(game_obj, 'payoffs'):
+            game_obj.payoffs = copy.deepcopy(self.payoffs)
+        
+        # Skip excessive debug logging during normal traversal
+        # logger.debug("Restored env state")
 
 
 class EnvStateManager:
@@ -133,10 +169,8 @@ class EnvStateManager:
             if self.snapshot_stack:
                 restored = self.snapshot_stack.pop()
                 restored.restore(self.env)
-                logger.debug(
-                    "Savepoint exited: restored to snapshot (depth=%d)",
-                    len(self.snapshot_stack)
-                )
+                # Skip excessive debug logging
+                # logger.debug("Savepoint exited")
     
     def get_depth(self) -> int:
         """Returns current nesting depth of savepoints."""

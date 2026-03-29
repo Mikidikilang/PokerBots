@@ -133,9 +133,9 @@ class ObservationConfig:
     use_bet_encoding:     bool  = True    # enables dim 11 (bet ratio)
     
     # [PHASE 3] Card abstraction options
-    use_suit_isomorphism: bool  = False   # Lossless: 1,326 → 169 hands
-    use_equity_bucketing: bool  = False   # Lossy: discretize by equity
-    num_equity_buckets:   int   = 100     # Bucket count (0-99)
+    use_suit_isomorphism: bool  = True   # Lossless: 1,326 → 169 hands (★ AUDIT FIX #6 ★)
+    use_equity_bucketing: bool  = True   # Lossy: discretize by equity (★ AUDIT FIX #6 ★)
+    num_equity_buckets:   int   = 100    # Bucket count (0-99)
 
     def __post_init__(self) -> None:
         if not 2 <= self.num_players <= 9:

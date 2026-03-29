@@ -127,6 +127,7 @@ class RolloutBuffer:
         self._log_probs: list[torch.Tensor] = []
         self._values: list[torch.Tensor] = []
         self._dones: list[bool] = []
+        self._legal_actions: list[list[int]] = []  # [PHASE 2.5B] Legal actions for CFR
 
         # GAE szamitas eredmenyei (compute_gae() tolti fel)
         self._advantages: torch.Tensor | None = None
@@ -143,6 +144,7 @@ class RolloutBuffer:
         self._actions_tensor: torch.Tensor | None = None
         self._log_probs_tensor: torch.Tensor | None = None
         self._values_tensor: torch.Tensor | None = None
+        self._legal_actions_list: list[list[int]] = []  # [PHASE 2.5B] Store legal actions for batching
 
         logger.info(
             "RolloutBuffer inicializalva: size=%d, gamma=%.3f, "
@@ -204,6 +206,7 @@ class RolloutBuffer:
         log_prob: torch.Tensor,
         value: torch.Tensor,
         done: bool,
+        legal_actions: list[int] | None = None,  # [PHASE 2.5B] CFR support
     ) -> None:
         """Egyetlen atmenet (transition) hozzaadasa a bufferhez.
 
@@ -214,6 +217,8 @@ class RolloutBuffer:
             log_prob: Az akcio log-valoszinusege pi(a|s).
             value: Az allapot erteke V(s) a Critic-bol.
             done: True ha az epizod veget ert.
+            legal_actions: [PHASE 2.5B] Legal action indices for CFR. 
+                          If None, defaults to list(range(12)).
         """
         self._observations.append(observation)
         self._actions.append(action.detach())
@@ -221,6 +226,12 @@ class RolloutBuffer:
         self._log_probs.append(log_prob.detach())
         self._values.append(value.detach())
         self._dones.append(done)
+        
+        # [PHASE 2.5B] Store legal actions for CFR
+        if legal_actions is None:
+            legal_actions = list(range(12))  # Default: all actions legal
+        self._legal_actions.append(legal_actions)
+        
         self.pos += 1
 
         if self.pos >= self.config.buffer_size:
@@ -325,6 +336,9 @@ class RolloutBuffer:
              for v in self._values], dim=0
         )
         self._values_tensor = values_stacked.view(num_steps)
+        
+        # [PHASE 2.5B] Store legal actions for CFR trajectory conversion
+        self._legal_actions_list = list(self._legal_actions)
 
         logger.debug(
             "Consolidated batching tensors allocated: %d steps, obs keys=%d",
@@ -378,6 +392,11 @@ class RolloutBuffer:
                 for key, obs_tensor in self._obs_tensors.items()
             }
 
+            # [PHASE 2.5B] Extract legal actions for this batch
+            batch_legal_actions = [
+                self._legal_actions_list[int(idx)] for idx in batch_indices
+            ]
+
             batch: dict[str, Any] = {
                 "observations": batch_obs,
                 "actions": self._actions_tensor[batch_indices],
@@ -385,6 +404,7 @@ class RolloutBuffer:
                 "advantages": self._advantages[batch_indices],
                 "returns": self._returns[batch_indices],
                 "old_values": self._values_tensor[batch_indices],
+                "legal_actions": batch_legal_actions,  # [PHASE 2.5B] CFR support
             }
 
             logger.debug(
@@ -409,6 +429,7 @@ class RolloutBuffer:
         self._log_probs.clear()
         self._values.clear()
         self._dones.clear()
+        self._legal_actions.clear()  # [PHASE 2.5B] Reset legal actions
         self._advantages = None
         self._returns = None
         self.pos = 0
@@ -422,6 +443,7 @@ class RolloutBuffer:
         self._actions_tensor = None
         self._log_probs_tensor = None
         self._values_tensor = None
+        self._legal_actions_list = []  # [PHASE 2.5B] Reset consolidated legal actions
         logger.debug("RolloutBuffer resetelve (bootstrap ertek es konszolidalt tenzorok torolve).")
 
     def __len__(self) -> int:

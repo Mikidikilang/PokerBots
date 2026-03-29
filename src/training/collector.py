@@ -247,6 +247,15 @@ class RolloutCollector:
             self._total_steps += 1
 
             obs_tensor_cpu = {k: v.cpu() for k, v in obs_tensor.items()}
+            
+            # [PHASE 2.5B] Extract legal actions for CFR from action_mask
+            legal_actions: list[int] | None = None
+            if "action_mask" in obs_tensor:
+                mask = obs_tensor["action_mask"]  # Binary [12] tensor
+                legal_actions = torch.nonzero(mask == 1.0, as_tuple=False).squeeze(-1).tolist()
+                if not legal_actions:  # Safety fallback
+                    legal_actions = list(range(12))
+            
             self.buffer.add(
                 observation=obs_tensor_cpu,
                 action=action.detach(),
@@ -254,6 +263,7 @@ class RolloutCollector:
                 value=value.detach(),
                 reward=float(reward),
                 done=done,
+                legal_actions=legal_actions,  # [PHASE 2.5B] Pass legal actions
             )
 
             if done:

@@ -158,6 +158,45 @@ ppo:
     compression_level: 3                # Zstd kompressziós szint (1-22, optimum: 3)
 
 # ---------------------------------------------------------------------------
+# Deep CFR Konfiguráció (Alternative to PPO)
+# ---------------------------------------------------------------------------
+# [PHASE 2.5B] Új training loop: PPO helyett Deep CFR
+# Aktiválás: training_algorithm: "cfr" (alapértelmezés: "ppo")
+# 
+# Deep CFR (Brunner et al. 2021, Hart & Mas-Colell 1999):
+#   - Counterfactual Regret Minimization: R^t(a|h) = V(h|a) - V(h)
+#   - Pure DCFR (no importance weighting): O(1/√T) convergence guarantee
+#   - Strategy Averaging: σ̄(a|h) = (1/T) Σ σ^t(a|h) → Nash Equilibrium
+# ---------------------------------------------------------------------------
+cfr:
+  # --- Training Algorithm Flag ---
+  # Set to "cfr" to use Deep CFR instead of PPO
+  # Default: "ppo" (backward compatible)
+  training_algorithm: "ppo"             # Opciók: "ppo", "cfr"
+
+  # --- Optimization Parameters ---
+  learning_rate: 1.0e-3                 # CFR hálózat tanulási ráta (gyakran magasabb mint PPO)
+  adam_epsilon: 1.0e-5
+  max_grad_norm: 0.5
+  entropy_coefficient: 0.01             # Exploráció ösztönzés (behavioral cloning-ben)
+  num_epochs: 2                         # Epochs per CFR iteration
+
+  # --- Deep CFR Specifics ---
+  regret_discount: 1.0                  # Pure DCFR discount factor (1.0 = no discount)
+  regret_min_threshold: 0.0             # Regrets < threshold ignored (numerical stability)
+  regret_scaling: 1.0                   # Scale regret updates
+  
+  # --- Convergence Tracking ---
+  track_exploitability: true            # Compute Nash Distance (heads-up only)
+  exploitability_update_freq: 100       # Update every N iterations
+  
+  # --- Traversal Configuration ---
+  traversals_per_iteration: 500         # MCCFR External Sampling traversals
+  regret_network_updates: 4             # Update regret network N times per iteration
+  strategy_network_updates: 4           # Update strategy network N times per iteration
+  batch_size: 32                        # Mini-batch size for network training
+
+# ---------------------------------------------------------------------------
 # Auto-Adaptív Curriculum Orchestrator
 # ---------------------------------------------------------------------------
 orchestrator:

@@ -113,9 +113,21 @@ class CFRTrajectoryAdapter:
             # Generate infoset ID from observation
             infoset_id = self._generate_infoset_id(obs_dicts, i)
             
-            # Infer legal actions (all for now; better: extract from obs)
-            # TODO: Store legal actions in buffer or obs to avoid this
-            legal_actions = list(range(12))  # All 12 actions (heads-up)
+            # Extract legal actions from observation if available
+            # Otherwise fall back to all actions (12 for heads-up, 9 for 6-max preflop)
+            legal_actions = list(range(12))  # Default: all 12 legal actions
+            if "action_mask" in obs_dicts:
+                mask = obs_dicts["action_mask"][i]
+                # action_mask is binary [12]: 1.0 = legal, 0.0 = illegal
+                legal_actions = torch.nonzero(mask == 1.0, as_tuple=False).squeeze(-1).tolist()
+                if not legal_actions:  # Safety: if no legal actions detected, allow all
+                    logger.warning(f"No legal actions in action_mask at batch index {i}, using all")
+                    legal_actions = list(range(12))
+            elif "legal_actions" in batch:
+                # If batch dict has a legal_actions field directly
+                legal_actions = batch["legal_actions"][i]
+                if isinstance(legal_actions, torch.Tensor):
+                    legal_actions = legal_actions.tolist()
             
             # Convert single obs_flat entry back to tensor for CFREngine
             obs_tensor = self._obs_dict_to_tensor(obs_single)
@@ -166,55 +178,109 @@ class CFRTrajectoryAdapter:
         
         Infoset = hash of (player, hero_cards, board_cards, action_history)
         
-        For now: use simplified hash of available obs keys.
-        TODO: Extract actual card information and action history.
+        Phase 2.5 Simplified (no action history):
+            Use hash(player, hero_cards, board_cards, action_count)
+            where action_count is approximated from betting_history length
+        
+        Args:
+            obs_dicts: Observation dict at batch index idx
+            idx: Batch index
+        
+        Returns:
+            Unique infoset identifier string
         """
-        # Simple approach: hash the concatenated features
-        # In production, extract actual cards from obs_dicts["hero_cards"] etc.
         from src.training.cfr_infoset import hash_infoset
         
-        # Placeholder: extract from obs (requires knowledge of obs structure)
-        hero_cards = ("A", "K")  # TODO: Parse from obs_dicts
-        board_cards = ()  # TODO: Parse from obs_dicts
-        action_history = ()  # TODO: Parse from obs_dicts
+        # Extract actual cards from observation tensors (FIXED from hardcoded "A", "K")
+        hero_cards = self._extract_cards(obs_dicts, idx, "hero")
+        board_cards = self._extract_cards(obs_dicts, idx, "board")
+        
+        # Approximate action history from betting_history tensor
+        # Each action takes 13 dims (if using extended history)
+        # So action_count ≈ num_nonzero / 13
+        action_history = ()
+        if "betting_history" in obs_dicts:
+            betting_hist_tensor = obs_dicts["betting_history"][idx].flatten()
+            action_count = int((betting_hist_tensor.nonzero().shape[0] / 13).item())
+            action_history = tuple(range(action_count))  # Placeholder actions
         
         return hash_infoset(
-            player=0,
+            player=0,  # Always hero in our setup (training poker player)
             hole_cards=hero_cards,
             board_cards=board_cards,
             action_history=action_history,
         )
     
+    def _decode_card_tensor(self, card_tensor: torch.Tensor) -> tuple[str, ...]:
+        """
+        Decode 52-dim multi-hot card tensor to card string tuple.
+        
+        Card encoding (from features.py._encode_cards):
+            card_index = rank_idx * 4 + suit_idx
+            where rank_idx ∈ [0,12] (2-A), suit_idx ∈ [0,3] (S,H,D,C)
+        
+        Args:
+            card_tensor: Shape [52] with 1.0 at card indices, 0.0 elsewhere
+        
+        Returns:
+            Tuple of card strings, e.g., ("As", "Kd")
+        """
+        RANK_NAMES = ["2", "3", "4", "5", "6", "7", "8", "9", "T", "J", "Q", "K", "A"]
+        SUIT_NAMES = ["S", "H", "D", "C"]
+        
+        # Find all indices where card_tensor == 1.0
+        card_tensor = card_tensor.flatten()
+        indices = torch.nonzero(card_tensor == 1.0, as_tuple=False).squeeze(-1)
+        
+        # Handle scalar output from nonzero
+        if indices.dim() == 0:
+            indices = indices.unsqueeze(0)
+        
+        cards = []
+        for idx in indices.tolist():
+            rank_idx = idx // 4
+            suit_idx = idx % 4
+            
+            if 0 <= rank_idx < 13 and 0 <= suit_idx < 4:
+                card_str = SUIT_NAMES[suit_idx] + RANK_NAMES[rank_idx]
+                cards.append(card_str)
+        
+        return tuple(cards)
+    
     def _extract_cards(
         self,
         obs_dicts: dict[str, torch.Tensor],
         idx: int,
-        card_type: str,  # "hero", "board", etc.
+        card_type: str,  # "hero", "board"
     ) -> tuple[str, ...]:
         """
         Extract card information from observation dict.
         
-        TODO: This requires understanding the exact encoding of cards in obs.
-        Current structure (from features.py) encodes cards as:
-            - Integer indices (0-51 in standard 52-card deck)
-            - Normalized to [0,1] range
-        
-        For CFR, we need the STRING representation (e.g., "A♠", "K♦").
+        Uses multi-hot card encoding from features.py:
+            - hole_cards: 52-dim vector for hero's 2 hole cards
+            - community_cards: 52-dim vector for 0-5 board cards
         
         Args:
-            obs_dicts: All observation tensors
+            obs_dicts: Observation dict with "hole_cards", "community_cards" tensors
             idx: Batch index
-            card_type: Which cards to extract ("hero", "board", "opponent")
+            card_type: "hero" (hole cards) or "board" (community cards)
         
         Returns:
-            Tuple of card strings, e.g., ("A♠", "K♦")
+            Tuple of card strings, e.g., ("As", "Kd")
         """
-        # Placeholder: return dummy cards
-        if card_type == "hero":
-            return ("A", "K")
-        elif card_type == "board":
-            return ()
-        else:
+        try:
+            if card_type == "hero":
+                tensor = obs_dicts["hole_cards"][idx]
+            elif card_type == "board":
+                tensor = obs_dicts["community_cards"][idx]
+            else:
+                logger.warning(f"Unknown card_type: {card_type}, returning empty tuple")
+                return ()
+            
+            return self._decode_card_tensor(tensor)
+        
+        except (KeyError, IndexError) as e:
+            logger.warning(f"Failed to extract {card_type} cards: {e}, returning empty tuple")
             return ()
     
     def _obs_dict_to_tensor(
