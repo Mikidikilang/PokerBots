@@ -72,6 +72,10 @@ kaggle_submissions/
 *.tmp
 *.temp
 .ipynb_checkpoints/
+debug_*.txt
+debug_*.log
+*_output.txt
+test_*.log
 
 # Config - Keep only production config
 config_test.yaml  # Tests use their own config
