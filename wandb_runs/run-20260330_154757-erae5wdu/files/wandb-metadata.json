@@ -1,0 +1,28 @@
+{
+  "os": "Windows-11-10.0.26200-SP0",
+  "python": "CPython 3.13.12",
+  "startedAt": "2026-03-30T13:47:57.941893Z",
+  "program": "C:\\Users\\Botond\\OneDrive - Eotvos Lorand Tudomanyegyetem Informatikai Kar\\PokerBots\\Poker\\poker_ai_v5\\scripts\\run_training_2iter.py",
+  "codePath": "scripts\\run_training_2iter.py",
+  "codePathLocal": "scripts\\run_training_2iter.py",
+  "git": {
+    "remote": "https://github.com/Mikidikilang/PokerBots.git",
+    "commit": "1a07e691f9c3409dbdd107d796764ee76adad1df"
+  },
+  "email": "botondszilard9@gmail.com",
+  "root": "C:\\Users\\Botond\\OneDrive - Eotvos Lorand Tudomanyegyetem Informatikai Kar\\PokerBots\\Poker\\poker_ai_v5",
+  "host": "anfield",
+  "executable": "C:\\Users\\Botond\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe",
+  "cpu_count": 4,
+  "cpu_count_logical": 8,
+  "disk": {
+    "/": {
+      "total": "511058112512",
+      "used": "482893737984"
+    }
+  },
+  "memory": {
+    "total": "34043187200"
+  },
+  "writerId": "l63o7qepqk8g07fn1vahgl2g2qia4xni"
+}

@@ -57,7 +57,7 @@ runtime:
 environment:
   game_engine: "rlcard"                 # Játékmotor backend: "rlcard" vagy "pettingzoo"
   game_type: "no-limit-holdem"
-  num_players: 2                        # [PHASE 1] Heads-up only (was 6). CFR has guaranteed convergence in 2-player zero-sum games.
+  num_players: 6                        # 6-player production run for Tabular MCCFR
   initial_stack_bb: 200                 # Induló zsetonkészlet Big Blind egységben
   small_blind: 1                        # Kisvak mérete (abszolút chip érték)
   big_blind: 2                          # Nagyvak mérete (abszolút chip érték)
@@ -172,7 +172,7 @@ cfr:
   # --- Training Algorithm Flag ---
   # Set to "cfr" to use Deep CFR instead of PPO
   # Default: "ppo" (backward compatible)
-  training_algorithm: "ppo"             # Opciók: "ppo", "cfr"
+  training_algorithm: "cfr"             # [MCCFR FIX] Changed from "ppo" to "cfr"
 
   # --- Optimization Parameters ---
   learning_rate: 1.0e-3                 # CFR hálózat tanulási ráta (gyakran magasabb mint PPO)
@@ -191,7 +191,7 @@ cfr:
   exploitability_update_freq: 100       # Update every N iterations
   
   # --- Traversal Configuration ---
-  traversals_per_iteration: 500         # MCCFR External Sampling traversals
+  traversals_per_iteration: 1000         # MCCFR External Sampling traversals (1000 per iteration × 4 workers = 4000 total)
   regret_network_updates: 4             # Update regret network N times per iteration
   strategy_network_updates: 4           # Update strategy network N times per iteration
   batch_size: 32                        # Mini-batch size for network training
@@ -363,12 +363,20 @@ reward_shaping:
 # ---------------------------------------------------------------------------
 mlops:
   # --- Hugging Face Hub ---
-  hf_repo_id: "Mikidikilang/poker-ai-checkpoints"     # HF repozitórium azonosító
-  hf_repo_type: "model"
+  huggingface:
+    enabled: true                      # Enable Hugging Face Hub sync
+    hf_repo_id: "Mikidikilang/poker-mccfr-production"     # HF repozitórium azonosító (Production run)
+    hf_repo_type: "model"
+
+  # --- Weights & Biases ---
+  wandb:
+    enabled: true                    # Enable Weights & Biases logging
+    project: "poker-mccfr-v5"        # W&B projekt neve
+    entity: null                     # W&B entity (use logged-in user's default if null)
 
   # --- Checkpoint Mentés ---
   checkpoint:
-    save_interval_iterations: 100       # Modellsúlyok mentése minden N iteráció
+    save_interval_iterations: 100       # Modellsúlyok mentése minden N iteráció (~every 8-10 min)
     buffer_save_interval_iterations: 500  # Replay Buffer mentése (ritkábban, nagyobb fájlméret)
     local_checkpoint_dir: "checkpoints/"  # Lokális mentési könyvtár
     max_checkpoints_to_keep: 5          # Régi checkpointok rotálása

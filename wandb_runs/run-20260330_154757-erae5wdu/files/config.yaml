@@ -1,0 +1,406 @@
+_wandb:
+    value:
+        cli_version: 0.25.1
+        e:
+            l63o7qepqk8g07fn1vahgl2g2qia4xni:
+                codePath: scripts\run_training_2iter.py
+                codePathLocal: scripts\run_training_2iter.py
+                cpu_count: 4
+                cpu_count_logical: 8
+                disk:
+                    /:
+                        total: "511058112512"
+                        used: "482893737984"
+                email: botondszilard9@gmail.com
+                executable: C:\Users\Botond\AppData\Local\Microsoft\WindowsApps\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\python.exe
+                git:
+                    commit: 1a07e691f9c3409dbdd107d796764ee76adad1df
+                    remote: https://github.com/Mikidikilang/PokerBots.git
+                host: anfield
+                memory:
+                    total: "34043187200"
+                os: Windows-11-10.0.26200-SP0
+                program: C:\Users\Botond\OneDrive - Eotvos Lorand Tudomanyegyetem Informatikai Kar\PokerBots\Poker\poker_ai_v5\scripts\run_training_2iter.py
+                python: CPython 3.13.12
+                root: C:\Users\Botond\OneDrive - Eotvos Lorand Tudomanyegyetem Informatikai Kar\PokerBots\Poker\poker_ai_v5
+                startedAt: "2026-03-30T13:47:57.941893Z"
+                writerId: l63o7qepqk8g07fn1vahgl2g2qia4xni
+        m: []
+        python_version: 3.13.12
+        t:
+            "1":
+                - 1
+            "2":
+                - 1
+            "3":
+                - 2
+                - 15
+                - 16
+                - 61
+            "4": 3.13.12
+            "5": 0.25.1
+            "8":
+                - 2
+                - 3
+            "12": 0.25.1
+            "13": windows-amd64
+cfr:
+    value:
+        adam_epsilon: 1e-05
+        batch_size: 32
+        entropy_coefficient: 0.01
+        exploitability_update_freq: 100
+        learning_rate: 0.001
+        max_grad_norm: 0.5
+        num_epochs: 2
+        regret_discount: 1
+        regret_min_threshold: 0
+        regret_network_updates: 4
+        regret_scaling: 1
+        strategy_network_updates: 4
+        track_exploitability: true
+        training_algorithm: ppo
+        traversals_per_iteration: 500
+degeneration_thresholds:
+    value:
+        "2":
+            maniac:
+                af_above: 5
+                pfr_above: 85
+                three_bet_above: 30
+            passivity:
+                vpip_below: 55
+                vpip_pfr_gap_above: 20
+        "3":
+            maniac:
+                af_above: 4.5
+                pfr_above: 50
+                three_bet_above: 22
+            passivity:
+                vpip_below: 28
+                vpip_pfr_gap_above: 15
+        "4":
+            maniac:
+                af_above: 4.5
+                pfr_above: 38
+                three_bet_above: 18
+            passivity:
+                vpip_below: 22
+                vpip_pfr_gap_above: 12
+        "6":
+            maniac:
+                af_above: 4
+                pfr_above: 28
+                three_bet_above: 15
+            passivity:
+                vpip_below: 16
+                vpip_pfr_gap_above: 10
+        "8":
+            maniac:
+                af_above: 4
+                pfr_above: 20
+                three_bet_above: 11
+            passivity:
+                vpip_below: 10
+                vpip_pfr_gap_above: 8
+        "9":
+            maniac:
+                af_above: 4
+                pfr_above: 20
+                three_bet_above: 11
+            passivity:
+                vpip_below: 10
+                vpip_pfr_gap_above: 8
+environment:
+    value:
+        action_space:
+            actions:
+                "0": fold
+                "1": check
+                "2": call
+                "3": min_raise
+                "4": raise_0.25x_pot
+                "5": raise_0.33x_pot
+                "6": raise_0.5x_pot
+                "7": raise_0.75x_pot
+                "8": raise_1.0x_pot
+                "9": raise_1.5x_pot
+                "10": raise_2.0x_pot
+                "11": all_in
+            illegal_action_logit_mask: -1e+08
+            num_actions: 12
+            type: discrete
+        big_blind: 2
+        game_engine: rlcard
+        game_type: no-limit-holdem
+        initial_stack_bb: 200
+        num_players: 2
+        observation_space:
+            betting_history_dim:
+                - 18
+                - 13
+            card_encoding: multi_hot
+            community_cards_dim: 52
+            hole_cards_dim: 52
+            max_actions_per_round: 18
+            max_betting_rounds: 4
+            normalization_method: big_blind
+            normalization_range:
+                - 0
+                - 1
+            position_encoding: one_hot
+            total_card_dim: 104
+        small_blind: 1
+evaluation:
+    value:
+        aivat:
+            baseline_type: learned
+            enabled: true
+        nash_distance:
+            eval_hands: 50000
+            method: lbr
+            target_pct: 0.3
+        slumbot:
+            enabled: false
+            max_action_time_seconds: 7
+            min_hands: 100000
+            stack_size_bb: 200
+            superhuman_threshold_mbb: 50
+gto_matrix:
+    value:
+        "2":
+            af:
+                - 2.5
+                - 3.8
+            pfr:
+                - 60
+                - 68
+            three_bet:
+                - 17.5
+                - 23
+            vpip:
+                - 71
+                - 78
+            wtsd:
+                - 26
+                - 30
+        "3":
+            af:
+                - 2.5
+                - 3.5
+            pfr:
+                - 31
+                - 39
+            three_bet:
+                - 11.5
+                - 16
+            vpip:
+                - 38
+                - 45
+            wtsd:
+                - 27
+                - 31
+        "4":
+            af:
+                - 2.5
+                - 3.5
+            pfr:
+                - 24
+                - 31
+            three_bet:
+                - 9
+                - 13.5
+            vpip:
+                - 29
+                - 36
+            wtsd:
+                - 27.5
+                - 31.5
+        "6":
+            af:
+                - 2.5
+                - 3.5
+            pfr:
+                - 17
+                - 22.5
+            three_bet:
+                - 7.5
+                - 11.5
+            vpip:
+                - 21
+                - 27
+            wtsd:
+                - 28
+                - 32
+        "8":
+            af:
+                - 2.5
+                - 3.5
+            pfr:
+                - 12
+                - 16
+            three_bet:
+                - 5.5
+                - 8.5
+            vpip:
+                - 15
+                - 19
+            wtsd:
+                - 28.5
+                - 33
+        "9":
+            af:
+                - 2.5
+                - 3.5
+            pfr:
+                - 10.5
+                - 14.5
+            three_bet:
+                - 4.5
+                - 7.5
+            vpip:
+                - 13.5
+                - 17.5
+            wtsd:
+                - 29
+                - 33.5
+mlops:
+    value:
+        async_upload:
+            commit_message_prefix: auto-checkpoint
+            enabled: true
+            sync_interval_minutes: 15
+        checkpoint:
+            buffer_save_interval_iterations: 500
+            local_checkpoint_dir: checkpoints/
+            max_checkpoints_to_keep: 5
+            save_interval_iterations: 1
+        graceful_shutdown:
+            max_runtime_hours: 11.5
+            use_monotonic_clock: true
+        hf_repo_id: Mikidikilang/poker-mccfr-production
+        hf_repo_type: model
+        rng_management:
+            components:
+                - python_stdlib
+                - numpy
+                - torch_cpu
+                - torch_cuda
+                - dataloader
+            save_rng_states: true
+        wandb:
+            entity: soross
+            project: poker-mccfr-v5
+model:
+    value:
+        actor:
+            activation: relu
+            dropout: 0.1
+            hidden_layers:
+                - 512
+                - 256
+                - 128
+            output_activation: softmax
+        architecture: mlp_actor_critic
+        critic:
+            activation: relu
+            dropout: 0.1
+            hidden_layers:
+                - 512
+                - 256
+                - 128
+            output_dim: 1
+        embedding:
+            card_embed_dim: 64
+            context_embed_dim: 32
+            history_embed_dim: 64
+        weight_init: orthogonal
+        weight_init_gain: 1
+orchestrator:
+    value:
+        mab:
+            algorithm: ucb
+            max_pool_size: 20
+            pool_snapshot_interval: 50
+            ucb_exploration_factor: 2
+        phases:
+            phase_0:
+                description: Alapvető póker mechanikák és matematika elsajátítása statikus botok ellen
+                name: Rules-Based Exploitation
+                opponents:
+                    - calling_station
+                    - maniac
+                    - random
+                    - tight_passive
+                transition_threshold:
+                    min_hands: 100000
+                    min_vpip_in_range: true
+                    min_win_rate_mbb: 50
+            phase_1:
+                description: Finomhangolt emberi adatokon tréningelt ellenfelek elleni játék
+                name: Opponent Modeling & SFT
+                opponents:
+                    - sft_aggressive
+                    - sft_balanced
+                    - sft_passive
+                    - phase_0_snapshots
+                transition_threshold:
+                    max_exploitability_pct: 1
+                    min_hands: 200000
+                    min_win_rate_mbb: 30
+            phase_2:
+                description: Multi-Armed Bandit vezérelt önjáték és Nash-konvergencia
+                name: Co-Adaptive FSP
+                opponents:
+                    - self_play_pool
+                    - benchmark_bots
+                target_metrics:
+                    min_slumbot_mbb: 50
+                    nash_distance_pct: 0.3
+        telemetry:
+            eval_interval_iterations: 50
+            log_interval_iterations: 10
+            sliding_window_hands: 100000
+ppo:
+    value:
+        adam_epsilon: 1e-05
+        batch_size: 64
+        buffer:
+            compression: zstandard
+            compression_level: 3
+            max_capacity: 1000000
+        clip_epsilon: 0.2
+        clip_range_vf: 0.2
+        entropy_coefficient: 0.01
+        gae_lambda: 0.95
+        gamma: 0.99
+        learning_rate: 0.0003
+        learning_rate_schedule: linear
+        lr_warmup_steps: 1000
+        max_grad_norm: 0.5
+        num_epochs: 2
+        num_mini_batches: 4
+        rollout_steps: 2048
+        target_kl: 0.015
+        value_loss_coefficient: 0.5
+project:
+    value:
+        description: No-Limit Texas Hold'em RL AI with Auto-Adaptive Curriculum Learning
+        name: PokerAI-NLHE
+        seed: 42
+        version: 0.1.0
+reward_shaping:
+    value:
+        bluff_intensity_threshold: 0.7
+        bluff_penalty_lambda: 0
+        entropy_boost_factor: 2
+        preflop_aggression_bonus: 0
+        stagnation_threshold: 0.001
+        stagnation_window: 50
+runtime:
+    value:
+        device: auto
+        log_dir: logs/
+        log_level: INFO
+        num_workers: 4
+        platform: kaggle
