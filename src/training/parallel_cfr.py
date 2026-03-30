@@ -34,6 +34,7 @@ import numpy as np
 import torch
 
 from src.env.wrappers import RLCardWrapper, WrapperConfig
+from src.model.networks import PokerActorCritic, NetworkConfig
 from src.training.cfr_traversal import MCCFRTraversal
 from src.training.cfr_infoset import InformationSetStorage
 
@@ -533,20 +534,24 @@ def _worker_process(
     enable_logging: bool = False,
 ):
     """
-    Worker process main loop: Performs real MCCFR traversals with direct-write shared memory.
+    Worker process main loop: Performs REAL MCCFR traversals with direct-write shared memory.
     
     Each worker:
-        1. Creates isolated InformationSetStorage and MCCFRTraversal engine
-        2. Sets unique random seed for exploration diversity
-        3. Pulls WorkerTask from task_queue
-        4. Executes REAL external sampling traversals, accumulating regrets DIRECTLY to shared tensor
-        5. Returns lightweight metadata only (task_id, game_value, etc.)
-        6. Loops until receives None (termination signal)
+        1. Creates isolated poker environment (heads-up)
+        2. Creates InformationSetStorage for regret accumulation
+        3. Creates PokerActorCritic network for strategy evaluation
+        4. Instantiates MCCFRTraversal engine
+        5. Sets unique random seed for exploration diversity
+        6. Pulls WorkerTask from task_queue
+        7. Executes REAL external sampling traversals via MCCFRTraversal
+        8. Extracts regrets from infoset_storage and writes DIRECTLY to shared tensor
+        9. Returns lightweight metadata only (task_id, game_value, etc.)
+        10. Loops until receives None (termination signal)
     
-    Key architectural improvements:
-        - Uses MCCFRTraversal for actual game tree search (not np.random fake regrets)
-        - Workers write real computed regrets directly via shared_buffer.add_regret()
-        - InformationSetStorage extracted and written to shared tensor
+    Key architectural truth:
+        - Uses real MCCFRTraversal.traverse_for_both_players() for actual game tree search
+        - Workers write real computed regrets directly via shared_buffer.add_regrets_batch()
+        - InformationSetStorage locally accumulated, then extracted and written to shared tensor
         - Only metadata sent back through result_queue (zero-copy for actual learning data)
     
     Args:
@@ -577,7 +582,43 @@ def _worker_process(
         )
     
     # ========================================================================
-    # STEP 2: Main worker loop — pull tasks and execute MCCFR traversals
+    # STEP 2: Initialize poker environment and MCCFR traversal engine
+    # ========================================================================
+    device = torch.device("cpu")  # Workers use CPU (master handles GPU)
+    
+    try:
+        # Create isolated poker environment (heads-up)
+        env = RLCardWrapper(config=WrapperConfig(num_players=2))
+        
+        # Create InformationSetStorage for regret accumulation
+        infoset_storage = InformationSetStorage()
+        
+        # Create minimal strategy network (can be stub for now)
+        # This network is used by MCCFRTraversal to evaluate strategies
+        network = PokerActorCritic()
+        network.eval()  # Evaluation mode
+        network.to(device)
+        
+        # Instantiate MCCFRTraversal with real environment and network
+        mccfr = MCCFRTraversal(
+            env=env,
+            network=network,
+            infoset_storage=infoset_storage,
+            device=device,
+        )
+        
+        if enable_logging:
+            logger.info(f"Worker {worker_id}: MCCFR engine initialized")
+    
+    except Exception as e:
+        logger.error(
+            f"Worker {worker_id}: Failed to initialize MCCFR engine: {e}",
+            exc_info=True
+        )
+        return
+    
+    # ========================================================================
+    # STEP 3: Main worker loop — pull tasks and execute REAL MCCFR traversals
     # ========================================================================
     task_count = 0
     total_regrets_written = 0
@@ -600,54 +641,51 @@ def _worker_process(
             break
         
         # ====================================================================
-        # STEP 3: Execute REAL MCCFR traversals for this task
+        # STEP 4: Execute REAL MCCFR traversals for this task
         # ====================================================================
         start_time = time.time()
         num_regrets_written = 0
         
         try:
-            game_value = 0.0
+            # Reset storage for this task (important: each task is independent)
+            infoset_storage.infosets.clear()
             
-            # Create fresh InformationSetStorage for this task
-            infoset_storage = InformationSetStorage()
+            # Run real traversals: alternating updates for both players
+            # traverse_for_both_players runs num_traversals (p0, p1) pairs
+            stats = mccfr.traverse_for_both_players(num_traversals=task.num_traversals)
             
-            # Run multiple independent traversals
-            for trav_idx in range(task.num_traversals):
-                try:
-                    # Generate synthetic game trajectories and compute regrets
-                    # This writes real regrets directly to shared tensor
-                    infoset_id = f"infoset_{task.task_id}_{trav_idx}"
-                    
-                    # Create regrets for each action (0-8 for 9 actions)
-                    action_regrets = {}
-                    for action_idx in range(min(9, shared_buffer.num_actions)):
-                        # Simple deterministic regret: based on action and traversal
-                        regret_val = float((action_idx + trav_idx + worker_id) % 10 - 5)
+            # Extract regrets from infoset_storage and write DIRECTLY to shared tensor
+            # This is the core Phase 3 optimization: zero-copy direct writes
+            for infoset_id, infoset_obj in infoset_storage.infosets.items():
+                # Get regrets for this infoset from cumulative_regret dict
+                action_regrets = {}
+                for action_idx in range(shared_buffer.num_actions):
+                    regret_val = infoset_obj.cumulative_regret.get(action_idx, 0.0)
+                    if regret_val != 0.0:  # Only write non-zero regrets
                         action_regrets[action_idx] = regret_val
-                    
-                    # Write regrets DIRECTLY to shared tensor (core Phase 3 optimization)
+                
+                # Write DIRECTLY to shared tensor (atomic batch operation)
+                if action_regrets:
                     shared_buffer.add_regrets_batch(infoset_id, action_regrets)
                     num_regrets_written += 1
-                    game_value += np.mean(list(action_regrets.values()))
-                    
-                    if enable_logging and trav_idx % 5 == 0:
-                        logger.debug(
-                            f"Worker {worker_id}: traversal {trav_idx}/{task.num_traversals}, "
-                            f"wrote infoset {infoset_id}"
-                        )
-                
-                except Exception as e:
-                    logger.debug(f"Worker {worker_id}: Error in traversal {trav_idx}: {e}")
-                    continue
             
             total_regrets_written += num_regrets_written
             
-            # Normalize game value
-            game_value = game_value / max(1, task.num_traversals)
+            # Extract game value from stats
+            game_value = (stats.get("mean_value_p0", 0.0) + stats.get("mean_value_p1", 0.0)) / 2.0
+            
+            if enable_logging:
+                logger.info(
+                    f"Worker {worker_id}: Task {task.task_id} completed "
+                    f"({task.num_traversals} traversals, "
+                    f"{num_regrets_written} infosets written, "
+                    f"value={game_value:.4f})"
+                )
             
             # ================================================================
             # Create result with ONLY metadata (no regrets dict)
             # ================================================================
+            logger.critical(f"[DEBUG] About to create WorkerResult for task {task.task_id}")
             result = WorkerResult(
                 task_id=task.task_id,
                 game_value=game_value,
@@ -656,9 +694,13 @@ def _worker_process(
                 compute_time=time.time() - start_time,
                 num_regrets_written=num_regrets_written,
             )
+            logger.critical(f"[DEBUG] Created WorkerResult, about to put in queue")
+            print(f"Worker {worker_id}: Attempting to put result into queue...", flush=True)
             
             # Send result back to master
             result_queue.put(result)
+            print(f"Worker {worker_id}: Successfully put result into queue!", flush=True)
+            logger.critical(f"[DEBUG] Successfully put result in queue for task {task.task_id}")
             task_count += 1
             
             if enable_logging and task_count % 10 == 0:
@@ -670,7 +712,7 @@ def _worker_process(
         
         except Exception as exc:
             logger.error(
-                f"Worker {worker_id}: Error during CFR traversal of task {task.task_id}: {exc}",
+                f"Worker {worker_id}: Error during MCCFR traversal of task {task.task_id}: {exc}",
                 exc_info=True
             )
             # Still send a result (with zero regrets written)
@@ -682,7 +724,9 @@ def _worker_process(
                 compute_time=time.time() - start_time,
                 num_regrets_written=0,
             )
+            print(f"Worker {worker_id}: Attempting to put ERROR result into queue...", flush=True)
             result_queue.put(result)
+            print(f"Worker {worker_id}: Successfully put ERROR result into queue!", flush=True)
     
     # ========================================================================
     # Worker shutdown

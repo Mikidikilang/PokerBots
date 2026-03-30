@@ -486,16 +486,23 @@ class RLCardWrapper:
         
         # Find RLCard action that minimizes absolute distance from target_amount
         # legal is {rlcard_id: chip_amount, ...}
-        closest_id = raise_ids[0]
-        closest_diff = abs(legal[raise_ids[0]] - target_amount)
-        
-        for rlcard_id in raise_ids[1:]:
-            chip_amount = legal[rlcard_id]
+        # Filter raise_ids to only include actions with valid numeric chip amounts
+        valid_raises = {r_id: legal[r_id] for r_id in raise_ids if legal.get(r_id) is not None}
+
+        if not valid_raises:
+            # Fallback if no valid raise amounts found (shouldn't happen, but safe)
+            return sorted_ids[min(1, len(sorted_ids) - 1)]
+
+        # Find the closest matching raise
+        closest_id = list(valid_raises.keys())[0]
+        closest_diff = abs(valid_raises[closest_id] - target_amount)
+
+        for r_id, chip_amount in valid_raises.items():
             diff = abs(chip_amount - target_amount)
             if diff < closest_diff:
                 closest_diff = diff
-                closest_id = rlcard_id
-        
+                closest_id = r_id
+
         return closest_id
 
     def _rlcard_legal_to_our_mask(

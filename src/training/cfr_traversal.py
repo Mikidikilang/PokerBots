@@ -124,6 +124,7 @@ class MCCFRTraversal:
         player_to_update: int,
         reach_probs: dict[int, float],
         action_count: int = 0,
+        _recursion_depth: int = 0,
     ) -> float:
         """
         [CORE MCCFR ALGORITHM]
@@ -157,7 +158,13 @@ class MCCFRTraversal:
         # Termination conditions
         if self.env.is_over():
             # Terminal state: return the reward
-            logger.debug(f"[A{action_count}] Terminal state reached, returning 0.0")
+            return 0.0
+        
+        # STRICT FAILSAFE: Prevent infinite ping-pong raising wars
+        # If the game hasn't ended naturally after 15 actions, force it to end.
+        # (No-Limit Hold'em allows many small raises; this prevents infinite loops)
+        if action_count >= 15:
+            logger.warning(f"[FAILSAFE] Depth limit reached (15 actions). Forcing terminal state at action_count={action_count}.")
             return 0.0
         
         # Determine whose turn it is
@@ -177,13 +184,13 @@ class MCCFRTraversal:
             legal_actions = list(legal_actions) if legal_actions else list(range(12))
         
         # ★ CRITICAL FIX ★: Extract cards ONCE at start
-        # RLCard stores cards in raw_obs['hand'] and raw_obs['public_cards'] as string lists
-        raw_obs = state.get('raw_obs', {})
-        if isinstance(raw_obs, dict):
-            hero_cards = tuple(raw_obs.get('hand', []))
-            board_cards = tuple(raw_obs.get('public_cards', []))
+        # RLCard stores cards in state['hand'] and state['public_cards'] as string lists
+        # State dict IS the observation (no 'raw_obs' wrapper)
+        if isinstance(state, dict):
+            hero_cards = tuple(state.get('hand', []))
+            board_cards = tuple(state.get('public_cards', []))
         else:
-            # Fallback if raw_obs is not a dict
+            # Fallback if state is not a dict
             hero_cards = ()
             board_cards = ()
         action_history = ()  # TODO: Extract full action history from state
@@ -243,6 +250,7 @@ class MCCFRTraversal:
                         player_to_update=player_to_update,
                         reach_probs=new_reach_probs,
                         action_count=action_count + 1,
+                        _recursion_depth=_recursion_depth + 1,
                     )
                     # Auto-restore environment state on context exit
                 
@@ -313,20 +321,25 @@ class MCCFRTraversal:
             
             logger.debug(f"[A{action_count}] Opponent turn: sampled action={sampled_action} (prob={sampled_prob:.3f})")
             
-            # Take sampled action
-            next_state, reward = self.env.step(sampled_action)
-            
-            # Update reach probabilities
-            new_reach_probs = reach_probs.copy()
-            new_reach_probs[1 - current_player] *= sampled_prob
-            
-            # Recursive traversal (only sampled branch)
-            value = self.external_sampling_traversal(
-                state=next_state,
-                player_to_update=player_to_update,
-                reach_probs=new_reach_probs,
-                action_count=action_count + 1,
-            )
+            # ★ STATE SAVE/RESTORE: Wrap opponent's step in savepoint too
+            # Even though opponent only samples ONE action (no loop), the step() mutates env
+            # which affects the state visible to subsequent recursion levels
+            with self.env_state_manager.savepoint():
+                # Take sampled action
+                next_state, reward = self.env.step(sampled_action)
+                
+                # Update reach probabilities
+                new_reach_probs = reach_probs.copy()
+                new_reach_probs[1 - current_player] *= sampled_prob
+                
+                # Recursive traversal (only sampled branch)
+                value = self.external_sampling_traversal(
+                    state=next_state,
+                    player_to_update=player_to_update,
+                    reach_probs=new_reach_probs,
+                    action_count=action_count + 1,
+                    _recursion_depth=_recursion_depth + 1,
+                )
             
             # ★ T1 FIX: No importance weighting division
             # External sampling MCCFR does not divide by sampled_prob.
