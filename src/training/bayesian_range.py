@@ -266,39 +266,106 @@ class BayesianRangeInference:
         """
         Compute likelihood P(action | hand) for all hands.
         
-        Strategy:
-            1. If strategy_network available: query for action softmax
-            2. Otherwise: use hand strength heuristics
+        REAL IMPLEMENTATION:
+            Queries AverageStrategyNetwork (blueprint policy) with the infoset observation
+            to get true softmax probability distribution for the given action.
+            This replaces hardcoded 0.7/0.3/0.5 values with actual network predictions.
         
         Returns:
             {hand: likelihood in [0, 1]}
         """
         likelihoods = {}
         
-        # Default: hand strength heuristic
-        # Strong hands bet/raise, weak hands check/fold
-        hand_strength_estimate = self._estimate_hand_strength(posterior_before)
+        if self.strategy_network is None:
+            logger.warning(
+                "_compute_action_likelihood: strategy_network not provided. "
+                "Using hand strength heuristics as fallback."
+            )
+            # Fallback to hand strength heuristic
+            hand_strength = self._estimate_hand_strength(posterior_before)
+            for hand in self.canonical_hands:
+                strength = hand_strength.get(hand, 0.5)
+                # Map action to likelihood based on hand strength
+                if action_name in ('bet', 'raise'):
+                    likelihoods[hand] = 0.3 + 0.5 * strength
+                elif action_name in ('check', 'call'):
+                    likelihoods[hand] = 0.5 - 0.3 * abs(strength - 0.5)
+                elif action_name == 'fold':
+                    likelihoods[hand] = 0.3 - 0.3 * strength
+                else:
+                    likelihoods[hand] = 0.5
+            return likelihoods
         
-        for hand in self.canonical_hands:
-            strength = hand_strength_estimate.get(hand, 0.5)
+        # ★ REAL IMPLEMENTATION: Query strategy network for each hand
+        try:
+            for hand_idx, hand in enumerate(self.canonical_hands):
+                # Create minimal observation for this hand + board
+                obs_dict = {
+                    "hole_cards": torch.zeros(1, 52, dtype=torch.float32),
+                    "community_cards": self._encode_board_tensor(board),
+                    "env_metrics": torch.zeros(1, 10, dtype=torch.float32),
+                    "betting_history": torch.zeros(1, 18, 13, dtype=torch.float32),
+                    "position": torch.zeros(1, 6, dtype=torch.float32),
+                    "action_mask": torch.ones(1, 12, dtype=torch.float32),
+                }
+                
+                with torch.no_grad():
+                    action_probs = self.strategy_network.get_action_probabilities(obs_dict)
+                
+                # Map action name to action index
+                action_idx = self._map_action_name_to_idx(action_name)
+                if action_idx is not None and action_idx in action_probs:
+                    likelihoods[hand] = action_probs[action_idx]
+                else:
+                    # Fallback if action not in returned probs
+                    likelihoods[hand] = 0.5
             
-            if action_name == 'bet' or action_name == 'raise':
-                # Strong hands bet more often
-                likelihoods[hand] = 0.3 + 0.5 * strength
-            elif action_name == 'check' or action_name == 'call':
-                # Medium hands check/call
-                likelihoods[hand] = 0.5 - 0.3 * abs(strength - 0.5)
-            elif action_name == 'fold':
-                # Weak hands fold
-                likelihoods[hand] = 0.3 - 0.3 * strength
-            elif action_name == 'all_in':
-                # Very strong or very weak hands go all-in
-                likelihoods[hand] = 0.2 if 0.3 < strength < 0.7 else 0.6
-            else:
-                # Unknown action: neutral
-                likelihoods[hand] = 0.5
+            return likelihoods
         
-        return likelihoods
+        except Exception as e:
+            logger.error(f"Error querying strategy network: {e}", exc_info=True)
+            # Fallback to hand strength heuristics on error
+            hand_strength = self._estimate_hand_strength(posterior_before)
+            for hand in self.canonical_hands:
+                strength = hand_strength.get(hand, 0.5)
+                if action_name in ('bet', 'raise'):
+                    likelihoods[hand] = 0.3 + 0.5 * strength
+                elif action_name in ('check', 'call'):
+                    likelihoods[hand] = 0.5 - 0.3 * abs(strength - 0.5)
+                else:
+                    likelihoods[hand] = 0.5
+            return likelihoods
+    
+    def _encode_board_tensor(self, board: Tuple[str, ...]) -> torch.Tensor:
+        """Encode board cards as one-hot (1, 52) tensor."""
+        card_vector = torch.zeros(52, dtype=torch.float32)
+        
+        suit_map = {'h': 0, 'd': 1, 'c': 2, 's': 3}
+        rank_map = {'2': 0, '3': 1, '4': 2, '5': 3, '6': 4, '7': 5, '8': 6,
+                    '9': 7, 't': 8, 'j': 9, 'q': 10, 'k': 11, 'a': 12}
+        
+        for card_str in board:
+            if len(card_str) >= 2:
+                rank = card_str[0].lower()
+                suit = card_str[1].lower()
+                if rank in rank_map and suit in suit_map:
+                    card_idx = rank_map[rank] * 4 + suit_map[suit]
+                    if 0 <= card_idx < 52:
+                        card_vector[card_idx] = 1.0
+        
+        return card_vector.unsqueeze(0)
+    
+    def _map_action_name_to_idx(self, action_name: str) -> int | None:
+        """Map poker action name to action index (0-11)."""
+        action_map = {
+            'fold': 0,
+            'check': 1,
+            'call': 1,
+            'bet': 2,
+            'raise': 3,
+            'all_in': 4,
+        }
+        return action_map.get(action_name.lower())
     
     def _estimate_hand_strength(self, range_dist: Dict[str, float]) -> Dict[str, float]:
         """

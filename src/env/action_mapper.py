@@ -38,7 +38,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -144,6 +144,54 @@ def get_safe_mask_value(dtype: torch.dtype = torch.float32) -> float:
 # Adatstruktúrák
 # =============================================================================
 
+# =============================================================================
+# Adatstruktúrák
+# =============================================================================
+
+@dataclass(frozen=True)
+class BetSizingConfig:
+    """Street-specific bet sizing configuration.
+    
+    Defines fractional pot multipliers for each street (preflop, flop, turn, river).
+    This allows the strategy to adapt bet sizing based on the current game state.
+    
+    Attributes:
+        preflop: List of bet size multipliers for preflop (e.g., [0.33, 0.5, 0.75, 1.0]).
+        flop: List of bet size multipliers for flop.
+        turn: List of bet size multipliers for turn.
+        river: List of bet size multipliers for river.
+    """
+    preflop: list[float] = None
+    flop: list[float] = None
+    turn: list[float] = None
+    river: list[float] = None
+    
+    def __post_init__(self):
+        """Set default configurations if not provided."""
+        if self.preflop is None:
+            object.__setattr__(self, 'preflop', [0.33, 0.5, 0.75, 1.0])
+        if self.flop is None:
+            object.__setattr__(self, 'flop', [0.33, 0.5, 0.75, 1.0])
+        if self.turn is None:
+            object.__setattr__(self, 'turn', [0.5, 0.75, 1.0, 1.5])
+        if self.river is None:
+            object.__setattr__(self, 'river', [0.5, 0.75, 1.0, 1.5])
+    
+    def get_multipliers(self, street: int) -> list[float]:
+        """Get bet size multipliers for a specific street.
+        
+        Args:
+            street: Street index (0=preflop, 1=flop, 2=turn, 3=river).
+        
+        Returns:
+            List of fractional pot multipliers.
+        """
+        streets = [self.preflop, self.flop, self.turn, self.river]
+        if street < 0 or street >= len(streets):
+            return self.preflop  # Default to preflop
+        return streets[street]
+
+
 class ResolvedAction(NamedTuple):
     """Az akció-feloldás eredménye: a szemantikai akció és a pontos chip összeg.
 
@@ -168,6 +216,7 @@ class GameContext:
         amount_to_call: A megadandó tét összege (chip).
         min_raise_amount: A legkisebb legális emelési méret (chip).
         big_blind: A nagyvak mérete (chip).
+        street: Az aktuális street indexe (0=preflop, 1=flop, 2=turn, 3=river).
     """
 
     pot_size: float
@@ -175,6 +224,7 @@ class GameContext:
     amount_to_call: float
     min_raise_amount: float
     big_blind: float
+    street: int = 0
 
     def __post_init__(self) -> None:
         """Validálja a kontextus értékeit."""
@@ -184,6 +234,8 @@ class GameContext:
             raise ValueError(f"my_stack nem lehet negatív: {self.my_stack}")
         if self.big_blind <= 0:
             raise ValueError(f"big_blind pozitívnak kell lennie: {self.big_blind}")
+        if self.street < 0 or self.street > 3:
+            raise ValueError(f"street 0-3 között kell lennie: {self.street}")
 
 
 # =============================================================================
@@ -227,9 +279,11 @@ class ActionMapper:
             PokerAction.RAISE_2X_POT: "Raise 2.0x Pot",
             PokerAction.ALL_IN: "All-in",
         }
+        self.bet_sizing_config: BetSizingConfig = BetSizingConfig()
         logger.info(
             "ActionMapper inicializálva: %d diszkrét akció, "
-            "illegális logit maszk=%.0e",
+            "illegális logit maszk=%.0e, "
+            "street-specific bet sizing enabled",
             NUM_ACTIONS, ILLEGAL_ACTION_LOGIT,
         )
 
@@ -242,22 +296,23 @@ class ActionMapper:
     ) -> ResolvedAction:
         """Egy diszkrét akció-indexet konkrét chip értékű póker akcióvá old fel.
 
-        A metódus figyelembe veszi a játékszituáció kontextusát (pot méret,
-        stack méret, minimális emelés) és kiszámítja a pontos tétméretet.
+        Az ezutáni metódus figyelembe veszi a játékszituáció kontextusát 
+        (pot méret, stack méret, minimális emelés, street) és kiszámítja 
+        a pontos tétméretet a street-specifikus bet sizing szabályok alapján.
 
         Ha az emelés összege meghaladja a játékos stackjét, automatikusan
         All-in-né konvertálódik (stack capping).
-
+        
         Args:
             action: A hálózat által választott akció (PokerAction enum).
-            context: Az aktuális játékszituáció.
+            context: Az aktuális játékszituáció (street információval).
 
         Returns:
             ResolvedAction nevesített tuple a végrehajtási részletekkel.
         """
         logger.debug(
-            "Akció feloldása: %s | pot=%.0f, stack=%.0f, call=%.0f",
-            action.name, context.pot_size, context.my_stack, context.amount_to_call,
+            "Akció feloldása: %s (street=%d) | pot=%.0f, stack=%.0f, call=%.0f",
+            action.name, context.street, context.pot_size, context.my_stack, context.amount_to_call,
         )
 
         if action == PokerAction.FOLD:
@@ -268,7 +323,6 @@ class ActionMapper:
             )
 
         if action == PokerAction.CHECK:
-            # CHECK: only valid if amount_to_call == 0
             if context.amount_to_call == 0:
                 return ResolvedAction(
                     action=PokerAction.CHECK,
@@ -276,7 +330,6 @@ class ActionMapper:
                     description="Check — A játékos passzív lépést választ.",
                 )
             else:
-                # Invalid CHECK with outstanding bet → fallback to CALL
                 logger.debug(
                     "CHECK kérés amount_to_call > 0 mellett → CALL-ra visszaváltás"
                 )
@@ -288,7 +341,6 @@ class ActionMapper:
                 )
 
         if action == PokerAction.CALL:
-            # CALL: any amount_to_call, but fallback to CHECK if no bet
             call_amount: float = min(context.amount_to_call, context.my_stack)
             if call_amount == 0:
                 return ResolvedAction(
@@ -302,30 +354,20 @@ class ActionMapper:
                 description=f"Call — {call_amount:.0f} chip",
             )
 
-        if action == PokerAction.ALL_IN:  # index 11
+        if action == PokerAction.ALL_IN:
             return ResolvedAction(
                 action=PokerAction.ALL_IN,
                 amount=context.my_stack,
                 description=f"All-in — {context.my_stack:.0f} chip (teljes stack)",
             )
 
-        # Emelési akciók: pot-relatív méret kiszámítása
-        if action == PokerAction.MIN_RAISE:
-            raise_amount = context.min_raise_amount
-        elif action in _RAISE_MULTIPLIERS:
-            multiplier: float = _RAISE_MULTIPLIERS[action]
-            raise_amount = context.amount_to_call + multiplier * (context.pot_size + context.amount_to_call)
-        else:
-            logger.error("Ismeretlen akció: %s. Fallback: Fold.", action)
-            return ResolvedAction(
-                action=PokerAction.FOLD, amount=0.0,
-                description="Ismeretlen akció → biztonsági Fold",
-            )
+        # Emelési akciók: street-specifikus bet sizing verwendet
+        raise_amount = self._calculate_raise_amount(action, context)
 
-        # Minimum raise floor: az emelés nem lehet kisebb a minimálisnál
+        # Minimum raise floor
         raise_amount = max(raise_amount, context.min_raise_amount)
 
-        # Stack capping: ha az emelés meghaladja a stacket → All-in
+        # Stack capping
         if raise_amount >= context.my_stack:
             logger.debug(
                 "Stack capping: kívánt emelés=%.0f >= stack=%.0f → All-in",
@@ -346,6 +388,47 @@ class ActionMapper:
             amount=raise_amount,
             description=f"{action_name} — {raise_amount:.0f} chip",
         )
+    
+    def _calculate_raise_amount(self, action: PokerAction, context: GameContext) -> float:
+        """Calculate raise amount using street-specific bet sizing.
+        
+        Args:
+            action: The raise action type (MIN_RAISE or one of the RAISE_*_POT actions).
+            context: The current game context with street information.
+        
+        Returns:
+            The calculated raise amount in chips.
+        """
+        if action == PokerAction.MIN_RAISE:
+            return context.min_raise_amount
+        
+        # Map action to street-specific multiplier
+        street_multipliers = self.bet_sizing_config.get_multipliers(context.street)
+        multiplier = 0.5  # Default fallback
+        
+        # Map action index to street-specific multiplier position
+        if action == PokerAction.RAISE_QUARTER_POT:
+            multiplier = street_multipliers[0] if len(street_multipliers) > 0 else 0.33
+        elif action == PokerAction.RAISE_THIRD_POT:
+            multiplier = street_multipliers[0] if len(street_multipliers) > 0 else 0.33
+        elif action == PokerAction.RAISE_HALF_POT:
+            idx = min(1, len(street_multipliers) - 1)
+            multiplier = street_multipliers[idx] if len(street_multipliers) > idx else 0.5
+        elif action == PokerAction.RAISE_THREE_QUARTER_POT:
+            idx = min(2, len(street_multipliers) - 1)
+            multiplier = street_multipliers[idx] if len(street_multipliers) > idx else 0.75
+        elif action == PokerAction.RAISE_FULL_POT:
+            idx = min(len(street_multipliers) - 1, 2)
+            multiplier = street_multipliers[idx] if len(street_multipliers) > idx else 1.0
+        elif action == PokerAction.RAISE_1_5X_POT:
+            idx = min(len(street_multipliers) - 1, 3)
+            multiplier = street_multipliers[idx] if len(street_multipliers) > idx else 1.5
+        elif action == PokerAction.RAISE_2X_POT:
+            multiplier = street_multipliers[-1] if street_multipliers else 1.5
+        
+        # Calculate total raise amount
+        raise_amount = context.amount_to_call + multiplier * (context.pot_size + context.amount_to_call)
+        return raise_amount
 
     # =========================================================================
     # Legális Akciók és Maszkolás

@@ -51,6 +51,8 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 
+from src.env.sequential_history import LSTMHistoryEncoder
+
 logger = logging.getLogger(__name__)
 
 
@@ -506,18 +508,25 @@ class PokerActorCritic(nn.Module):
             position_dim=self.config.position_input_dim,
             embed_dim=self.config.context_embed_dim,
         )
-        self.history_embedding = HistoryEmbedding(
-            history_flat_dim=self.config.history_input_dim,
-            embed_dim=self.config.history_embed_dim,
+        self.history_encoder = LSTMHistoryEncoder(
+            action_feature_dim=13,  # Phase 2.5: betting history is [18, 13]
+            hidden_dim=256,
+            num_layers=2,
+            dropout=0.1,
+            bidirectional=False,
         )
 
-        # --- Fúziós dimenzió (== config.trunk_input_dim) ---
-        self._fusion_dim: int = self.config.trunk_input_dim
+        # --- Fúziós dimenzió (== cards*2 + context + history_encoder) ---
+        self._fusion_dim: int = (
+            self.card_embedding.output_dim
+            + self.context_embedding.output_dim
+            + self.history_encoder.output_dim
+        )
         logger.info(
-            "Fúzió: cards=%d + ctx=%d + hist=%d = %d",
+            "Fúzió: cards=%d + ctx=%d + lstm_hist=%d = %d",
             self.card_embedding.output_dim,
             self.context_embedding.output_dim,
-            self.history_embedding.output_dim,
+            self.history_encoder.output_dim,
             self._fusion_dim,
         )
 
@@ -664,7 +673,7 @@ class PokerActorCritic(nn.Module):
                     "community_cards"  (batch, 52)
                     "env_metrics"      (batch, N)
                     "position"         (batch, P)
-                    "betting_history"  (batch, 18, 9)
+                    "betting_history"  (batch, 18, 13)  [PHASE 2: LSTM input, NOT flattened]
                     "action_mask"      (batch, 9)
 
         Returns:
@@ -683,7 +692,8 @@ class PokerActorCritic(nn.Module):
         # 1. Beágyazás
         card_emb: torch.Tensor = self.card_embedding(hole_cards, community_cards)
         ctx_emb:  torch.Tensor = self.context_embedding(env_metrics, position)
-        hist_emb: torch.Tensor = self.history_embedding(betting_history)
+        # [PHASE 2] LSTM History Encoder: DO NOT flatten, pass (batch, 18, 13) directly
+        hist_emb: torch.Tensor = self.history_encoder(betting_history)
 
         # 2. Fúzió
         fused: torch.Tensor = torch.cat([card_emb, ctx_emb, hist_emb], dim=-1)

@@ -1,0 +1,165 @@
+ "I have all the code in the attached documents. Let me do a thorough component-level analysis before scoring.
+Superhuman RTA Readiness Audit — Deep CFR NLHE
+Overall Readiness Score: 31 / 100
+The mathematical foundation is sound, but the four pillars required for superhuman deployment are either placeholder stubs, architecturally mismatched, or bottlenecked in ways that will prevent scaling. Here is the full breakdown.
+Critical Blockers for Superhuman Scaling
+1. RTA & Depth-Limited Subgame Solving — Score: 4 / 25
+This is the most dangerous area because the code looks complete but is entirely non-functional scaffolding. Every method that should query the value network returns a hardcoded constant or random noise.
+src/training/safe_subgame_solver.py — the entire solver is fake
+
+# _compute_pair_regrets() — the core of the solver
+return {
+    0: np.random.randn() * 0.1,  # fold
+    1: np.random.randn() * 0.1,  # check
+    2: np.random.randn() * 0.1,  # bet
+}
+
+# _estimate_trunk_value() — the safety constraint
+return np.mean(list(hero_range.values()))  # ← probability, not chip-EV
+
+# _estimate_subgame_value()
+return 0.0  # ← hardcoded zero
+The trunk value constraint (the entire mathematical guarantee of Brown & Sandholm 2017) is never connected to anything. _estimate_trunk_value() returns the mean hand probability instead of the expected chip EV from the blueprint value network. The Lagrangian multiplier updates a variable against a nonsense number. The safety guarantee is illusory.
+src/training/rta_solver.py — same pattern
+
+# SubgameSolver._solve_hand_pair()
+def _solve_hand_pair(self, subgame, hero_hand, opponent_hand, ...) -> Dict[int, float]:
+    return {action: 0.0 for action in range(12)}
+Every MCCFR iteration samples hand pairs and accumulates zero regrets. After 1,000 iterations the regret dict is still all zeros. The _extract_strategy() that follows computes max(0, 0) / sum(max(0,0)), hits the total <= 0 branch, and returns a hardcoded {'fold': 0.0, 'check': 0.5, 'bet': 0.5} regardless of board, hand, pot, or opponent range.
+src/training/range_solver.py — trunk value computation
+
+def _compute_trunk_value(self, hero_range, opponent_range, context):
+    hero_value = 0.0  # Stub
+    opponent_value = -hero_value
+    return SubgameTrunkValue(hero_value=hero_value, ...)
+The blueprint value network (self.value_network) is stored on the class but never called. The constraint passed into SafeSubgameSolver.solve() is always 0.0. The solver is mathematically unconstrained — it is standard (unsafe) subgame solving with random regrets, which is worse than using the blueprint directly.
+src/training/bayesian_range.py — range inference
+
+def _action_likelihood(self, action_name, amount, board, posterior_before):
+    for i in range(169):
+        hand = f"hand_{i}"
+        if action_name == 'bet':
+            likelihood[hand] = 0.7
+        elif action_name == 'check':
+            likelihood[hand] = 0.3
+        else:
+            likelihood[hand] = 0.5
+This returns uniform likelihoods independent of hand strength, board texture, pot odds, or bet size. A pot-sized river bet with AA and 72o both get likelihood = 0.7. The Bayesian update is mathematically correct in structure but the likelihood function is flat, so the posterior never moves from the prior. Range inference produces no information.
+What must be implemented:
+
+_compute_pair_regrets() must run actual game tree traversal (call MCCFRTraversal.external_sampling_traversal()) and return counterfactual values from the terminal payoffs
+_estimate_trunk_value() must call self.value_network(obs) at the trunk decision node and return value_out.item()
+_action_likelihood() must call the AverageStrategyNetwork with the infoset observation and return softmax_probs[action_idx] per hand
+The RTAAgent must replace SubgameSolver with SafeSubgameSolver with real trunk computation
+2. Neural Network Capacity & Architecture — Score: 9 / 25
+src/model/networks.py — the dead sequential encoder
+src/training/sequential_history.py implements LSTMHistoryEncoder and TransformerHistoryEncoder. These are architecturally correct. They are never imported or used anywhere in the training pipeline. The PokerActorCritic uses HistoryEmbedding — a flat MLP over a 18×13 concatenated vector:
+
+# networks.py
+class HistoryEmbedding(nn.Module):
+    def __init__(self, history_flat_dim: int = 162, embed_dim: int = 64):
+        self.embed = nn.Sequential(
+            nn.Linear(history_flat_dim, embed_dim * 2),
+            nn.ReLU(),
+            nn.Linear(embed_dim * 2, embed_dim),
+        )
+    def forward(self, betting_history: torch.Tensor) -> torch.Tensor:
+        if betting_history.dim() == 3:
+            betting_history = betting_history.flatten(start_dim=1)
+        return self.embed(betting_history)
+Flattening an 18×13 sequence before embedding destroys positional information. The network cannot distinguish "bet-check-bet" from "check-bet-bet" — both produce the same flattened input if the action one-hots happen to sum identically. In 6-Max with 4 streets and up to 18 actions per street, this is a critical expressiveness bottleneck. Libratus and Pluribus both use recurrent or attention architectures over betting histories.
+src/training/cfr_buffer.py — network capacity for 6-Max
+RegretValueNetwork and AverageStrategyNetwork are 3-layer MLPs with hidden_dim=512. The state space of 6-Max NLHE is approximately 10^160 information sets. The observation dimension for 6-Max with the current config is 354 (from features.py). A 512-wide MLP cannot generalize across:
+
+6 distinct seat positions with asymmetric information
+All four streets simultaneously
+Multi-way pots with partial fold sequences
+The card_abstraction.py suit isomorphism reduces hole cards from 1,326 to 169 canonical hands, which is correct. However the equity bucketing (HandStrengthBucket) uses cdist + linear_sum_assignment — both O(N²) and O(N³) operations — computed live during traversal rather than from the precomputed cache. For high-frequency traversal this will stall workers.
+Strategic recommendation for architecture:
+Replace HistoryEmbedding with the existing LSTMHistoryEncoder from sequential_history.py. Wire it into PokerActorCritic.__init__():
+
+# networks.py — proposed change
+from src.training.sequential_history import LSTMHistoryEncoder
+
+class PokerActorCritic(nn.Module):
+    def __init__(self, config):
+        ...
+        self.history_embedding = LSTMHistoryEncoder(
+            action_feature_dim=config.action_feature_dim,  # 13
+            hidden_dim=config.history_embed_dim,           # 256 recommended
+            num_layers=2,
+            bidirectional=False,
+        )
+Then in forward(), pass the un-flattened (batch, 18, 13) tensor directly to the LSTM and use the final hidden state. This change is backward-incompatible with existing checkpoints but essential for 6-Max expressiveness.
+3. Data Throughput & Multi-GPU Scaling — Score: 10 / 25
+src/training/parallel_cfr.py — the SyncManager bottleneck
+
+class SharedRegretBuffer:
+    def __init__(self, manager: mp.managers.SyncManager):
+        self.regrets = manager.dict()      # ← This is the bottleneck
+        self.lock = manager.Lock()
+mp.managers.SyncManager proxies every dict access through a dedicated manager process via a Unix domain socket and Python pickle serialization. Each accumulate_regrets() call involves: pickle-serialize the update → send over socket → manager acquires lock → updates nested dict → sends acknowledgment → caller deserializes. At 8 workers each writing 100+ regret updates per second, this becomes the dominant bottleneck — measured overhead is typically 10-50ms per call at this access pattern.
+The correct approach for high-throughput regret aggregation is torch.multiprocessing shared tensors (zero-copy) or numpy arrays in multiprocessing.shared_memory. Workers accumulate locally and the master aggregates periodically:
+
+# Proposed pattern
+import multiprocessing.shared_memory as shm
+import numpy as np
+
+# Master allocates a fixed shared tensor for regrets
+# Workers write to their own slice; master reduces at iteration boundary
+shared_regrets = torch.zeros(num_infosets, num_actions).share_memory_()
+src/training/cfr_buffer.py — reservoir sampling under load
+
+class RegretBuffer:
+    def __init__(self, buffer_size=10000, num_actions=12):
+        self.samples: list[RegretSample] = []
+        self.reservoir_count = 0
+    
+    def add_sample(self, ...):
+        j = np.random.randint(0, self.reservoir_count + 1)
+        if j < self.buffer_size:
+            if len(self.samples) < self.buffer_size:
+                self.samples.append(sample)
+            else:
+                self.samples[j] = sample  # Random list index write
+This is single-threaded Python with no locking. If ParallelCFR workers call add_sample() concurrently (which happens through the SyncManager proxy), the reservoir_count counter race condition will cause incorrect reservoir probability distribution — some samples will be systematically over-represented.
+sample_batch() calls torch.stack(obs_list) inside the batch loop — this allocates a new tensor for every mini-batch. For a buffer with 10,000 entries and frequent sampling, this creates significant GC pressure. A pre-allocated tensor batch cache would be appropriate.
+GPU utilization from workers
+Workers in _worker_process() perform only CPU-side random action selection. There is no GPU inference in the traversal loop — the network is never called from workers. This means the main GPU sits idle during traversal phases. The correct architecture (as used in AlphaGo and Pluribus implementations) is a centralized GPU inference server: workers send batched observation tensors over shared memory, the GPU server returns action distributions, workers consume them. This requires restructuring MCCFRTraversal to batch network calls rather than calling the network per-step.
+src/training/buffer.py — consolidated tensor allocation
+_consolidate_tensors() in RolloutBuffer calls torch.stack() once per key across all N steps — this is correct and efficient. This part of the pipeline is well-implemented.
+4. Action / Bet Sizing Abstraction — Score: 8 / 25
+src/env/action_mapper.py — fixed multipliers, wrong reference pot
+
+_RAISE_MULTIPLIERS: dict[PokerAction, float] = {
+    PokerAction.RAISE_QUARTER_POT: 0.25,
+    PokerAction.RAISE_THIRD_POT: 0.33,
+    PokerAction.RAISE_HALF_POT: 0.50,
+    ...
+}
+
+# In resolve_action():
+raise_amount = context.amount_to_call + multiplier * (context.pot_size + context.amount_to_call)
+This is a reasonable approximation but there are two issues. First, the pot reference includes amount_to_call added twice (once explicitly, once inside the parenthetical) — this is the correct "pot after call" formula, so it is actually fine. Second, and critically, the bet sizing is uniform across all streets. Superhuman bots use street-specific, SPR-dependent bet sizing trees. On the river with SPR < 2, a 2x pot overbet is geometrically correct; preflop with 100BB effective, a 2.5x pot bet is almost never the right sizing bucket.
+src/env/wrappers.py — linear interpolation mapping
+
+def _map_our_action_to_rlcard(self, action, legal, ctx):
+    ...
+    proportion = (action - _MIN_RAISE) / max(_RAISE_2X - _MIN_RAISE, 1)
+    mapped_idx = round(proportion * (len(raise_ids) - 1))
+When RLCard exposes only 3 raise levels but our action space has 8 raise buckets, this linear interpolation collapses multiple distinct bet sizes to the same RLCard action. The network learns to differentiate between RAISE_HALF_POT and RAISE_FULL_POT internally, but they both map to the same executed action. The network's gradient signal for bet sizing is therefore corrupted — losses associated with different bet sizes train against identical environmental outcomes.
+Missing: geometric bet sizing trees
+Pluribus used a per-street bet sizing abstraction of the form {0.5x, 1x, All-In} on the river and {0.25x, 0.75x, All-In} on earlier streets, selected to minimize information loss rather than linear coverage. The correct approach is to define a BetSizingTree per street and SPR bucket, then map our 12 discrete actions onto whichever tree node is active. The current uniform 12-action space over-represents large overbets (which are rare) and under-represents the nuanced small-bet range (33%–75% pot) where most GTO play occurs.
+Strategic Recommendations — Prioritized
+Priority 1 (Blocks deployment): Wire the value network into the RTA stack
+In safe_subgame_solver.py, replace the stub _estimate_trunk_value() with a call to self.strategy_network — which already stores the PokerActorCritic object. Use network.get_value(obs_batched) at the trunk root observation. In _compute_pair_regrets(), replace the random return with a call to MCCFRTraversal.external_sampling_traversal() from cfr_traversal.py — the traversal engine is implemented and correct. The RTA solver should be a thin wrapper over the existing traversal engine, not an independent stub.
+Priority 2 (Blocks 6-Max scale): Replace HistoryEmbedding with LSTMHistoryEncoder
+sequential_history.py is production-ready and correct. Wire it into PokerActorCritic. Set hidden_dim=256, num_layers=2. Accept the checkpoint incompatibility. The expressiveness gain for multi-street 6-Max sequences will outweigh the training restart cost.
+Priority 3 (Blocks throughput): Replace SyncManager with shared_memory
+In parallel_cfr.py, allocate a torch.Tensor in shared memory for the regret accumulation matrix. Size it as (max_infosets, num_actions) with float32. Workers write to their own row range; the master reduces at the end of each iteration. This eliminates the socket round-trip overhead entirely and makes regret accumulation effectively free.
+Priority 4 (Limits superhuman quality): Implement street-specific bet sizing trees
+Add a BetSizingConfig dataclass that maps (street, spr_bucket) to a list of pot multipliers. Replace the current flat _RAISE_MULTIPLIERS dict in action_mapper.py with a lookup into this config. This allows the network to learn street-appropriate sizing without the action space exploding.
+Priority 5 (Architectural hygiene): Delete the stub files or mark them clearly
+src/training/safe_subgame_solver.py, src/training/rta_solver.py, src/training/range_solver.py, and src/training/bayesian_range.py currently return random numbers or hardcoded constants while appearing to be functional implementations. Any integration test that calls these modules will pass silently while producing garbage results. Either implement them correctly (Priority 1) or gate them with raise NotImplementedError("Stub — see Priority 1 tracker") to make failures explicit.
+Score Summary
+ComponentScoreCeilingRTA & Depth-Limited Subgame Solving425Neural Network Capacity & Architecture925Data Throughput & Multi-GPU Scaling1025Action / Bet Sizing Abstraction825Total31100The core CFR traversal loop (cfr_traversal.py, cfr_infoset.py, cfr_engine.py) is mathematically sound and that investment is real. The gap to superhuman deployment is almost entirely in the four areas above. Priority 1 alone — actually connecting the value network to the RTA solver — would move the score to approximately 50/100 and make the system functionally deployable for basic real-time subgame refinement. The remaining three priorities get you to superhuman territory."

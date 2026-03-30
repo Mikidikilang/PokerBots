@@ -261,15 +261,19 @@ class RangeBasedSubgameSolver:
         """
         Compute hero's range at this decision node.
         
-        Uses:
+        PHASE 1 NOTE: This is a stub that returns uniform distribution.
+        Real version would use:
         - Starting hand ranges (preflop position)
         - Actions taken (folding some hands, not others)
         - Network probabilities (which hands likely at this state)
         """
-        # Placeholder: return uniform
-        num_hands = 169
-        hands = {f"hand_{i}": 1.0 / num_hands for i in range(num_hands)}
-        return HandRange(hands=hands)
+        # ★ STUB — Pending poker game tree analysis
+        raise NotImplementedError(
+            "PHASE 1 RTA WIRING: RangeBasedSubgameSolver._get_hero_range() "
+            "pending game tree / position-based range computation. "
+            "Currently returns uniform distribution. "
+            "See audit.txt Priority 1."
+        )
     
     def _compute_trunk_value(
         self,
@@ -280,20 +284,28 @@ class RangeBasedSubgameSolver:
         """
         Compute blueprint's expected value in trunk (leading to this subgame).
         
+        REAL IMPLEMENTATION:
+            Calls self.value_network(observation) at trunk root state
+            to compute true expected chip-EV.
+            This is the constraint that makes safe subgame solving actually safe.
+        
         This is the constraint for safe subgame solving.
         Hero cannot guarantee less than this.
         """
-        # Placeholder: would use value network to compute
-        # hero_value = E[value | hero_range, opponent_range, history]
+        if self.value_network is None:
+            raise NotImplementedError(
+                "PHASE 1 RTA WIRING: RangeBasedSubgameSolver._compute_trunk_value() "
+                "requires value_network to compute real trunk values. "
+                "Currently returns hardcoded 0.0 (constraint not enforced). "
+                "See audit.txt Priority 1."
+            )
         
-        hero_value = 0.0  # Stub
-        opponent_value = -hero_value
-        
-        return SubgameTrunkValue(
-            hero_value=hero_value,
-            opponent_value=opponent_value,
-            pot_size=context.pot,
-            hero_position=context.hero_position,
+        # ★ STUB with check — Pending value network integration
+        raise NotImplementedError(
+            "PHASE 1 RTA WIRING: _compute_trunk_value() must call "
+            "value_network(observation) to compute real expected value. "
+            "Requires constructing observation tensor from (hero_range, opponent_range, history). "
+            "See audit.txt Priority 1."
         )
 
 

@@ -281,7 +281,21 @@ class RLCardWrapper:
         action = int(max(_FOLD, min(_ALL_IN, action)))
 
         raw = self._get_raw_obs(self._current_state)
+        
+        # [PHASE 4] Determine street BEFORE building context for street-specific bet sizing
+        n_public = len(raw.get("public_cards", []))
+        self._current_street = _PUBLIC_CARDS_TO_STREET.get(n_public, 0)
+        
         ctx = self._build_game_context(raw, self._current_player_id)
+        # Add street to context for street-specific bet sizing
+        ctx = GameContext(
+            pot_size=ctx.pot_size,
+            my_stack=ctx.my_stack,
+            amount_to_call=ctx.amount_to_call,
+            min_raise_amount=ctx.min_raise_amount,
+            big_blind=ctx.big_blind,
+            street=self._current_street,
+        )
 
         try:
             resolved = self._action_mapper.resolve_action(
@@ -295,12 +309,6 @@ class RLCardWrapper:
                 action, exc,
             )
             chip_amount = 0.0
-
-        # [FIX Y-1 COMPLETION] Determine street from the CURRENT state
-        # (before the step), so the recorded street is the one on which
-        # this action was taken.
-        n_public = len(raw.get("public_cards", []))
-        self._current_street = _PUBLIC_CARDS_TO_STREET.get(n_public, 0)
 
         # Calculate SPR (Stack-to-Pot Ratio) before the action
         # SPR = effective_stack / pot_before_action
