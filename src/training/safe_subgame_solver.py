@@ -256,9 +256,14 @@ class SafeSubgameSolver:
                 env,
             )
             
-            # Update regrets
+            # Update regrets with Lagrangian penalty
             for action, regret in pair_regrets.items():
-                self.regrets[hero_hand_sample][action] += regret
+                # ★ T2 FIX: Apply Lagrangian penalty to constrain trunk value
+                # adjusted_regret = regret - λ * (target_value - current_value)
+                # This penalizes deviations from the trunk value constraint
+                current_trunk = self._estimate_trunk_value(hero_range, board)
+                lagrangian_penalty = self.lagrange_multiplier * (trunk_value.hero_value - current_trunk)
+                self.regrets[hero_hand_sample][action] += regret - lagrangian_penalty
             
             # Every 100 iterations: check trunk value and update λ
             if (iteration + 1) % 100 == 0:

@@ -692,8 +692,11 @@ class PokerActorCritic(nn.Module):
         # 1. Beágyazás
         card_emb: torch.Tensor = self.card_embedding(hole_cards, community_cards)
         ctx_emb:  torch.Tensor = self.context_embedding(env_metrics, position)
-        # [PHASE 2] LSTM History Encoder: DO NOT flatten, pass (batch, 18, 13) directly
-        hist_emb: torch.Tensor = self.history_encoder(betting_history)
+        # [PHASE 2] LSTM History Encoder: compute sequence_lengths from betting_history
+        # Count non-zero rows (actions) for each batch element
+        # CRITICAL: pack_padded_sequence requires CPU int64 tensor, clamp min to 1 to avoid RNN crashes
+        seq_lens: torch.Tensor = (betting_history.sum(dim=-1) != 0).sum(dim=-1).clamp(min=1).cpu().to(torch.int64)
+        hist_emb: torch.Tensor = self.history_encoder(betting_history, sequence_lengths=seq_lens)
 
         # 2. Fúzió
         fused: torch.Tensor = torch.cat([card_emb, ctx_emb, hist_emb], dim=-1)
@@ -1000,7 +1003,7 @@ class PokerActorCritic(nn.Module):
         counts: dict[str, int] = {
             "card_embedding":    sum(p.numel() for p in self.card_embedding.parameters()),
             "context_embedding": sum(p.numel() for p in self.context_embedding.parameters()),
-            "history_embedding": sum(p.numel() for p in self.history_embedding.parameters()),
+            "history_embedding": sum(p.numel() for p in self.history_encoder.parameters()),
             "actor_head":        sum(p.numel() for p in self.actor_head.parameters()),
             "critic_head":       sum(p.numel() for p in self.critic_head.parameters()),
         }

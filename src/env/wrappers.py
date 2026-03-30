@@ -479,12 +479,24 @@ class RLCardWrapper:
         if not raise_ids:
             return sorted_ids[min(1, n - 1)]
 
-        # Map our raise indices (MIN_RAISE..RAISE_2X inclusive = 3..10) linearly
-        # onto RLCard's available raise slots. _ALL_IN (11) is handled above.
-        proportion = (action - _MIN_RAISE) / max(_RAISE_2X - _MIN_RAISE, 1)  # 0.0 -> 1.0
-        mapped_idx = round(proportion * (len(raise_ids) - 1))
-        mapped_idx = max(0, min(mapped_idx, len(raise_ids) - 1))
-        return raise_ids[mapped_idx]
+        # Raise actions: Use ActionMapper.resolve_action() to get exact target amount
+        poker_action = PokerAction(action)
+        resolved = self._action_mapper.resolve_action(poker_action, ctx)
+        target_amount = resolved.amount
+        
+        # Find RLCard action that minimizes absolute distance from target_amount
+        # legal is {rlcard_id: chip_amount, ...}
+        closest_id = raise_ids[0]
+        closest_diff = abs(legal[raise_ids[0]] - target_amount)
+        
+        for rlcard_id in raise_ids[1:]:
+            chip_amount = legal[rlcard_id]
+            diff = abs(chip_amount - target_amount)
+            if diff < closest_diff:
+                closest_diff = diff
+                closest_id = rlcard_id
+        
+        return closest_id
 
     def _rlcard_legal_to_our_mask(
         self,

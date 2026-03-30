@@ -328,8 +328,11 @@ class MCCFRTraversal:
                 action_count=action_count + 1,
             )
             
-            # Scale by probability of sampling this action (importance weighting)
-            return value / sampled_prob if sampled_prob > 0 else 0.0
+            # ★ T1 FIX: No importance weighting division
+            # External sampling MCCFR does not divide by sampled_prob.
+            # The sampled branch is traversed exactly once; expectation is correct.
+            # Dividing by sampled_prob creates unbounded variance.
+            return value
     
     def traverse_for_both_players(self, num_traversals: int = 1) -> dict[str, float]:
         """

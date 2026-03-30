@@ -331,13 +331,17 @@ def test_worker_pool_direct_write_architecture():
             print(f"  Task {result.task_id}: wrote {result.num_regrets_written} regrets to tensor")
         
         # Verify regrets are actually in shared tensor
-        shared_regrets = pool.get_shared_regrets()
+        # Count non-zero entries in the shared regret tensor
+        import torch
+        shared_tensor = pool.shared_buffer.regrets
+        non_zero_count = torch.count_nonzero(shared_tensor).item()
+        
         print(f"\nVerification:")
         print(f"  Total regrets written directly to tensor: {total_regrets_written}")
-        print(f"  Unique infosets in tensor: {len(shared_regrets)}")
+        print(f"  Non-zero entries in shared tensor: {non_zero_count}")
         
         assert total_regrets_written > 0, "Should have written regrets directly to tensor"
-        assert len(shared_regrets) > 0, "Shared tensor should contain infosets"
+        assert non_zero_count > 0, "Shared tensor should contain non-zero regrets"
         
         print(f"\nPASS: Direct-write architecture verified\n")
         

@@ -392,6 +392,9 @@ class ActionMapper:
     def _calculate_raise_amount(self, action: PokerAction, context: GameContext) -> float:
         """Calculate raise amount using street-specific bet sizing.
         
+        Each discrete raise action maps to a distinct multiplier from the street config,
+        using interpolation if the multiplier list is shorter than the number of actions.
+        
         Args:
             action: The raise action type (MIN_RAISE or one of the RAISE_*_POT actions).
             context: The current game context with street information.
@@ -402,29 +405,43 @@ class ActionMapper:
         if action == PokerAction.MIN_RAISE:
             return context.min_raise_amount
         
-        # Map action to street-specific multiplier
         street_multipliers = self.bet_sizing_config.get_multipliers(context.street)
-        multiplier = 0.5  # Default fallback
+        if not street_multipliers:
+            street_multipliers = [0.25, 0.5, 1.0, 1.5, 2.0]
         
-        # Map action index to street-specific multiplier position
-        if action == PokerAction.RAISE_QUARTER_POT:
-            multiplier = street_multipliers[0] if len(street_multipliers) > 0 else 0.33
-        elif action == PokerAction.RAISE_THIRD_POT:
-            multiplier = street_multipliers[0] if len(street_multipliers) > 0 else 0.33
-        elif action == PokerAction.RAISE_HALF_POT:
-            idx = min(1, len(street_multipliers) - 1)
-            multiplier = street_multipliers[idx] if len(street_multipliers) > idx else 0.5
-        elif action == PokerAction.RAISE_THREE_QUARTER_POT:
-            idx = min(2, len(street_multipliers) - 1)
-            multiplier = street_multipliers[idx] if len(street_multipliers) > idx else 0.75
-        elif action == PokerAction.RAISE_FULL_POT:
-            idx = min(len(street_multipliers) - 1, 2)
-            multiplier = street_multipliers[idx] if len(street_multipliers) > idx else 1.0
-        elif action == PokerAction.RAISE_1_5X_POT:
-            idx = min(len(street_multipliers) - 1, 3)
-            multiplier = street_multipliers[idx] if len(street_multipliers) > idx else 1.5
-        elif action == PokerAction.RAISE_2X_POT:
-            multiplier = street_multipliers[-1] if street_multipliers else 1.5
+        # Map action to index in the raise actions (3-10, excluding MIN_RAISE and ALL_IN)
+        raise_actions = [
+            PokerAction.RAISE_QUARTER_POT,
+            PokerAction.RAISE_THIRD_POT,
+            PokerAction.RAISE_HALF_POT,
+            PokerAction.RAISE_THREE_QUARTER_POT,
+            PokerAction.RAISE_FULL_POT,
+            PokerAction.RAISE_1_5X_POT,
+            PokerAction.RAISE_2X_POT,
+        ]
+        
+        action_index = -1
+        for idx, ra in enumerate(raise_actions):
+            if action == ra:
+                action_index = idx
+                break
+        
+        if action_index < 0:
+            # Fallback: use default proportional multiplier
+            multiplier = 1.0
+        else:
+            # Interpolate action_index to street_multipliers list
+            if len(raise_actions) <= len(street_multipliers):
+                # Direct mapping: each action gets a distinct multiplier
+                multiplier = street_multipliers[action_index]
+            else:
+                # Interpolate: action_index onto shorter multiplier list
+                proportion = action_index / (len(raise_actions) - 1) if len(raise_actions) > 1 else 0.0
+                target_idx = proportion * (len(street_multipliers) - 1)
+                lower_idx = int(target_idx)
+                upper_idx = min(lower_idx + 1, len(street_multipliers) - 1)
+                frac = target_idx - lower_idx
+                multiplier = street_multipliers[lower_idx] * (1 - frac) + street_multipliers[upper_idx] * frac
         
         # Calculate total raise amount
         raise_amount = context.amount_to_call + multiplier * (context.pot_size + context.amount_to_call)
