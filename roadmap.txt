@@ -1,0 +1,121 @@
+Part 1: PDF Synthesis — What VR-DeepPDCFR+ Actually Requires
+The four PDFs describe an algorithm that is fundamentally different from anything in your current codebase. Here are the non-negotiable mathematical requirements:
+Four distinct neural networks per player, not one actor-critic:
+The cumulative advantage network (θ) bootstraps from its own frozen prior iteration, applying CFR+ clipping and DCFR temporal discounting inside the regression loss function itself — not as a post-processing step. The instantaneous advantage network (φ) sees only the current iteration's variance-reduced data, acting as the "predictive sensor." The history value baseline network (Q) is an Expected SARSA-style critic whose sole job is killing Monte Carlo variance. The average strategy network (Π) learns the Nash-converging average strategy via time-weighted behavioral cloning.
+The ephemeral buffer is the architectural keystone. The ephemeral advantage buffer B_V,i is wiped to zero at the start of every CFR iteration. This single design decision is what eliminates capacity-induced reservoir dilution — the phenomenon where stale early-training noise crowds out refined late-training signal. The persistent strategy buffer B_Π survives across all T iterations but uses time-decay weighting (γ=2 means iteration t=1000 carries 100× more weight than t=10).
+The predictive strategy is not optional. The behavior policy during traversal is derived from the predicted next-state, computed as max(R(I,a|θ_{t-1}) × discount + r(I,a|φ_{t-1}), 0), then normalized via regret matching. Using only θ_{t-1} (as standard Deep CFR does) introduces one iteration of lag. The φ network eliminates this lag, which is the "predictive" in PDCFR+.
+Here is the full network interaction diagram:
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation-duration: 0.25s;
+    animation-timing-function: cubic-bezier(0.19, 1, 0.22, 1);
+  }
+VvisualizeVvisualize show_widgetCritical hyperparameters from the papers: α=2 (discounting power), β=0 (negative regret discount — effectively zeroing negative history), γ=2 (strategy weighting), ε=0.6 (exploration). The temporal decay fraction is (t-1)^α / ((t-1)^α + 1), which starts near zero and approaches 1 asymptotically.
+State representation requirements for 6-max (from the state PDF): cards use 17-dim rank-suit factorization per card, not 52-dim multi-hot. Flop cards must be permutation-invariant (sorted or processed through a permutation-invariant layer). Multi-way pots require a B ∈ R^{4×6} betting tensor. For full exploitability guarantees, the Public Belief State (PBS) encodes probability distributions over 1326 combos per active player — scaling to 7956 dims for 6-max beliefs alone.
+
+Part 2: Legacy Codebase Audit
+Here is the definitive keep/rewrite breakdown:
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation-duration: 0.25s;
+    animation-timing-function: cubic-bezier(0.19, 1, 0.22, 1);
+  }
+VvisualizeVvisualize show_widgetThe most important incompatibility in the existing code is the unified reservoir buffer in cfr_buffer.py. VR-DeepPDCFR+'s convergence proof requires the ephemeral buffer — using a persistent reservoir for advantage samples causes the temporal discounting math to collapse, because samples from iteration t-k carry an "entirely outdated, historically invalid valuation" of the decay weight. The existing deep_cfr_v2.py is actually the closest thing to correct, but it lacks temporal discounting, CFR+ clipping inside the loss, and the predictive φ network.
+
+Part 3: The Refactoring Roadmap
+Here is the five-phase plan:
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation-duration: 0.25s;
+    animation-timing-function: cubic-bezier(0.19, 1, 0.22, 1);
+  }
+VvisualizeVvisualize show_widgetHere is the detailed breakdown of each phase:
+
+Phase 1 — State Representation (env/state_encoder_v2.py)
+New file: src/env/state_encoder_v2.py
+Card encoding replaces the current 52-dim multi-hot with the 17-dim rank-suit factorization per card. A card like A♠ becomes a 13-dim rank one-hot concatenated with a 4-dim suit one-hot. The flop (3 cards) is sorted lexicographically before embedding to achieve permutation invariance without a self-attention layer. Turn and River cards are appended chronologically (order matters for those). Streets not yet reached are zero-masked. Total card dimensionality: 2×17 (hole) + 3×17 (flop) + 17 (turn) + 17 (river) = 119 dims.
+Multi-way betting tensor B ∈ R^{4×6} tracks each player's pot contribution per street, normalized by effective stacks. A binary 6-dim active/folded mask is concatenated. Positional encoding is a 6-dim one-hot for the dealer-relative seat.
+Action representation uses distance-weighted probability binning for off-grid bet sizes: an opponent bet of 0.85× pot is split probabilistically between the 0.66× and 1.0× abstract actions based on geometric distance.
+What you reuse: the WrapperConfig, _normalise_cards(), _to_suitrank() helpers, and ObservationConfig dataclass skeleton from features.py. What changes is the card encoding path and the multi-way betting history tensor dimensions.
+
+Phase 2 — Buffer Redesign (training/vr_buffers.py)
+New file: src/training/vr_buffers.py
+Three distinct buffer classes must be created:
+EphemeralAdvantageBuffer holds (infoset_key, legal_mask, r̄_vector) tuples. It exposes a clear() method that is called at the start of every CFR iteration before traversals begin. It uses a simple list — no reservoir sampling needed, because ephemerality itself prevents dilution. Capacity is bounded by K × max_tree_depth where K is traversals per iteration.
+PersistentStrategyBuffer uses standard reservoir sampling but inserts each sample with a weight of t^γ (iteration index raised to power γ=2). During mini-batch sampling, samples are selected proportional to their stored weight. This ensures the strategy network learns from a linearly weighted average of historical strategies.
+ValueBaselineBuffer stores complete trajectory tuples (history_h, action_â, terminal_utility_û, next_infoset_I') for training the Q network via Expected SARSA. This buffer persists across all iterations and uses uniform reservoir sampling because the Q network needs broad coverage of the game tree.
+What you discard: The existing RolloutBuffer in buffer.py is PPO-specific and incompatible. The RegretBuffer in cfr_buffer.py uses persistent reservoir sampling for advantage data, which is the precise pathology VR-DeepPDCFR+ was designed to eliminate.
+
+Phase 3 — Neural Network Architecture (model/vr_networks.py)
+New file: src/model/vr_networks.py
+Four network classes, all sharing a common observation encoder backbone:
+CumulativeAdvantageNet (θ): Wide MLP (3–4 layers, 512–1024 hidden) with LayerNorm. Output: R^{NUM_ACTIONS} (raw regret predictions, signed). The forward pass is straightforward. The magic is in the loss function — computed externally in the engine: y_cum = max(θ_{t-1}.forward(obs) × decay_factor + r_bar, 0), then L(θ_t) = MSE(θ_t.forward(obs), y_cum).
+InstantaneousAdvantageNet (φ): Identical architecture to θ. Same output space. Loss is simply L(φ_t) = MSE(φ_t.forward(obs), r_bar). This network trains only on current-iteration data.
+HistoryValueBaselineNet (Q): Slightly different structure — maps (history_h, action_â) to a scalar expected value. Trained via Expected SARSA: y_Q = û + γ_Q × Σ_a' σ(a'|h') × Q(h', a'). Requires access to the next infoset h' and the current strategy σ.
+AverageStrategyNet (Π): Output through softmax to produce valid probability distributions. Loss: L(ψ) = Σ_t t^γ × MSE(Π.forward(obs), σ^t). This is behavioral cloning weighted by iteration index.
+What you reuse: The CardEmbedding, ContextEmbedding, and _build_mlp() utilities from networks.py can be kept. The LSTMHistoryEncoder is also reusable for encoding the betting sequence into the shared backbone. What changes entirely is the network heads and the loss computation logic.
+
+Phase 4 — The VR-DeepPDCFR+ Engine (training/vr_deep_pdcfr_engine.py)
+New file: src/training/vr_deep_pdcfr_engine.py
+This is the core new component. The engine orchestrates a single CFR iteration as follows:
+Step 1 — Clear ephemeral buffer. B_V_i.clear() for each player. This is non-negotiable.
+Step 2 — Traversal for each player. For player i, run K external-sampling traversals. At each decision node visited by player i:
+
+Compute predicted strategy using frozen θ_{t-1} and φ_{t-1}: σ = regret_match(max(θ_{t-1}(obs) × d + φ_{t-1}(obs), 0))
+Compute variance-reduced advantage: r̄(I,a) = A_network(obs)[a] - Q_baseline(h, σ)  where the Q subtraction centers the estimate
+Insert (obs, legal_mask, r̄) into B_V_i
+For opponents, sample one action from their current strategy and recurse
+
+Step 3 — Update θ_t (bootstrapped loss). For each batch from B_V_i:
+
+Retrieve θ_{t-1} predictions (frozen)
+Apply temporal discounting: scaled = θ_{t-1}(obs) × ((t-1)^α / ((t-1)^α + 1))
+Apply CFR+ clipping: y_cum = relu(scaled + r̄)
+Update θ_t via MSE(θ_t(obs), y_cum.detach())
+
+Step 4 — Update φ_t (direct loss). MSE(φ_t(obs), r̄.detach()) on the same B_V_i data.
+Step 5 — Update ω_t (Q baseline). Sample from B_Q, apply SARSA targets, update Q network.
+Step 6 — Accumulate strategy samples. For each traversal, compute σ^t from current regret-matched strategy and insert (obs, legal_mask, σ^t, weight=t^γ) into B_Π.
+Step 7 — Update Π_ψ (average strategy). Sample from B_Π, compute weighted MSE against stored strategy distributions, update Π.
+What you reuse: The MCCFRTraversal class from cfr_traversal.py provides the get_full_state()/set_full_state() tree branching logic. The RegretStore compressed shard storage can optionally back the θ network for debugging/verification. The WorkerPool + SharedMemoryRegretBuffer from parallel_cfr.py can be adapted for parallel K traversals per iteration.
+
+Phase 5 — Orchestration, MLOps & Evaluation
+Runner (training/vr_runner.py): The iteration loop is simpler than the current PPO runner because there's no per-step advantage computation. One outer loop: clear buffers → traverse → update 4 networks → checkpoint. The GracefulShutdownMonitor from fault_tolerance.py and CheckpointManager from state_manager.py are reused without modification.
+Checkpointing: The checkpoint must serialize all four network state_dicts plus both optimizer states, the current iteration counter t (critical for temporal discounting), and both RNG states. Losing t desynchronizes the α-decay schedule. The existing StateManager.save_training_state() needs only minor field additions.
+MLOps: AsyncModelUploader and HuggingFaceStateManager from hf_sync.py work unchanged. WandbMonitor works unchanged. New telemetry metrics to add: per-network loss (θ, φ, Q, Π separately), the current temporal discount factor value, the effective sample size of B_Π, and the LBR exploitability bound.
+Evaluation: LocalBestResponseEvaluator from nash_evaluator.py is directly reusable by passing the trained Π network instead of the old PPO network. SlumbotEvaluator works unchanged. New: a convergence diagnostic that tracks whether the θ network loss is monotonically decreasing (it should be, unlike PPO which fluctuates).
+
+Implementation Sequence Recommendation
+I recommend implementing in this exact order to maintain a runnable codebase at each step:
+
+state_encoder_v2.py — validate card encoding with unit tests against known hand equities
+vr_buffers.py — validate that EphemeralAdvantageBuffer.clear() correctly zeros state between iterations
+vr_networks.py — validate individual network forward passes with dummy data before wiring the loss
+vr_deep_pdcfr_engine.py — validate on Kuhn Poker first (3 cards, provable Nash) before scaling to 6-max NLHE
+vr_runner.py + MLOps wiring — connect to existing checkpoint and telemetry infrastructure
+
+The Kuhn Poker validation in step 4 is critical. Your existing KuhnPokerEnv in env/kuhn_poker_minimal.py is already well-suited for this. After 1000–2000 CFR iterations on Kuhn, the Π network should produce a strategy close to the known Nash values (Jack: bet 1/3, Queen: never bet, King: always bet). If it doesn't, the bootstrapping or variance reduction is misconfigured before you've spent GPU time on a 6-max game tree.
+
+Say "begin Phase 1" and I'll generate the complete src/env/state_encoder_v2.py with full rank-suit factorization, the PBS tensor builder, permutation-invariant board encoding, and all integration hooks into the existing WrapperConfig and RLCardWrapper infrastructure.Make a very detaled roadmap for the development for my agent12:542 / 2Synthesized comprehensive development roadmap frameworkSynthesized comprehensive development roadmap frameworkThe user wants a very detailed development roadmap for their VR-DeepPDCFR+ poker AI agent. Let me create a comprehensive, visually rich roadmap that covers all phases in detail.The user wants a detailed visual roadmap for the VR-DeepPDCFR+ poker AI development. I have the full context from memory and the summary. Let me build a rich interactive HTML roadmap widget.
+The 5 phases are:
+
+State Representation (state_encoder_v2.py)
+Buffer Architecture (vr_buffers.py)
+Neural Network Architecture (vr_networks.py)
+VR-DeepPDCFR+ Engine (vr_deep_pdcfr_engine.py)
+Orchestration, MLOps & Evaluation (vr_runner.py)
+
+I'm creating an interactive HTML widget with a vertical timeline layout where each phase card expands on click to reveal deliverables, sub-tasks with checkboxes, dependencies, and validation criteria.Show lessThe roadmap has been rendered. Let me provide a brief summary.Done
+  ::view-transition-group(*),
+  ::view-transition-old(*),
+  ::view-transition-new(*) {
+    animation-duration: 0.25s;
+    animation-timing-function: cubic-bezier(0.19, 1, 0.22, 1);
+  }
+VvisualizeVvisualize show_widgetEach phase is clickable to expand full details. A few things worth emphasizing about the sequencing:
+Phase 4 is the riskiest phase — do not scale to 6-max until Kuhn Poker converges to the known Nash equilibrium (Jack ⅓ bet, Queen never, King always). If it doesn't converge, the bug is almost certainly either (a) the ephemeral buffer not being cleared at the right moment, or (b) the frozen θ_{t-1}/φ_{t-1} snapshots being taken after the update rather than before traversal.
+The iteration counter t is load-bearing across all phases — it drives the t² strategy weights in B_Π, the temporal decay scalar (t-1)² / ((t-1)² + 1) in the θ update, and the DCFR+ α parameter. If a checkpoint restore doesn't correctly reload t, the entire math degrades silently. That's the single most dangerous failure mode to test for in Phase 5.
+Ready to begin Phase 1 — state_encoder_v2.py — on your word.

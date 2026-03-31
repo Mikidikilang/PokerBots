@@ -1,0 +1,459 @@
+
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--font-sans);color:var(--color-text-primary)}
+.rm-wrap{padding:1rem 0 2rem;max-width:680px}
+.rm-header{margin-bottom:1.5rem}
+.rm-title{font-size:18px;font-weight:500;margin-bottom:4px}
+.rm-sub{font-size:13px;color:var(--color-text-secondary)}
+.timeline{position:relative;padding-left:32px}
+.timeline::before{content:'';position:absolute;left:11px;top:8px;bottom:8px;width:1.5px;background:var(--color-border-secondary)}
+.phase{position:relative;margin-bottom:12px}
+.phase-dot{position:absolute;left:-32px;top:14px;width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:500;border:1.5px solid;z-index:1;background:var(--color-background-primary)}
+.phase-card{background:var(--color-background-primary);border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-lg);overflow:hidden;transition:border-color .2s}
+.phase-card:hover{border-color:var(--color-border-secondary)}
+.phase-header{padding:14px 16px;cursor:pointer;display:flex;align-items:center;gap:12px;user-select:none}
+.phase-num{font-size:11px;font-weight:500;padding:2px 8px;border-radius:100px;flex-shrink:0}
+.phase-info{flex:1;min-width:0}
+.phase-name{font-size:14px;font-weight:500;margin-bottom:2px}
+.phase-file{font-size:12px;color:var(--color-text-secondary);font-family:var(--font-mono)}
+.phase-chevron{font-size:16px;color:var(--color-text-secondary);transition:transform .2s;flex-shrink:0}
+.phase-chevron.open{transform:rotate(90deg)}
+.phase-body{display:none;padding:0 16px 16px;border-top:0.5px solid var(--color-border-tertiary)}
+.phase-body.open{display:block}
+.section-label{font-size:11px;font-weight:500;color:var(--color-text-secondary);text-transform:uppercase;letter-spacing:.05em;margin:14px 0 8px}
+.task-list{display:flex;flex-direction:column;gap:6px}
+.task-item{display:flex;align-items:flex-start;gap:10px;font-size:13px;line-height:1.5}
+.task-icon{flex-shrink:0;width:16px;height:16px;margin-top:1px;border-radius:3px;display:flex;align-items:center;justify-content:center;font-size:10px}
+.task-text{color:var(--color-text-primary)}
+.task-sub{color:var(--color-text-secondary);font-size:12px;margin-top:1px}
+.dep-list{display:flex;flex-wrap:wrap;gap:6px}
+.dep-badge{font-size:11px;padding:3px 8px;border-radius:100px;border:0.5px solid;font-family:var(--font-mono)}
+.val-box{background:var(--color-background-secondary);border-radius:var(--border-radius-md);padding:10px 12px;font-size:12px;color:var(--color-text-secondary);line-height:1.6;margin-top:4px;border-left:2.5px solid}
+.net-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:4px}
+.net-card{background:var(--color-background-secondary);border-radius:var(--border-radius-md);padding:8px 10px;font-size:12px}
+.net-sym{font-size:15px;font-weight:500;margin-bottom:2px}
+.net-name{font-size:11px;color:var(--color-text-secondary)}
+.net-detail{font-size:11px;color:var(--color-text-secondary);margin-top:3px}
+.phase-progress{display:flex;gap:3px;margin-left:auto;flex-shrink:0}
+.prog-dot{width:6px;height:6px;border-radius:50%}
+.legend{display:flex;gap:16px;margin-top:16px;padding-top:12px;border-top:0.5px solid var(--color-border-tertiary)}
+.leg-item{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--color-text-secondary)}
+.leg-dot{width:10px;height:10px;border-radius:50%}
+
+/* Phase colors */
+.p1 .phase-dot{border-color:#534AB7;color:#534AB7}
+.p1 .phase-num{background:#EEEDFE;color:#534AB7}
+.p1 .phase-card{border-left:2px solid #534AB7}
+.p1 .val-box{border-color:#534AB7}
+.p1 .dep-badge{border-color:#AFA9EC;color:#534AB7;background:#EEEDFE}
+
+.p2 .phase-dot{border-color:#0F6E56;color:#0F6E56}
+.p2 .phase-num{background:#E1F5EE;color:#0F6E56}
+.p2 .phase-card{border-left:2px solid #0F6E56}
+.p2 .val-box{border-color:#0F6E56}
+.p2 .dep-badge{border-color:#5DCAA5;color:#0F6E56;background:#E1F5EE}
+
+.p3 .phase-dot{border-color:#BA7517;color:#BA7517}
+.p3 .phase-num{background:#FAEEDA;color:#BA7517}
+.p3 .phase-card{border-left:2px solid #BA7517}
+.p3 .val-box{border-color:#BA7517}
+.p3 .dep-badge{border-color:#EF9F27;color:#BA7517;background:#FAEEDA}
+
+.p4 .phase-dot{border-color:#993C1D;color:#993C1D}
+.p4 .phase-num{background:#FAECE7;color:#993C1D}
+.p4 .phase-card{border-left:2px solid #993C1D}
+.p4 .val-box{border-color:#993C1D}
+.p4 .dep-badge{border-color:#F0997B;color:#993C1D;background:#FAECE7}
+
+.p5 .phase-dot{border-color:#185FA5;color:#185FA5}
+.p5 .phase-num{background:#E6F1FB;color:#185FA5}
+.p5 .phase-card{border-left:2px solid #185FA5}
+.p5 .val-box{border-color:#185FA5}
+.p5 .dep-badge{border-color:#85B7EB;color:#185FA5;background:#E6F1FB}
+
+@media(prefers-color-scheme:dark){
+.p1 .phase-dot{border-color:#AFA9EC;color:#AFA9EC}
+.p1 .phase-num{background:#26215C;color:#AFA9EC}
+.p1 .dep-badge{background:#26215C;color:#AFA9EC;border-color:#534AB7}
+.p2 .phase-dot{border-color:#5DCAA5;color:#5DCAA5}
+.p2 .phase-num{background:#04342C;color:#5DCAA5}
+.p2 .dep-badge{background:#04342C;color:#5DCAA5;border-color:#0F6E56}
+.p3 .phase-dot{border-color:#EF9F27;color:#EF9F27}
+.p3 .phase-num{background:#412402;color:#EF9F27}
+.p3 .dep-badge{background:#412402;color:#EF9F27;border-color:#BA7517}
+.p4 .phase-dot{border-color:#F0997B;color:#F0997B}
+.p4 .phase-num{background:#4A1B0C;color:#F0997B}
+.p4 .dep-badge{background:#4A1B0C;color:#F0997B;border-color:#993C1D}
+.p5 .phase-dot{border-color:#85B7EB;color:#85B7EB}
+.p5 .phase-num{background:#042C53;color:#85B7EB}
+.p5 .dep-badge{background:#042C53;color:#85B7EB;border-color:#185FA5}
+}
+</style>
+
+<div class="rm-wrap">
+<div class="rm-header">
+  <div class="rm-title">VR-DeepPDCFR+ development roadmap</div>
+  <div class="rm-sub">5 phases · 6-max NLHE · Superhuman RTA target</div>
+</div>
+
+<div class="timeline">
+
+<!-- PHASE 1 -->
+<div class="phase p1">
+  <div class="phase-dot">1</div>
+  <div class="phase-card">
+    <div class="phase-header" onclick="toggle(this)">
+      <span class="phase-num">Phase 1</span>
+      <div class="phase-info">
+        <div class="phase-name">State representation</div>
+        <div class="phase-file">state_encoder_v2.py</div>
+      </div>
+      <span class="phase-chevron">›</span>
+    </div>
+    <div class="phase-body">
+      <div class="section-label">Goal</div>
+      <div style="font-size:13px;color:var(--color-text-secondary);line-height:1.6">Replace the legacy 52-dim multi-hot card encoding with a 17-dim rank-suit factorization. Build a mathematically correct 6-max observation tensor including multi-way betting and a public belief state encoder.</div>
+
+      <div class="section-label">Tasks</div>
+      <div class="task-list">
+        <div class="task-item">
+          <div class="task-icon" style="background:#EEEDFE;color:#534AB7">✦</div>
+          <div>
+            <div class="task-text">17-dim card encoding</div>
+            <div class="task-sub">13-dim rank one-hot + 4-dim suit one-hot per card. Total hole: 34d, board: 85d → 119d card vector</div>
+          </div>
+        </div>
+        <div class="task-item">
+          <div class="task-icon" style="background:#EEEDFE;color:#534AB7">✦</div>
+          <div>
+            <div class="task-text">Permutation-invariant flop encoding</div>
+            <div class="task-sub">Sort flop cards lexicographically before encoding — no self-attention required</div>
+          </div>
+        </div>
+        <div class="task-item">
+          <div class="task-icon" style="background:#EEEDFE;color:#534AB7">✦</div>
+          <div>
+            <div class="task-text">Multi-way betting tensor B ∈ ℝ⁴ˣ⁶</div>
+            <div class="task-sub">Per-street, per-player pot contributions normalized by effective stacks. Binary 6-dim active/folded mask appended</div>
+          </div>
+        </div>
+        <div class="task-item">
+          <div class="task-icon" style="background:#EEEDFE;color:#534AB7">✦</div>
+          <div>
+            <div class="task-text">Distance-weighted off-grid bet binning</div>
+            <div class="task-sub">Map continuous bet sizes to the 12-action discretization using proximity weights</div>
+          </div>
+        </div>
+        <div class="task-item">
+          <div class="task-icon" style="background:#EEEDFE;color:#534AB7">✦</div>
+          <div>
+            <div class="task-text">Public Belief State (PBS) encoder</div>
+            <div class="task-sub">1326 combo probability distributions per active player → 7956-dim PBS tensor for 6-max beliefs</div>
+          </div>
+        </div>
+        <div class="task-item">
+          <div class="task-icon" style="background:#EEEDFE;color:#534AB7">✦</div>
+          <div>
+            <div class="task-text">Unit test suite</div>
+            <div class="task-sub">Validate against known equity lookups; assert flop-sort invariance; assert betting tensor normalization</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-label">Reuse from legacy</div>
+      <div class="dep-list">
+        <span class="dep-badge">WrapperConfig</span>
+        <span class="dep-badge">_normalise_cards()</span>
+        <span class="dep-badge">_to_suitrank()</span>
+        <span class="dep-badge">ObservationConfig skeleton</span>
+      </div>
+
+      <div class="section-label">Validation gate</div>
+      <div class="val-box">All unit tests green. Encoded observation of A♠K♠ on A♥7♦2♣ flop matches expected equity within 0.5%. Flop-sort invariance holds for all 3-card permutations. Betting tensor sums to 1.0 per street.</div>
+    </div>
+  </div>
+</div>
+
+<!-- PHASE 2 -->
+<div class="phase p2">
+  <div class="phase-dot">2</div>
+  <div class="phase-card">
+    <div class="phase-header" onclick="toggle(this)">
+      <span class="phase-num">Phase 2</span>
+      <div class="phase-info">
+        <div class="phase-name">Buffer architecture</div>
+        <div class="phase-file">vr_buffers.py</div>
+      </div>
+      <span class="phase-chevron">›</span>
+    </div>
+    <div class="phase-body">
+      <div class="section-label">Goal</div>
+      <div style="font-size:13px;color:var(--color-text-secondary);line-height:1.6">Implement the bifurcated buffer design that is the architectural keystone of VR-DeepPDCFR+. The ephemeral advantage buffer <em>must</em> be cleared at the start of every iteration — this is non-negotiable for convergence. The persistent strategy buffer must use tᵞ (γ=2) time-decay insertion weights.</div>
+
+      <div class="section-label">Three buffer classes</div>
+      <div class="task-list">
+        <div class="task-item">
+          <div class="task-icon" style="background:#E1F5EE;color:#0F6E56">B_V</div>
+          <div>
+            <div class="task-text">EphemeralAdvantageBuffer</div>
+            <div class="task-sub">Simple list. clear() called at iteration start. Capacity bounded by K × max_tree_depth. Stores (obs, legal_mask, r̄)</div>
+          </div>
+        </div>
+        <div class="task-item">
+          <div class="task-icon" style="background:#E1F5EE;color:#0F6E56">B_Π</div>
+          <div>
+            <div class="task-text">PersistentStrategyBuffer</div>
+            <div class="task-sub">Reservoir sampling with t² insertion weights. Mini-batch sampling proportional to stored weight. Stores (obs, σᵗ, t)</div>
+          </div>
+        </div>
+        <div class="task-item">
+          <div class="task-icon" style="background:#E1F5EE;color:#0F6E56">B_Q</div>
+          <div>
+            <div class="task-text">ValueBaselineBuffer</div>
+            <div class="task-sub">Uniform reservoir sampling. Stores complete trajectory tuples (h, â, û, I') for Expected SARSA Q-network training</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-label">Discard from legacy</div>
+      <div class="dep-list">
+        <span class="dep-badge" style="background:var(--color-background-danger);color:var(--color-text-danger);border-color:var(--color-border-danger)">RolloutBuffer (PPO)</span>
+        <span class="dep-badge" style="background:var(--color-background-danger);color:var(--color-text-danger);border-color:var(--color-border-danger)">RegretBuffer (persistent reservoir)</span>
+      </div>
+
+      <div class="section-label">Critical invariant</div>
+      <div class="val-box">After EphemeralAdvantageBuffer.clear(): len(buffer) == 0 and all stored tensors are freed. Verified by asserting GPU memory delta ≈ 0 post-clear on a full-tree traversal.</div>
+    </div>
+  </div>
+</div>
+
+<!-- PHASE 3 -->
+<div class="phase p3">
+  <div class="phase-dot">3</div>
+  <div class="phase-card">
+    <div class="phase-header" onclick="toggle(this)">
+      <span class="phase-num">Phase 3</span>
+      <div class="phase-info">
+        <div class="phase-name">Neural network architecture</div>
+        <div class="phase-file">vr_networks.py</div>
+      </div>
+      <span class="phase-chevron">›</span>
+    </div>
+    <div class="phase-body">
+      <div class="section-label">Goal</div>
+      <div style="font-size:13px;color:var(--color-text-secondary);line-height:1.6">Replace the PPO actor-critic with four specialized networks, each with a distinct loss function and training data source. All four share a common observation encoder backbone.</div>
+
+      <div class="section-label">Four network classes</div>
+      <div class="net-grid">
+        <div class="net-card">
+          <div class="net-sym" style="color:#BA7517">θ</div>
+          <div class="net-name">CumulativeAdvantageNet</div>
+          <div class="net-detail">Wide MLP 3-4L × 512-1024h + LayerNorm. Output: ℝ^A. Loss: MSE(θ_t, relu(θ_{t-1}×decay + r̄)). Trains on B_V after clear.</div>
+        </div>
+        <div class="net-card">
+          <div class="net-sym" style="color:#BA7517">φ</div>
+          <div class="net-name">InstantaneousAdvantageNet</div>
+          <div class="net-detail">Identical arch to θ. Output: ℝ^A. Loss: MSE(φ_t, r̄). Trains ONLY on current-iteration data — eliminates one-iteration lag.</div>
+        </div>
+        <div class="net-card">
+          <div class="net-sym" style="color:#BA7517">Q</div>
+          <div class="net-name">HistoryValueBaselineNet</div>
+          <div class="net-detail">Maps (h, â) → scalar. Trained via Expected SARSA: y_Q = û + γ_Q × Σ_a' σ(a'|h') Q(h', a'). Source: B_Q.</div>
+        </div>
+        <div class="net-card">
+          <div class="net-sym" style="color:#BA7517">Π</div>
+          <div class="net-name">AverageStrategyNet</div>
+          <div class="net-detail">Softmax output. Loss: Σ_t t² × MSE(Π(obs), σᵗ). Behavioral cloning weighted by iteration index. This is the deployable policy.</div>
+        </div>
+      </div>
+
+      <div class="section-label">Predictive strategy formula</div>
+      <div class="val-box" style="font-family:var(--font-mono);font-size:12px">σ = regret_match(max(θ_{t-1}(obs) × decay + φ_{t-1}(obs), 0))<br>decay = (t-1)^α / ((t-1)^α + 1),  α=2</div>
+
+      <div class="section-label">Reuse from legacy</div>
+      <div class="dep-list">
+        <span class="dep-badge">CardEmbedding</span>
+        <span class="dep-badge">ContextEmbedding</span>
+        <span class="dep-badge">_build_mlp()</span>
+        <span class="dep-badge">LSTMHistoryEncoder</span>
+      </div>
+
+      <div class="section-label">Validation gate</div>
+      <div class="val-box">All four network forward passes produce correct output shapes on dummy data. No NaN in any loss. Gradient flow confirmed through each loss independently. θ and φ produce distinct outputs (not identical — verifies separate parameter sets).</div>
+    </div>
+  </div>
+</div>
+
+<!-- PHASE 4 -->
+<div class="phase p4">
+  <div class="phase-dot">4</div>
+  <div class="phase-card">
+    <div class="phase-header" onclick="toggle(this)">
+      <span class="phase-num">Phase 4</span>
+      <div class="phase-info">
+        <div class="phase-name">VR-DeepPDCFR+ engine</div>
+        <div class="phase-file">vr_deep_pdcfr_engine.py</div>
+      </div>
+      <span class="phase-chevron">›</span>
+    </div>
+    <div class="phase-body">
+      <div class="section-label">Goal</div>
+      <div style="font-size:13px;color:var(--color-text-secondary);line-height:1.6">Implement the core per-iteration CFR loop. Every step must execute in the exact order below — deviation from this sequence invalidates the mathematical guarantees.</div>
+
+      <div class="section-label">Per-iteration sequence (strictly ordered)</div>
+      <div class="task-list">
+        <div class="task-item">
+          <div class="task-icon" style="background:#FAECE7;color:#993C1D;font-size:9px;font-weight:500">①</div>
+          <div>
+            <div class="task-text">Clear B_V,i for each player</div>
+            <div class="task-sub">Non-negotiable first step. Any data from t-1 surviving into t corrupts temporal discounting math</div>
+          </div>
+        </div>
+        <div class="task-item">
+          <div class="task-icon" style="background:#FAECE7;color:#993C1D;font-size:9px;font-weight:500">②</div>
+          <div>
+            <div class="task-text">K external-sampling traversals per player</div>
+            <div class="task-sub">At each node: compute predicted σ from frozen θ_{t-1} + φ_{t-1}; compute r̄ = A_net[a] − Q(h,σ); insert (obs, mask, r̄) into B_V,i; opponent samples one action and recurses</div>
+          </div>
+        </div>
+        <div class="task-item">
+          <div class="task-icon" style="background:#FAECE7;color:#993C1D;font-size:9px;font-weight:500">③</div>
+          <div>
+            <div class="task-text">Update θ_t (cumulative advantage)</div>
+            <div class="task-sub">Freeze θ_{t-1}; apply decay scalar; apply CFR+ clip: y_cum = relu(scaled + r̄); MSE(θ_t(obs), y_cum.detach())</div>
+          </div>
+        </div>
+        <div class="task-item">
+          <div class="task-icon" style="background:#FAECE7;color:#993C1D;font-size:9px;font-weight:500">④</div>
+          <div>
+            <div class="task-text">Update φ_t (instantaneous advantage)</div>
+            <div class="task-sub">MSE(φ_t(obs), r̄.detach()) on same B_V,i data — pure current-iteration signal, no carry-over</div>
+          </div>
+        </div>
+        <div class="task-item">
+          <div class="task-icon" style="background:#FAECE7;color:#993C1D;font-size:9px;font-weight:500">⑤</div>
+          <div>
+            <div class="task-text">Update ω_t (Q baseline)</div>
+            <div class="task-sub">Sample trajectory tuples from B_Q; apply Expected SARSA targets; update Q network</div>
+          </div>
+        </div>
+        <div class="task-item">
+          <div class="task-icon" style="background:#FAECE7;color:#993C1D;font-size:9px;font-weight:500">⑥</div>
+          <div>
+            <div class="task-text">Accumulate into B_Π with weight t²</div>
+            <div class="task-sub">Store (obs, σᵗ, t) — iteration t=1000 carries 100× more weight than t=10</div>
+          </div>
+        </div>
+        <div class="task-item">
+          <div class="task-icon" style="background:#FAECE7;color:#993C1D;font-size:9px;font-weight:500">⑦</div>
+          <div>
+            <div class="task-text">Update Π_ψ (average strategy)</div>
+            <div class="task-sub">Weighted MSE against stored strategy distributions. This is the policy that ships to RTA</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-label">Reuse from legacy</div>
+      <div class="dep-list">
+        <span class="dep-badge">MCCFRTraversal (state save/restore)</span>
+        <span class="dep-badge">WorkerPool</span>
+        <span class="dep-badge">SharedMemoryRegretBuffer</span>
+      </div>
+
+      <div class="section-label">Validation gate — Kuhn Poker first</div>
+      <div class="val-box">After 1000–2000 iterations on kuhn_poker_minimal.py, the trained Π network must produce: Jack → bet ~1/3 of the time, Queen → never bet, King → always bet. Any deviation indicates a buffer ordering bug, a network wiring error, or incorrect discounting. Do not proceed to 6-max until Kuhn Poker converges.</div>
+    </div>
+  </div>
+</div>
+
+<!-- PHASE 5 -->
+<div class="phase p5">
+  <div class="phase-dot">5</div>
+  <div class="phase-card">
+    <div class="phase-header" onclick="toggle(this)">
+      <span class="phase-num">Phase 5</span>
+      <div class="phase-info">
+        <div class="phase-name">Orchestration, MLOps & evaluation</div>
+        <div class="phase-file">vr_runner.py</div>
+      </div>
+      <span class="phase-chevron">›</span>
+    </div>
+    <div class="phase-body">
+      <div class="section-label">Goal</div>
+      <div style="font-size:13px;color:var(--color-text-secondary);line-height:1.6">Wire the engine into production infrastructure: graceful shutdown, multi-GPU DDP, checkpointing that serializes all 4 networks + iteration counter t, and evaluation pipelines.</div>
+
+      <div class="section-label">Training loop tasks</div>
+      <div class="task-list">
+        <div class="task-item">
+          <div class="task-icon" style="background:#E6F1FB;color:#185FA5">✦</div>
+          <div>
+            <div class="task-text">Iteration loop: clear → traverse → update 4 nets → checkpoint</div>
+            <div class="task-sub">Iteration counter t must survive restarts — it drives the tᵞ weighting math</div>
+          </div>
+        </div>
+        <div class="task-item">
+          <div class="task-icon" style="background:#E6F1FB;color:#185FA5">✦</div>
+          <div>
+            <div class="task-text">Atomic checkpoint serialization</div>
+            <div class="task-sub">Must include: all 4 network state_dicts, both optimizer states, current t, both RNG states</div>
+          </div>
+        </div>
+        <div class="task-item">
+          <div class="task-icon" style="background:#E6F1FB;color:#185FA5">✦</div>
+          <div>
+            <div class="task-text">DDP collective correctness (2×T4 Kaggle)</div>
+            <div class="task-sub">Symmetric dist.barrier() placement; NaN exits broadcast to all ranks; shutdown signal to non-zero ranks</div>
+          </div>
+        </div>
+        <div class="task-item">
+          <div class="task-icon" style="background:#E6F1FB;color:#185FA5">✦</div>
+          <div>
+            <div class="task-text">New W&B metrics</div>
+            <div class="task-sub">Per-network loss (θ, φ, Q, Π separately) · temporal decay factor value · ESS of B_Π · LBR exploitability bound</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="section-label">Reuse unchanged</div>
+      <div class="dep-list">
+        <span class="dep-badge">GracefulShutdownMonitor</span>
+        <span class="dep-badge">CheckpointManager</span>
+        <span class="dep-badge">AsyncModelUploader</span>
+        <span class="dep-badge">HuggingFaceStateManager</span>
+        <span class="dep-badge">WandbMonitor</span>
+        <span class="dep-badge">LocalBestResponseEvaluator</span>
+        <span class="dep-badge">SlumbotEvaluator</span>
+      </div>
+
+      <div class="section-label">RTA deployment readiness gate</div>
+      <div class="val-box">LBR exploitability bound decreasing monotonically over last 500 iterations. SlumbotEvaluator win-rate &gt; +50 mbb/hand. Subgame solver latency &lt; 100ms on a single T4. Π network checkpoint loads and produces valid action distributions on arbitrary board textures.</div>
+    </div>
+  </div>
+</div>
+
+</div><!-- /timeline -->
+
+<div class="legend">
+  <div class="leg-item"><div class="leg-dot" style="background:#534AB7"></div>Phase 1 — State repr.</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#0F6E56"></div>Phase 2 — Buffers</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#BA7517"></div>Phase 3 — Networks</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#993C1D"></div>Phase 4 — Engine</div>
+  <div class="leg-item"><div class="leg-dot" style="background:#185FA5"></div>Phase 5 — MLOps</div>
+</div>
+
+</div>
+
+<script>
+function toggle(header){
+  const body=header.nextElementSibling;
+  const chev=header.querySelector('.phase-chevron');
+  const isOpen=body.classList.contains('open');
+  document.querySelectorAll('.phase-body.open').forEach(b=>{
+    b.classList.remove('open');
+    b.previousElementSibling.querySelector('.phase-chevron').classList.remove('open');
+  });
+  if(!isOpen){body.classList.add('open');chev.classList.add('open');}
+}
+document.querySelector('.p1 .phase-header').click();
+</script>

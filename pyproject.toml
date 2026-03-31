@@ -1,0 +1,189 @@
+# =============================================================================
+# PokerAI-Project: No-Limit Texas Hold'em Reinforcement Learning AI
+# =============================================================================
+# Produkciós szintű pyproject.toml a pip install -e . telepítéshez.
+# A Kaggle futtatókörnyezetben a GitHub klón után ez a fájl biztosítja
+# az összes tranzitív függőség automatikus feloldását és a tiszta
+# importálási hierarchiát (pl. from src.env.features import ...).
+# =============================================================================
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel>=0.41.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "poker-ai"
+version = "0.1.0"
+description = "Production-grade No-Limit Texas Hold'em RL AI with Auto-Adaptive Curriculum Learning"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "PokerAI Team"},
+]
+keywords = [
+    "reinforcement-learning",
+    "poker",
+    "nlhe",
+    "ppo",
+    "deep-cfr",
+    "game-theory",
+    "nash-equilibrium",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Games/Entertainment",
+]
+
+# ---------------------------------------------------------------------------
+# Függőségi fa (Dependency Tree)
+# ---------------------------------------------------------------------------
+# A verziók szándékosan alsó korláttal vannak rögzítve (>=), hogy a Kaggle
+# előtelepített környezetével ne ütközzenek, de a kritikus API-változások
+# ellen védelmet nyújtsanak.
+# ---------------------------------------------------------------------------
+dependencies = [
+    # === Mély Tanulási Keretrendszer ===
+    "torch>=2.1.0",
+    "torchrl>=0.4.0",           # CompressedListStorage, ReplayBuffer
+    "tensordict>=0.4.0",        # TensorDict struktúrák az RL adatfolyamhoz
+
+    # === RL Környezetek és Játékmotorok ===
+    "rlcard>=1.1.0",            # No-Limit Texas Hold'em játékmotor
+    "pettingzoo>=1.24.0",       # Multi-ágens környezeti interfész (AEC API)
+    "gymnasium>=0.29.0",        # OpenAI Gym utód - env wrapper API
+
+    # === Numerikus és Tudományos Számítások ===
+    "numpy>=1.24.0",
+    "scipy>=1.11.0",            # Statisztikai tesztek, speciális függvények
+
+    # === Konfiguráció és Szerializáció ===
+    "pyyaml>=6.0",              # config.yaml hot-reload olvasás
+    "omegaconf>=2.3.0",         # Strukturált, típusos konfigurációkezelés
+
+    # === MLOps és Felhő Szinkronizáció ===
+    "huggingface-hub>=0.21.0",  # CommitScheduler, snapshot_download, upload_folder
+    "wandb>=0.16.0",            # Opcionális: kísérleti metrikák vizualizálása
+
+    # === Monitorozás és Naplózás ===
+    "tqdm>=4.66.0",             # Folyamatjelző sávok a tréning iterációkhoz
+    "rich>=13.0.0",             # Színes konzol kimenet, táblázatok, tracebackek
+
+    # === Tömörítés ===
+    "zstandard>=0.22.0",        # Zstd natív Python binding (buffer kompresszió)
+
+    # === Equity Kalkuláció ===
+    "treys>=0.1.8",             # Gyors póker hand evaluator (5/7 kártyás)
+]
+
+# ---------------------------------------------------------------------------
+# Opcionális függőségek fejlesztési és tesztelési célokra
+# ---------------------------------------------------------------------------
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-timeout>=2.2.0",
+    "mypy>=1.8.0",
+    "ruff>=0.2.0",              # Gyors Python linter és formatter
+    "pre-commit>=3.6.0",
+    "ipykernel>=6.27.0",        # Jupyter/Kaggle notebook kompatibilitás
+]
+eval = [
+    "matplotlib>=3.8.0",        # Telemetria vizualizáció
+    "seaborn>=0.13.0",          # Statisztikai ábrák
+    "pandas>=2.1.0",            # HUD metrikák aggregálása
+]
+
+# ---------------------------------------------------------------------------
+# CLI belépési pont lokális teszteléshez
+# ---------------------------------------------------------------------------
+[project.scripts]
+poker-train = "scripts.train_local:main"
+
+# ---------------------------------------------------------------------------
+# Csomagfelfedezés: a src/ könyvtárban keressük a modulokat
+# ---------------------------------------------------------------------------
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "scripts*"]
+
+# ---------------------------------------------------------------------------
+# Statikus Típusellenőrzés (mypy)
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+no_implicit_optional = true
+strict_equality = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = [
+    "rlcard.*",
+    "pettingzoo.*",
+    "treys.*",
+    "torchrl.*",
+    "tensordict.*",
+    "wandb.*",
+]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# Ruff Linter és Formatter konfiguráció
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+fix = true
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # Pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "SIM",  # flake8-simplify
+    "TCH",  # flake8-type-checking
+    "RUF",  # Ruff-specifikus szabályok
+]
+ignore = [
+    "E501",  # Sorhossz - a line-length felülírja
+    "B008",  # Függvényhívás alapértelmezett argumentumban (FastAPI minta)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src"]
+
+# ---------------------------------------------------------------------------
+# Pytest konfiguráció
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--strict-markers",
+    "--tb=short",
+    "--timeout=60",
+]
+markers = [
+    "slow: Hosszú futási idejű tesztek (pl. teljes tréning iteráció)",
+    "gpu: GPU-t igénylő tesztek",
+    "integration: Integrációs tesztek (HF Hub, Kaggle API)",
+]
