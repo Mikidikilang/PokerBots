@@ -138,15 +138,21 @@ class BayesianRangeInference:
     def __init__(
         self,
         strategy_network: Optional[nn.Module] = None,
+        obs_builder: Optional[Any] = None,
+        action_mapper: Optional[Any] = None,
         device: torch.device = torch.device('cpu'),
     ):
         """
         Args:
-            strategy_network: Trained blueprint network
-                              Output: softmax over actions for each hand
+            strategy_network: Trained π (strategy) network
+                              Output: raw logits over actions for each hand
+            obs_builder: ObservationBuilder to convert raw_state to tensors
+            action_mapper: ActionMapper for legal action masking
             device: PyTorch device
         """
         self.strategy_network = strategy_network
+        self.obs_builder = obs_builder
+        self.action_mapper = action_mapper
         self.device = device
         
         # Default 169-hand canonical ordering
@@ -154,7 +160,9 @@ class BayesianRangeInference:
         
         logger.info(
             f"BayesianRangeInference initialized with "
-            f"{len(self.canonical_hands)} canonical hands"
+            f"{len(self.canonical_hands)} canonical hands, "
+            f"obs_builder={'present' if obs_builder else 'missing'}, "
+            f"action_mapper={'present' if action_mapper else 'missing'}"
         )
     
     def _create_canonical_hands(self) -> List[str]:
@@ -183,6 +191,7 @@ class BayesianRangeInference:
         self,
         board: Tuple[str, ...],
         action_history: List[Dict],
+        raw_state: Optional[dict] = None,
         initial_prior: Optional[Dict[str, float]] = None,
         removed_cards: Optional[set] = None,
     ) -> HandRange:
@@ -196,6 +205,8 @@ class BayesianRangeInference:
                 'action': 'fold', 'check', 'call', 'bet', 'raise', 'all_in',
                 'amount': bet size (0 for check/fold),
             }
+            raw_state: Current game state dict (contains pot, stacks, legal_actions, etc.)
+                      Required for accurate observation generation when obs_builder is present.
             initial_prior: Starting probability distribution (default: uniform)
             removed_cards: Cards definitely not in opponent's hand (e.g., hero's hole)
         
@@ -234,6 +245,7 @@ class BayesianRangeInference:
                 action_name=action_name,
                 amount=amount,
                 board=board,
+                raw_state=raw_state,
                 posterior_before=posterior,  # Use current posterior as context
             )
             
@@ -261,31 +273,40 @@ class BayesianRangeInference:
         action_name: str,
         amount: float,
         board: Tuple[str, ...],
+        raw_state: Optional[dict],
         posterior_before: Dict[str, float],
     ) -> Dict[str, float]:
         """
         Compute likelihood P(action | hand) for all hands.
         
-        REAL IMPLEMENTATION:
-            Queries AverageStrategyNetwork (blueprint policy) with the infoset observation
-            to get true softmax probability distribution for the given action.
-            This replaces hardcoded 0.7/0.3/0.5 values with actual network predictions.
+        Real Implementation:
+            For each canonical hand, builds an observation using ObservationBuilder
+            with the actual game state (pot, stacks, legal actions, etc.).
+            Queries the strategy network to get raw logits, applies legal action
+            masking, softmax normalization, and extracts the probability for the
+            target action.
+        
+        Args:
+            action_name: Target action ('fold', 'check', 'call', 'bet', 'raise', 'all_in')
+            amount: Bet size
+            board: Community cards
+            raw_state: Current game state dict (must contain legal_actions, pot, etc.)
+            posterior_before: Current hand probability distribution
         
         Returns:
-            {hand: likelihood in [0, 1]}
+            {hand: likelihood in [0, 1]} where likelihood is P(action_name | hand)
         """
         likelihoods = {}
         
+        # Fallback 1: No strategy network
         if self.strategy_network is None:
             logger.warning(
                 "_compute_action_likelihood: strategy_network not provided. "
                 "Using hand strength heuristics as fallback."
             )
-            # Fallback to hand strength heuristic
             hand_strength = self._estimate_hand_strength(posterior_before)
             for hand in self.canonical_hands:
                 strength = hand_strength.get(hand, 0.5)
-                # Map action to likelihood based on hand strength
                 if action_name in ('bet', 'raise'):
                     likelihoods[hand] = 0.3 + 0.5 * strength
                 elif action_name in ('check', 'call'):
@@ -296,35 +317,107 @@ class BayesianRangeInference:
                     likelihoods[hand] = 0.5
             return likelihoods
         
-        # ★ REAL IMPLEMENTATION: Query strategy network for each hand
-        try:
-            for hand_idx, hand in enumerate(self.canonical_hands):
-                # Create minimal observation for this hand + board
-                obs_dict = {
-                    "hole_cards": torch.zeros(1, 52, dtype=torch.float32),
-                    "community_cards": self._encode_board_tensor(board),
-                    "env_metrics": torch.zeros(1, 10, dtype=torch.float32),
-                    "betting_history": torch.zeros(1, 18, 13, dtype=torch.float32),
-                    "position": torch.zeros(1, 6, dtype=torch.float32),
-                    "action_mask": torch.ones(1, 12, dtype=torch.float32),
-                }
-                
-                with torch.no_grad():
-                    action_probs = self.strategy_network.get_action_probabilities(obs_dict)
-                
-                # Map action name to action index
-                action_idx = self._map_action_name_to_idx(action_name)
-                if action_idx is not None and action_idx in action_probs:
-                    likelihoods[hand] = action_probs[action_idx]
+        # Fallback 2: No observation builder (can't build real observations)
+        if self.obs_builder is None:
+            logger.warning(
+                "_compute_action_likelihood: obs_builder not provided. "
+                "Using hand strength heuristics as fallback."
+            )
+            hand_strength = self._estimate_hand_strength(posterior_before)
+            for hand in self.canonical_hands:
+                strength = hand_strength.get(hand, 0.5)
+                if action_name in ('bet', 'raise'):
+                    likelihoods[hand] = 0.3 + 0.5 * strength
+                elif action_name in ('check', 'call'):
+                    likelihoods[hand] = 0.5 - 0.3 * abs(strength - 0.5)
                 else:
-                    # Fallback if action not in returned probs
                     likelihoods[hand] = 0.5
+            return likelihoods
+        
+        # Fallback 3: No raw_state provided
+        if raw_state is None:
+            logger.warning(
+                "_compute_action_likelihood: raw_state not provided. "
+                "Using hand strength heuristics as fallback."
+            )
+            hand_strength = self._estimate_hand_strength(posterior_before)
+            for hand in self.canonical_hands:
+                strength = hand_strength.get(hand, 0.5)
+                if action_name in ('bet', 'raise'):
+                    likelihoods[hand] = 0.3 + 0.5 * strength
+                elif action_name in ('check', 'call'):
+                    likelihoods[hand] = 0.5 - 0.3 * abs(strength - 0.5)
+                else:
+                    likelihoods[hand] = 0.5
+            return likelihoods
+        
+        # ★ REAL IMPLEMENTATION: Query strategy network for each canonical hand
+        try:
+            import torch.nn.functional as F
+            from src.env.action_mapper import apply_action_mask
+            
+            for hand_idx, hand in enumerate(self.canonical_hands):
+                try:
+                    # Step 1: Create shallow copy of raw_state with this hand
+                    state_copy = dict(raw_state)
+                    state_copy["hand"] = hand  # Inject canonical hand
+                    
+                    # Step 2: Build observation tensor dict from the game state
+                    obs_dict = self.obs_builder.build(state_copy, validate=False)
+                    
+                    # Step 3: Flatten observation and add batch dimension
+                    flat_obs = self.obs_builder.flatten(obs_dict)  # Shape: (feature_dim,)
+                    obs_tensor = flat_obs.unsqueeze(0).to(self.device)  # Shape: (1, feature_dim)
+                    
+                    # Step 4: Query strategy network in inference mode
+                    with torch.inference_mode():
+                        logits = self.strategy_network(obs_tensor)  # Shape: (1, num_actions)
+                    
+                    # Step 5: Extract legal actions from state
+                    legal_actions_list = state_copy.get("legal_actions", [])
+                    num_actions = logits.shape[-1]
+                    action_mask = torch.zeros(1, num_actions, dtype=torch.float32, device=self.device)
+                    
+                    for action_idx in legal_actions_list:
+                        if 0 <= action_idx < num_actions:
+                            action_mask[0, action_idx] = 1.0
+                    
+                    # Step 6: Apply AMP-safe legal action masking (matches LBR Oracle)
+                    masked_logits = apply_action_mask(logits, action_mask)  # Shape: (1, num_actions)
+                    
+                    # Step 7: Get probability distribution via softmax
+                    action_probs = F.softmax(masked_logits, dim=-1)  # Shape: (1, num_actions)
+                    
+                    # Step 8: Extract probability for target action
+                    action_idx = self._map_action_name_to_idx(action_name)
+                    if action_idx is not None and 0 <= action_idx < num_actions:
+                        likelihoods[hand] = action_probs[0, action_idx].item()
+                    else:
+                        # Action not in legal set or mapping failed
+                        likelihoods[hand] = 0.5  # Neutral fallback
+                
+                except Exception as hand_error:
+                    logger.debug(
+                        f"Error processing hand {hand}: {hand_error}. Using fallback."
+                    )
+                    # For this hand only, use hand strength heuristic
+                    hand_strength = self._estimate_hand_strength({hand: 1.0})
+                    strength = hand_strength.get(hand, 0.5)
+                    if action_name in ('bet', 'raise'):
+                        likelihoods[hand] = 0.3 + 0.5 * strength
+                    elif action_name in ('check', 'call'):
+                        likelihoods[hand] = 0.5 - 0.3 * abs(strength - 0.5)
+                    else:
+                        likelihoods[hand] = 0.5
             
             return likelihoods
         
         except Exception as e:
-            logger.error(f"Error querying strategy network: {e}", exc_info=True)
-            # Fallback to hand strength heuristics on error
+            logger.error(
+                f"Error querying strategy network for action likelihood: {e}",
+                exc_info=True
+            )
+            # Fallback to hand strength heuristics on critical error
             hand_strength = self._estimate_hand_strength(posterior_before)
             for hand in self.canonical_hands:
                 strength = hand_strength.get(hand, 0.5)

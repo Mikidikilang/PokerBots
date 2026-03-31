@@ -560,6 +560,39 @@ class VRDeepPDCFRNetworks:
         params.extend(self.strategy.parameters())
         return params
     
+    def state_dict(self) -> Dict[str, Dict]:
+        """Return state dictionaries of all networks for checkpointing.
+        
+        Returns:
+            Dictionary mapping network names to their state_dicts:
+            {
+                'cumulative_advantage': {...},
+                'cumulative_advantage_frozen': {...},
+                'instantaneous_advantage': {...},
+                'value': {...},
+                'strategy': {...}
+            }
+        """
+        return {
+            'cumulative_advantage': self.cumulative_advantage.state_dict(),
+            'cumulative_advantage_frozen': self.cumulative_advantage_frozen.state_dict(),
+            'instantaneous_advantage': self.instantaneous_advantage.state_dict(),
+            'value': self.value.state_dict(),
+            'strategy': self.strategy.state_dict(),
+        }
+    
+    def load_state_dict(self, state_dict: Dict[str, Dict]) -> None:
+        """Load state dictionaries for all networks from checkpoint.
+        
+        Args:
+            state_dict: Dictionary mapping network names to their state_dicts
+        """
+        self.cumulative_advantage.load_state_dict(state_dict['cumulative_advantage'])
+        self.cumulative_advantage_frozen.load_state_dict(state_dict['cumulative_advantage_frozen'])
+        self.instantaneous_advantage.load_state_dict(state_dict['instantaneous_advantage'])
+        self.value.load_state_dict(state_dict['value'])
+        self.strategy.load_state_dict(state_dict['strategy'])
+    
     def __repr__(self) -> str:
         """Human-readable representation."""
         return (

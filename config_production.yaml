@@ -1,13 +1,14 @@
 # ==============================================================================
-# VR-DeepPDCFR+ — Production Config  (6-Max No-Limit Texas Hold'em)
+# VR-DeepPDCFR+ — PRODUCTION CONFIG  (6-Max No-Limit Texas Hold'em)
 # ==============================================================================
-# Optimised for Kaggle P100/T4 (16 GB VRAM, 13 h session).
+# Full-scale training configuration for GPU cluster deployment.
+# Optimized for multi-day convergence and O(1) Rapid Card Abstraction.
 # All monetary values in big blinds (BB) unless stated otherwise.
 
 project:
   name: "vr-deep-pdcfr-plus-6max"
   version: "1.0.0"
-  description: "6-Max NLHE agent via VR-DeepPDCFR+"
+  description: "6-Max NLHE agent via VR-DeepPDCFR+ — Production Training"
 
 # ------------------------------------------------------------------------------
 # Environment
@@ -69,15 +70,15 @@ networks:
     max_grad_norm: 1.0
 
 # ------------------------------------------------------------------------------
-# CFR / VR-DeepPDCFR+  training hyperparameters
+# CFR / VR-DeepPDCFR+  training hyperparameters (PRODUCTION SCALE)
 # ------------------------------------------------------------------------------
 cfr:
   training_algorithm: "cfr"        # Only "cfr" is supported
 
-  # Traversal
-  num_iterations: 2  # SMOKE TEST: 2 iterations
-  traversals_per_iteration: 1500   # External-sampling traversals per (p0+p1)
-  max_tree_depth: 60               # Poker-theoretic max (4 streets × ~15 raises)
+  # Traversal — PRODUCTION SCALE
+  num_iterations: 10_000_000       # 10 million iterations for convergence
+  traversals_per_iteration: 100    # Batch-optimized per GPU hardware
+  max_tree_depth: 60               # Full 6-Max NLHE depth (4 streets × ~15 raises)
 
   # Temporal discounting (Brown & Sandholm 2019)  α=1.5, β=0, γ=2
   dcfr_alpha: 1.5
@@ -117,12 +118,12 @@ regret_store:
 # Parallel CFR  (multi-process workers)
 # ------------------------------------------------------------------------------
 parallel:
-  num_workers: 4                   # Kaggle CPU cores
+  num_workers: 4                   # Adjust to GPU cluster CPU cores
   max_infosets: 500_000
   use_shared_memory: true          # dict-free crc32 indexing
 
 # ------------------------------------------------------------------------------
-# Card Abstraction
+# Card Abstraction (with RCE CACHE from Priority #6)
 # ------------------------------------------------------------------------------
 abstraction:
   preflop_buckets: 8
@@ -131,7 +132,7 @@ abstraction:
   river_buckets: 12
   equity_histogram_bins: 10
   rce_opponent_samples: 500
-  cache_dir: "equity_cache"
+  cache_dir: "equity_cache"        # O(1) RCE lookups via precomputed cache
 
 # ------------------------------------------------------------------------------
 # Curriculum  (3-phase)
@@ -193,21 +194,21 @@ degeneration_thresholds:
       af_above: 8.0
 
 # ------------------------------------------------------------------------------
-# Training loop
+# Training loop (PRODUCTION SCALE)
 # ------------------------------------------------------------------------------
 training:
-  max_iterations: 50000
-  log_interval_iterations: 10
-  eval_interval_iterations: 50
-  save_interval_iterations: 100
-  max_runtime_hours: 11.5          # Kaggle session limit (with 30-min buffer)
+  max_iterations: 10_000_000       # 10 million iterations for full convergence
+  log_interval_iterations: 50
+  eval_interval_iterations: 100
+  save_interval_iterations: 1_000  # Checkpoint every 1k iterations
+  max_runtime_hours: 336.0         # 14 days on GPU cluster
 
 # ------------------------------------------------------------------------------
-# Evaluation
+# Evaluation (PRODUCTION: High-fidelity LBR)
 # ------------------------------------------------------------------------------
 evaluation:
-  oracle_eval_interval: 500        # Run LBR oracle every N iterations
-  oracle_hands: 5000
+  oracle_eval_interval: 1_000      # Run LBR oracle every 1k iterations
+  oracle_hands: 50_000             # High-fidelity evaluation (50k hands)
   equity_iterations: 5000
   nash_target_mbb: 100.0           # Convergence threshold
 
@@ -217,13 +218,13 @@ evaluation:
 mlops:
   checkpoint:
     local_checkpoint_dir: "checkpoints"
-    max_checkpoints_to_keep: 5
-    save_interval_iterations: 100
+    max_checkpoints_to_keep: 10    # Keep more checkpoints for recovery
+    save_interval_iterations: 1_000 # Every 1k iterations
 
   graceful_shutdown:
-    max_runtime_hours: 11.5
+    max_runtime_hours: 336.0       # 14-day cluster reservation
     use_monotonic_clock: true
-    warning_threshold_minutes: 45.0
+    warning_threshold_minutes: 120.0 # Warn 2 hours before shutdown
 
   huggingface:
     enabled: false                 # Set true + HUGGINGFACE_TOKEN env var
@@ -235,7 +236,7 @@ mlops:
     enabled: false                 # Set true + WANDB_API_KEY env var
     project: "vr-deep-pdcfr-plus-6max"
     entity: ""                     # Your W&B entity / team name
-    tags: ["6max", "cfr", "deep-cfr", "poker"]
+    tags: ["6max", "cfr", "deep-cfr", "poker", "production"]
 
 # ------------------------------------------------------------------------------
 # Runtime
@@ -244,4 +245,4 @@ runtime:
   device: "auto"                   # "auto" → cuda if available, else cpu
   seed: 42
   dtype: "float32"
-  num_threads: 4                   # PyTorch CPU threads (non-GPU path)
+  num_threads: 8                   # GPU cluster CPU threads

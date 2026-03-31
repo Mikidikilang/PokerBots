@@ -67,6 +67,8 @@ import numpy as np
 from scipy.cluster.vq import kmeans2
 from scipy.optimize import linear_sum_assignment
 
+from src.env.equity_precompute import EquityLookupTable, CardCombo
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -135,19 +137,40 @@ def hand_name(c1: str, c2: str) -> str:
     return r1 + r2 + ("s" if cc1[1] == cc2[1] else "o")
 
 
+def string_card_to_combo(card_str: str) -> CardCombo:
+    """Convert string card like 'As' or 'Kh' to CardCombo object."""
+    rank = card_str[0].upper()
+    suit = card_str[1].lower()
+    return CardCombo(rank=rank, suit=suit)
+
+
+def string_cards_to_combo_list(cards: Tuple[str, ...]) -> list[CardCombo]:
+    """Convert tuple of string cards to list of CardCombo objects."""
+    return [string_card_to_combo(c) for c in cards]
+
+
 # ---------------------------------------------------------------------------
 # Equity computation (Treys-backed)
 # ---------------------------------------------------------------------------
 
 class EquityEngine:
     """
-    Fast batch equity computation using Treys.
+    Fast batch equity computation using Treys with RCE caching.
 
-    Evaluates P(hero wins | hero_hand, opp_hand, board) for many
-    (hand, hand, board) triples simultaneously.
+    Features:
+    1. Evaluates P(hero wins | hero_hand, opp_hand, board) for many triples
+    2. Caches Range-Conditioned Equity (RCE) lookups in EquityLookupTable
+    3. Short-circuits expensive MC simulations when cache hits occur
     """
 
-    def __init__(self):
+    def __init__(self, cache_dir: Optional[Path | str] = None):
+        """
+        Initialize EquityEngine with optional RCE cache.
+        
+        Args:
+            cache_dir: Directory for RCE lookup table cache.
+                      If None, no caching is performed.
+        """
         try:
             from treys import Evaluator, Card
             self._eval = Evaluator()
@@ -156,6 +179,12 @@ class EquityEngine:
         except ImportError:
             logger.warning("Treys not available. Equity computation uses fallback.")
             self._available = False
+        
+        # Initialize RCE cache if cache_dir provided
+        self._cache = None
+        if cache_dir is not None:
+            self._cache = EquityLookupTable(cache_dir=cache_dir)
+            logger.info(f"EquityEngine initialized with cache at {cache_dir}")
 
     def evaluate_batch(
         self,
@@ -209,9 +238,22 @@ class EquityEngine:
         """
         Compute E[equity(hero, opp, board)] over opponent range.
 
-        If opp_range is None, uses uniform random opponent hands
-        (matches original behavior, but this is the WEAK version).
+        First checks RCE cache for O(1) lookup. If found, returns cached value.
+        Otherwise, runs Monte Carlo simulation and caches the result.
+
+        If opp_range is None, uses uniform random opponent hands.
         """
+        # Try cache lookup first (O(1))
+        if self._cache is not None:
+            hero_combo_tuple = (string_card_to_combo(hero[0]), string_card_to_combo(hero[1]))
+            board_combo_list = string_cards_to_combo_list(board)
+            
+            cached_equity = self._cache.get_equity(hero_combo_tuple, board_combo_list)
+            if cached_equity is not None:
+                logger.debug(f"Cache hit for {hero} on {board}: equity={cached_equity:.6f}")
+                return cached_equity
+        
+        # Cache miss: run MC simulation
         used = set(hero) | set(board)
         remaining = [c for c in all_cards() if c not in used]
 
@@ -258,8 +300,18 @@ class EquityEngine:
             n_valid += 1
 
         if n_valid == 0:
-            return 0.5
-        return (wins + 0.5 * ties) / n_valid
+            result = 0.5
+        else:
+            result = (wins + 0.5 * ties) / n_valid
+        
+        # Cache the result
+        if self._cache is not None:
+            hero_combo_tuple = (string_card_to_combo(hero[0]), string_card_to_combo(hero[1]))
+            board_combo_list = string_cards_to_combo_list(board)
+            self._cache.add_equity(hero_combo_tuple, board_combo_list, result)
+            logger.debug(f"Cached {hero} on {board}: equity={result:.6f}")
+        
+        return result
 
     def equity_histogram(
         self,
@@ -275,9 +327,28 @@ class EquityEngine:
         This is the key input to EMD clustering — we cluster by
         distribution shape, not just scalar equity.
 
+        First checks RCE cache for O(1) lookup. If found, constructs
+        a one-hot histogram centered at the cached equity value.
+
         Returns:
             np.ndarray of shape (n_bins,) summing to 1.0
         """
+        # Try cache lookup first (O(1))
+        if self._cache is not None:
+            hero_combo_tuple = (string_card_to_combo(hero[0]), string_card_to_combo(hero[1]))
+            board_combo_list = string_cards_to_combo_list(board)
+            
+            cached_equity = self._cache.get_equity(hero_combo_tuple, board_combo_list)
+            if cached_equity is not None:
+                logger.debug(f"Cache hit for histogram {hero} on {board}: equity={cached_equity:.6f}")
+                # Construct one-hot histogram centered at cached equity
+                hist = np.zeros(n_bins, dtype=np.float32)
+                bin_idx = int(cached_equity * n_bins)
+                bin_idx = min(bin_idx, n_bins - 1)  # Clamp to valid range
+                hist[bin_idx] = 1.0
+                return hist
+        
+        # Cache miss: run MC simulation
         used = set(hero) | set(board)
         remaining = [c for c in all_cards() if c not in used]
 
@@ -315,7 +386,17 @@ class EquityEngine:
         hist, _ = np.histogram(equities, bins=n_bins, range=(0.0, 1.0), density=False)
         hist = hist.astype(np.float32)
         total = hist.sum()
-        return hist / total if total > 0 else np.ones(n_bins) / n_bins
+        result = hist / total if total > 0 else np.ones(n_bins) / n_bins
+        
+        # Cache the average equity from this histogram
+        if self._cache is not None and equities:
+            avg_equity = np.mean(equities)
+            hero_combo_tuple = (string_card_to_combo(hero[0]), string_card_to_combo(hero[1]))
+            board_combo_list = string_cards_to_combo_list(board)
+            self._cache.add_equity(hero_combo_tuple, board_combo_list, avg_equity)
+            logger.debug(f"Cached histogram avg {hero} on {board}: equity={avg_equity:.6f}")
+        
+        return result
 
     def _sample_from_range(
         self, opp_range: Dict[str, float], used_cards: set
@@ -708,3 +789,31 @@ class CardAbstractionV2:
         if len(hand_name_str) == 2:
             return _hand_strength_prior(hand_name_str)
         return _hand_strength_prior(hand_name_str)
+
+
+# ==============================================================================
+# Stub Implementations for Backward Compatibility (Phase 3)
+# ==============================================================================
+
+class SuitIsomorphismAbstraction:
+    """Stub for suit isomorphism abstraction (Phase 3 placeholder)."""
+    
+    def __init__(self, num_equity_buckets: int = 100):
+        """Initialize stub."""
+        self.num_equity_buckets = num_equity_buckets
+
+
+class CombinedCardAbstraction:
+    """Stub implementation of combined card abstraction for smoke testing."""
+    
+    def __init__(self, num_equity_buckets: int = 100):
+        """Initialize stub with equity bucket count."""
+        self.num_equity_buckets = num_equity_buckets
+    
+    def canonicalize_hole_cards(self, card1: str, card2: str) -> tuple:
+        """Stub: return cards as-is (no actual canonicalization)."""
+        return (card1, card2)
+    
+    def abstract_observation(self, observation: dict) -> dict:
+        """Stub: return observation unchanged."""
+        return observation

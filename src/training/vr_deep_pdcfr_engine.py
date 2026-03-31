@@ -192,6 +192,7 @@ class VRDeepPDCFREngine:
         networks: Dict[int, VRDeepPDCFRNetworks],
         optimizers: Dict[int, Dict[str, Optimizer]],
         device: torch.device = torch.device("cpu"),
+        max_depth: int = 10,
     ) -> None:
         """Initialize VR-DeepPDCFR+ engine.
         
@@ -205,12 +206,16 @@ class VRDeepPDCFREngine:
                 'strategy': Optimizer
             }
             device: torch.device for computation
+            max_depth: Maximum depth for game tree traversal. When depth >= max_depth,
+                      return estimated values from Q networks instead of continuing traversal.
+                      Prevents infinite recursion on large games like 6-Max NLHE.
         """
         self.buffer_managers = buffer_managers
         self.networks = networks
         self.optimizers = optimizers
         self.device = device
         self.current_iteration = 1
+        self.max_depth = max_depth
         
         # Move all networks to device
         for player_id, net_bundle in self.networks.items():
@@ -252,10 +257,15 @@ class VRDeepPDCFREngine:
         self,
         state: Any,
         player_reach_probs: Dict[int, float],
+        updating_player: int,
+        depth: int = 0,
     ) -> Dict[int, float]:
-        """Recursively traverse the game tree, computing advantages.
+        """Recursively traverse the game tree with External Sampling MCCFR.
         
-        This is the core VR-DeepPDCFR+ traversal algorithm.
+        This is the core VR-DeepPDCFR+ traversal algorithm with External Sampling.
+        For LARGE game trees (e.g., 6-Max NLHE with ~10^161 nodes), full enumeration
+        is intractable. External Sampling reduces computation by sampling ONE opponent
+        action per non-updating player node instead of enumerating all.
         
         Algorithm:
             1. If terminal: return payoffs
@@ -263,23 +273,24 @@ class VRDeepPDCFREngine:
             3. If player node:
                a. Compute predictive strategy from frozen θ and φ
                b. Apply legal action masking
-               c. Recursively compute child values
-               d. Query Q baseline for variance reduction
-               e. Compute instantaneous advantages
-               f. Store in buffer
-               g. Return value weighted by strategy
+               
+               **If acting_player == updating_player**:
+                 - Recursively compute child values for ALL legal actions
+                 - Query Q baseline
+                 - Compute instantaneous advantages for all actions
+                 - Store transition in buffer for this player
+                 - Return value weighted by strategy
+               
+               **If acting_player != updating_player**:
+                 - Sample a SINGLE action according to predictive_strategy
+                 - Recursively compute child value for ONLY that sampled action
+                 - Do NOT compute advantages or store in buffer
+                 - Return child value directly (unbiased via importance weighting)
         
         Args:
-            state: GameState object with methods:
-                - is_terminal() -> bool
-                - get_terminal_payoffs() -> Dict[player_id] -> float
-                - get_chance_outcomes() -> List[state, probability]
-                - get_acting_player() -> int
-                - get_infoset_features() -> np.ndarray
-                - get_legal_actions() -> np.ndarray (boolean, num_actions)
-                - get_action_taken(action_idx) -> state
-                - get_reward_for_action(action_idx) -> float
+            state: GameState object with required methods
             player_reach_probs: Dict[player_id] -> cumulative reach probability
+            updating_player: Which player's regrets/strategies we're updating this pass
             
         Returns:
             Dict[player_id] -> expected value from this state
@@ -290,13 +301,31 @@ class VRDeepPDCFREngine:
             logger.debug(f"Terminal reached: payoffs={payoffs}")
             return payoffs
         
+        # DEPTH LIMIT: Use Q network to estimate values for all players
+        if depth >= self.max_depth:
+            logger.debug(f"Depth limit reached at depth={depth}, using Q networks for value estimation")
+            estimated_values = {}
+            
+            with torch.no_grad():
+                for player_id in self.networks.keys():
+                    # Get features from this player's perspective
+                    player_features = state.get_infoset_features(player_id)
+                    features_tensor = torch.FloatTensor(player_features).unsqueeze(0).to(self.device)
+                    
+                    # Query Q network for this player
+                    q_value = self.networks[player_id].value(features_tensor)[0, 0].item()
+                    estimated_values[player_id] = float(q_value)
+            
+            logger.debug(f"Estimated values at depth limit: {estimated_values}")
+            return estimated_values
+        
         # CHANCE NODE: Stochastic transition
         if state.is_chance_node():
             outcomes = state.get_chance_outcomes()
             expected_values = {player_id: 0.0 for player_id in self.networks.keys()}
             
             for outcome_state, outcome_prob in outcomes:
-                child_values = self.traverse(outcome_state, player_reach_probs)
+                child_values = self.traverse(outcome_state, player_reach_probs, updating_player, depth=depth + 1)
                 for player_id in expected_values.keys():
                     expected_values[player_id] += outcome_prob * child_values[player_id]
             
@@ -307,11 +336,12 @@ class VRDeepPDCFREngine:
         acting_player = state.get_acting_player()
         infoset_features = state.get_infoset_features()
         legal_actions = state.get_legal_actions()
-        num_actions = len(legal_actions)
+        num_legal_actions = int(legal_actions.sum())
         
         logger.debug(
-            f"Player {acting_player} node: {num_actions} actions, "
-            f"reach_prob={player_reach_probs[acting_player]:.6f}"
+            f"Player {acting_player} node: {num_legal_actions} legal actions, "
+            f"reach_prob={player_reach_probs[acting_player]:.6f}, "
+            f"updating_player={updating_player}"
         )
         
         # =====================================================================
@@ -356,82 +386,112 @@ class VRDeepPDCFREngine:
         )
         
         # =====================================================================
-        # STEP 2: Recursively compute child values via traversal
+        # BRANCHING: Full Enumeration vs External Sampling
         # =====================================================================
-        action_values = {}
-        for action_idx in range(num_actions):
-            if not legal_actions[action_idx]:
-                action_values[action_idx] = None
-                continue
+        
+        if acting_player == updating_player:
+            # ================== FULL ENUMERATION (Updating Player) ==================
+            # Enumerate ALL legal actions, compute advantages, store in buffer
+            
+            logger.debug(f"Full enumeration mode for updating_player={updating_player}")
+            
+            action_values = {}
+            for action_idx in range(len(legal_actions)):
+                if not legal_actions[action_idx]:
+                    action_values[action_idx] = None
+                    continue
+                
+                # Get child state
+                child_state = state.get_action_taken(action_idx)
+                
+                # Update reach probabilities
+                new_reach_probs = dict(player_reach_probs)
+                new_reach_probs[acting_player] *= predictive_strategy[action_idx]
+                
+                # Recursively traverse (only if reach probability is non-negligible)
+                if new_reach_probs[acting_player] > 1e-10:
+                    child_values = self.traverse(child_state, new_reach_probs, updating_player, depth=depth + 1)
+                    action_values[action_idx] = child_values
+                else:
+                    # Zero-reach subtree: skip traversal
+                    action_values[action_idx] = {
+                        player_id: 0.0 for player_id in self.networks.keys()
+                    }
+            
+            # Compute state value via strategy
+            state_values = {player_id: 0.0 for player_id in self.networks.keys()}
+            for action_idx in range(len(legal_actions)):
+                if legal_actions[action_idx] and action_values[action_idx] is not None:
+                    for player_id in state_values.keys():
+                        state_values[player_id] += (
+                            predictive_strategy[action_idx] * action_values[action_idx][player_id]
+                        )
+            
+            # Compute instantaneous advantages and store in buffer
+            instantaneous_advantages = np.zeros(len(legal_actions))
+            target_strategy = predictive_strategy.copy()  # Target for π network
+            
+            for action_idx in range(len(legal_actions)):
+                if legal_actions[action_idx] and action_values[action_idx] is not None:
+                    # Advantage: action value minus state value
+                    child_value_for_player = action_values[action_idx][acting_player]
+                    instantaneous_advantages[action_idx] = (
+                        child_value_for_player - state_values[acting_player]
+                    )
+                else:
+                    instantaneous_advantages[action_idx] = 0.0
+            
+            logger.debug(f"Instantaneous advantages: {instantaneous_advantages}")
+            
+            # Store transition in buffer for updating player
+            # Pass legal_mask to ensure Π network only assigns probability to legal actions
+            self.buffer_managers[acting_player].add_transition(
+                infoset_features=infoset_features,
+                action_probs=target_strategy,
+                legal_mask=legal_actions.astype(np.float32),
+                advantages=instantaneous_advantages,
+                reach_prob=player_reach_probs[acting_player],
+            )
+            
+            return state_values
+        
+        else:
+            # ================== EXTERNAL SAMPLING (Non-Updating Player) ==================
+            # Sample ONE action according to strategy, traverse only that branch
+            
+            logger.debug(f"External sampling mode for acting_player={acting_player}, updating_player={updating_player}")
+            
+            # Get legal action indices
+            legal_indices = np.where(legal_actions)[0]
+            
+            if len(legal_indices) == 0:
+                raise RuntimeError(f"No legal actions at non-terminal node")
+            
+            # Get probabilities for legal actions (normalized)
+            legal_probs = predictive_strategy[legal_indices]
+            legal_probs = legal_probs / legal_probs.sum()  # Ensure normalized
+            
+            # Sample ONE action according to strategy
+            sampled_action_idx = np.random.choice(legal_indices, p=legal_probs)
+            
+            logger.debug(
+                f"Sampled action {sampled_action_idx} for acting_player={acting_player} "
+                f"with prob {legal_probs[list(legal_indices).index(sampled_action_idx)]:.4f}"
+            )
             
             # Get child state
-            child_state = state.get_action_taken(action_idx)
+            child_state = state.get_action_taken(sampled_action_idx)
             
-            # Update reach probabilities
+            # Update reach probabilities for the sampled action
             new_reach_probs = dict(player_reach_probs)
-            new_reach_probs[acting_player] *= predictive_strategy[action_idx]
+            new_reach_probs[acting_player] *= predictive_strategy[sampled_action_idx]
             
-            # Recursively traverse (only if reach probability is non-negligible)
-            if new_reach_probs[acting_player] > 1e-10:
-                child_values = self.traverse(child_state, new_reach_probs)
-                action_values[action_idx] = child_values
-            else:
-                # Zero-reach subtree: skip traversal
-                action_values[action_idx] = {
-                    player_id: 0.0 for player_id in self.networks.keys()
-                }
-        
-        # =====================================================================
-        # STEP 3: Compute state value via strategy
-        # =====================================================================
-        state_values = {player_id: 0.0 for player_id in self.networks.keys()}
-        for action_idx in range(num_actions):
-            if legal_actions[action_idx] and action_values[action_idx] is not None:
-                for player_id in state_values.keys():
-                    state_values[player_id] += (
-                        predictive_strategy[action_idx] * action_values[action_idx][player_id]
-                    )
-        
-        # =====================================================================
-        # STEP 4: Compute instantaneous advantages and store in buffers
-        # =====================================================================
-        instantaneous_advantages = np.zeros(num_actions)
-        target_strategy = predictive_strategy.copy()  # Target for π network
-        
-        for action_idx in range(num_actions):
-            if legal_actions[action_idx] and action_values[action_idx] is not None:
-                # Reward for this action (if game structure provides it)
-                action_reward = state.get_reward_for_action(action_idx) if hasattr(state, 'get_reward_for_action') else 0.0
-                
-                # Advantage: action value minus state value
-                child_value_for_player = action_values[action_idx][acting_player]
-                instantaneous_advantages[action_idx] = (
-                    action_reward + child_value_for_player - state_values[acting_player]
-                )
-            else:
-                instantaneous_advantages[action_idx] = 0.0
-        
-        logger.debug(f"Instantaneous advantages: {instantaneous_advantages}")
-        
-        # =====================================================================
-        # STEP 5: Store transition in both buffers
-        # =====================================================================
-        transition = Transition(
-            infoset_features=infoset_features,
-            action_probs=target_strategy,  # Strategy targets for π
-            advantages=instantaneous_advantages,
-            iteration=self.current_iteration,
-            reach_prob=player_reach_probs[acting_player],
-        )
-        
-        self.buffer_managers[acting_player].add_transition(
-            infoset_features=infoset_features,
-            action_probs=target_strategy,
-            advantages=instantaneous_advantages,
-            reach_prob=player_reach_probs[acting_player],
-        )
-        
-        return state_values
+            # Recursively traverse ONLY the sampled branch
+            child_values = self.traverse(child_state, new_reach_probs, updating_player, depth=depth + 1)
+            
+            # Return child values directly (no advantage computation, no buffer storage)
+            # The values from this branch are unbiased estimators via importance weighting
+            return child_values
     
     def train_networks(self) -> Dict[str, float]:
         """Train all networks from buffered data.
@@ -453,12 +513,12 @@ class VRDeepPDCFREngine:
             buffer_manager = self.buffer_managers[player_id]
             optim_dict = self.optimizers[player_id]
             
-            # Determine batch sizes
-            adv_buffer_size = network_bundle.instantaneous_advantage.size()
-            strat_buffer_size = network_bundle.strategy.size() if hasattr(network_bundle, 'strategy') else 0
+            # Determine batch sizes from buffer manager, not network
+            adv_buffer_size = buffer_manager.advantage_buffer.size()
+            strat_buffer_size = buffer_manager.strategy_buffer.size()
             
-            batch_size = min(32, max(adv_buffer_size, strat_buffer_size // 10))
-            num_epochs = 3
+            batch_size = min(32, max(adv_buffer_size, strat_buffer_size // 10) if max(adv_buffer_size, strat_buffer_size) > 0 else 1)
+            num_epochs = 1  # Single epoch to preserve buffer quality
             
             for epoch in range(num_epochs):
                 # =========================================================
@@ -472,9 +532,16 @@ class VRDeepPDCFREngine:
                     )
                     losses[f"player_{player_id}_phi_loss"] = loss_phi.item()
                     
-                    optim_dict['instantaneous'].zero_grad()
-                    loss_phi.backward()
-                    optim_dict['instantaneous'].step()
+                    # Debug: Check loss tensor state
+                    logger.debug(f"φ loss - requires_grad: {loss_phi.requires_grad}, has grad_fn: {loss_phi.grad_fn is not None}, dtype: {loss_phi.dtype}")
+                    
+                    # Only perform backward if loss requires grad and has a computation graph
+                    if loss_phi.requires_grad and loss_phi.grad_fn is not None:
+                        optim_dict['instantaneous'].zero_grad()
+                        loss_phi.backward()
+                        optim_dict['instantaneous'].step()
+                    elif loss_phi.requires_grad:
+                        logger.warning(f"φ loss requires_grad but has no grad_fn - skipping backward")
                     
                     logger.debug(f"φ loss: {loss_phi.item():.6f}")
                 
@@ -489,9 +556,13 @@ class VRDeepPDCFREngine:
                     )
                     losses[f"player_{player_id}_q_loss"] = loss_q.item()
                     
-                    optim_dict['value'].zero_grad()
-                    loss_q.backward()
-                    optim_dict['value'].step()
+                    # Only perform backward if loss requires grad and has a computation graph
+                    if loss_q.requires_grad and loss_q.grad_fn is not None:
+                        optim_dict['value'].zero_grad()
+                        loss_q.backward()
+                        optim_dict['value'].step()
+                    elif loss_q.requires_grad:
+                        logger.warning(f"Q loss requires_grad but has no grad_fn - skipping backward")
                     
                     logger.debug(f"Q loss: {loss_q.item():.6f}")
                 
@@ -507,9 +578,13 @@ class VRDeepPDCFREngine:
                     )
                     losses[f"player_{player_id}_pi_loss"] = loss_pi.item()
                     
-                    optim_dict['strategy'].zero_grad()
-                    loss_pi.backward()
-                    optim_dict['strategy'].step()
+                    # Only perform backward if loss requires grad and has a computation graph
+                    if loss_pi.requires_grad and loss_pi.grad_fn is not None:
+                        optim_dict['strategy'].zero_grad()
+                        loss_pi.backward()
+                        optim_dict['strategy'].step()
+                    elif loss_pi.requires_grad:
+                        logger.warning(f"π loss requires_grad but has no grad_fn - skipping backward")
                     
                     logger.debug(f"π loss: {loss_pi.item():.6f}")
                 
@@ -525,9 +600,13 @@ class VRDeepPDCFREngine:
                     )
                     losses[f"player_{player_id}_theta_loss"] = loss_theta.item()
                     
-                    optim_dict['cumulative'].zero_grad()
-                    loss_theta.backward()
-                    optim_dict['cumulative'].step()
+                    # Only perform backward if loss requires grad and has a computation graph
+                    if loss_theta.requires_grad and loss_theta.grad_fn is not None:
+                        optim_dict['cumulative'].zero_grad()
+                        loss_theta.backward()
+                        optim_dict['cumulative'].step()
+                    elif loss_theta.requires_grad:
+                        logger.warning(f"θ loss requires_grad but has no grad_fn - skipping backward")
                     
                     logger.debug(f"θ loss: {loss_theta.item():.6f}")
         
@@ -575,8 +654,8 @@ class VRDeepPDCFREngine:
         if buffer_manager.strategy_buffer.size() == 0:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
         
-        features, target_probs, _ = buffer_manager.strategy_buffer.sample_minibatch(
-            batch_size, iteration_t=self.current_iteration, replace=True
+        features, target_probs, _, _ = buffer_manager.strategy_buffer.sample_minibatch(
+            batch_size, current_iteration=self.current_iteration, replace=True
         )
         
         # We need the corresponding advantages for the same states
@@ -612,22 +691,43 @@ class VRDeepPDCFREngine:
         
         Loss = Cross-entropy(predicted_logits, target_policy) * time_decay_weight
         
+        IMPORTANT: Apply legal action masking BEFORE log_softmax to ensure
+        the Π network does not leak probability mass to illegal actions during
+        behavioral cloning.
+        
         Time-decay weight emphasizes recent iterations over old ones.
         """
         if buffer_manager.strategy_buffer.size() == 0:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
         
-        features, target_probs, time_decay_weights = buffer_manager.strategy_buffer.sample_minibatch(
-            batch_size, iteration_t, replace=True
+        features, target_probs, legal_masks, time_decay_weights = buffer_manager.strategy_buffer.sample_minibatch(
+            batch_size, current_iteration=iteration_t, replace=True
         )
         
         features_tensor = torch.FloatTensor(features).to(self.device)
         target_tensor = torch.FloatTensor(target_probs).to(self.device)
+        legal_masks_tensor = torch.FloatTensor(legal_masks).to(self.device)
         weights_tensor = torch.FloatTensor(time_decay_weights).to(self.device)
         
-        # Network outputs raw logits; apply softmax for cross-entropy
+        # Network outputs raw logits; apply masking BEFORE softmax
         logits = network_bundle.strategy(features_tensor)  # Shape: (batch, num_actions)
-        log_probs = F.log_softmax(logits, dim=-1)
+        
+        # =====================================================================
+        # BEHAVIORAL CLONING MASKED SOFTMAX (AMP-SAFE)
+        # =====================================================================
+        # Apply legal action mask to logits using AMP-safe masking:
+        # Set illegal actions to torch.finfo(dtype).min (safe for float16/bfloat16)
+        # This prevents softmax from assigning any probability to illegal actions
+        
+        mask_value = torch.finfo(logits.dtype).min
+        masked_logits = torch.where(
+            legal_masks_tensor.bool(),
+            logits,
+            torch.full_like(logits, mask_value, dtype=logits.dtype)
+        )
+        
+        # Apply log_softmax ONLY to masked logits
+        log_probs = F.log_softmax(masked_logits, dim=-1)
         
         # Cross-entropy loss (unweighted)
         entropy_loss = F.kl_div(

@@ -1,0 +1,212 @@
+# ==============================================================================
+# VR-DeepPDCFR+ — SMOKE TEST Config (Quick Sanity Check)
+# ==============================================================================
+# Minimal iterations to verify end-to-end functionality without errors.
+# This config runs 10 iterations with full lifecycle: traversal → training → eval → checkpoint.
+
+project:
+  name: "vr-deep-pdcfr-plus-6max-smoke"
+  version: "1.0.0"
+  description: "6-Max NLHE Smoke Test"
+
+# ==============================================================================
+# Environment
+# ==============================================================================
+environment:
+  game_type: "no-limit-holdem"
+  num_players: 6
+  big_blind: 2.0
+  small_blind: 1.0
+  initial_stack_bb: 100.0
+
+  action_space:
+    num_actions: 12
+    bet_sizes:
+      preflop: [0.33, 0.5, 0.75, 1.0]
+      flop:    [0.33, 0.5, 0.75, 1.0]
+      turn:    [0.5,  0.75, 1.0, 1.5]
+      river:   [0.5,  0.75, 1.0, 1.5]
+
+  observation_space:
+    max_betting_actions: 18
+    action_feature_dim: 13
+    use_extended_history: true
+    use_bet_encoding: true
+    use_suit_isomorphism: true
+    use_equity_bucketing: true
+    num_equity_buckets: 100
+
+# ==============================================================================
+# Neural Networks (REDUCED for smoke test)
+# ==============================================================================
+networks:
+  shared_architecture:
+    hidden_dims: [256, 256, 128]  # Smaller network for quick test
+    activation: "relu"
+    use_layer_norm: true
+    dropout_p: 0.0
+
+  cumulative_advantage:
+    learning_rate: 1.0e-3
+    adam_epsilon: 1.0e-5
+    max_grad_norm: 1.0
+
+  instantaneous_advantage:
+    learning_rate: 1.0e-3
+    adam_epsilon: 1.0e-5
+    max_grad_norm: 1.0
+
+  value_baseline:
+    learning_rate: 1.0e-3
+    adam_epsilon: 1.0e-5
+    max_grad_norm: 1.0
+
+  average_strategy:
+    learning_rate: 1.0e-3
+    adam_epsilon: 1.0e-5
+    max_grad_norm: 1.0
+
+# ==============================================================================
+# CFR / VR-DeepPDCFR+ (MINIMAL for smoke test)
+# ==============================================================================
+cfr:
+  training_algorithm: "cfr"
+  
+  # SMOKE TEST: Minimal for quick end-to-end test
+  num_iterations: 2
+  traversals_per_iteration: 1  # Single traversal per iteration
+  max_tree_depth: 3  # Shallow tree depth
+
+  # Temporal discounting
+  dcfr_alpha: 1.5
+  dcfr_beta:  0.0
+  dcfr_gamma: 2.0
+
+  # Variance reduction
+  regret_discount: 1.0
+  regret_min_threshold: 0.0
+  regret_scaling: 1.0
+
+  # Network training
+  num_network_epochs: 1  # Single epoch for speed
+  batch_size: 64
+
+  # Convergence monitoring (RUN EVERY ITERATION FOR COVERAGE)
+  track_exploitability: true
+  exploitability_update_freq: 1  # Run LBR every iteration
+
+# ==============================================================================
+# Replay Buffers
+# ==============================================================================
+buffers:
+  advantage_buffer_size: 100_000
+  strategy_buffer_size: 100_000
+  time_decay_power: 1.0
+
+# ==============================================================================
+# Regret Store
+# ==============================================================================
+regret_store:
+  base_dir: "regrets"
+  n_shards: 64
+  max_hot_shards: 8
+
+# ==============================================================================
+# Parallel CFR
+# ==============================================================================
+parallel:
+  num_workers: 2
+  max_infosets: 100_000
+  use_shared_memory: true
+
+# ==============================================================================
+# Card Abstraction
+# ==============================================================================
+abstraction:
+  preflop_buckets: 8
+  flop_buckets: 50
+  turn_buckets: 25
+  river_buckets: 12
+  equity_histogram_bins: 10
+  rce_opponent_samples: 500
+  cache_dir: "equity_cache"
+
+# ==============================================================================
+# Curriculum
+# ==============================================================================
+orchestrator:
+  eval_interval: 50
+  enable_hot_reload: true
+
+  phases:
+    phase_0:
+      name: "Rules-Based Exploitation"
+      opponents: ["calling_station", "maniac", "random", "tight_passive"]
+      transition_threshold:
+        min_win_rate_mbb: 50.0
+        min_hands: 200_000
+    phase_1:
+      name: "SFT Opponent Modeling"
+      opponents: ["sft_aggressive", "sft_balanced", "sft_passive"]
+      transition_threshold:
+        min_win_rate_mbb: 30.0
+        min_hands: 500_000
+        max_exploitability_pct: 1.0
+    phase_2:
+      name: "Co-Adaptive FSP"
+      opponents: ["self_play_pool"]
+      transition_threshold:
+        max_exploitability_pct: 0.3
+
+  mab:
+    algorithm: "ucb"
+    ucb_exploration_factor: 2.0
+    pool_snapshot_interval: 50
+    max_pool_size: 20
+
+  fsp:
+    snapshot_dir: "checkpoints/fsp_avg"
+    max_snapshots: 100
+    weighting: "linear"
+    exploration_frac: 0.20
+    snapshot_interval: 50
+
+# ==============================================================================
+# GTO Matrix & Anomaly Detection
+# ==============================================================================
+gto_matrix:
+  "6":
+    vpip:      [22, 28]
+    pfr:       [18, 24]
+    three_bet: [6,  10]
+    af:        [2.5, 4.5]
+    wtsd:      [24, 30]
+
+degeneration_thresholds:
+  "6":
+    passivity:
+      vpip_below: 18
+      vpip_pfr_gap_above: 12
+    maniac:
+      pfr_above: 35
+      three_bet_above: 20
+      af_above: 8.0
+
+# ==============================================================================
+# Training Loop
+# ==============================================================================
+training:
+  max_iterations: 2  # SMOKE TEST: Minimal iterations
+  log_interval_iterations: 1
+
+# ==============================================================================
+# MLOps / Checkpointing
+# ==============================================================================
+checkpoint_dir: "checkpoints"
+max_checkpoints: 5
+save_interval_iterations: 2  # Save on final iteration
+
+wandb:
+  entity: null
+  project: "vr-deep-pdcfr-smoke-test"
+  offline: false

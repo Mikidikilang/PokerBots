@@ -1,0 +1,119 @@
+# ==============================================================================
+# VR-DeepPDCFR+ .gitignore
+# Ignores ephemeral files, caches, and build artifacts
+# ==============================================================================
+
+# ===== PYTHON =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ===== VIRTUAL ENVIRONMENTS =====
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ===== IDE & EDITOR =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.classpath
+.c9/
+*.sublime-project
+*.sublime-workspace
+.sublime-project
+.sublime-workspace
+
+# ===== TRAINING & CHECKPOINTS =====
+checkpoints/
+checkpoints_debug/
+*.pt
+*.pth
+*.ckpt
+checkpoint_*.pt
+
+# ===== EPHEMERAL DATA & LOGS =====
+logs/
+*.log
+*.tmp
+*.temp
+*.bak
+
+# ===== CACHED COMPUTATION =====
+equity_cache/
+regrets/
+regrets_debug/
+*.pkl
+*.pickle
+*.json.gz
+
+# ===== REPLAY BUFFERS & TRANSIENT STATE =====
+buffers/
+*.npz
+*.npy
+
+# ===== MODEL ARTIFACTS & OPTIMIZATION STATE =====
+*.optimizer
+*.scheduler
+
+# ===== SYSTEM FILES =====
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.env
+.env.local
+.env.*.local
+
+# ===== JUPYTER & NOTEBOOKS =====
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+*.ipynb
+
+# ===== GIT =====
+.git/
+
+# ===== WANDB & LOGGING =====
+wandb/
+.wandb/
+outputs/
+mlruns/
+
+# ===== MISCELLANEOUS =====
+*.zip
+*.gz
+*.tar
+*.tar.gz
+config_debug.yaml
+config_test.yaml
+temp_*
+test_*_output.*
+debug_*_output.*

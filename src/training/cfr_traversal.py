@@ -56,6 +56,67 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# N-PLAYER REACH PROBABILITY TRACKER
+# ============================================================================
+
+@dataclass
+class ReachProbs:
+    """
+    Reach probabilities for each player in an N-player game.
+
+    π(h) = Π_{i=0}^{N-1} π_i(h)
+    π^{-j}(h) = Π_{i ≠ j} π_i(h)  (counterfactual reach for player j)
+    
+    This supports arbitrary number of players (2 for heads-up, 6 for 6-Max, etc.)
+    """
+    probs: np.ndarray  # shape (N,), dtype float64
+
+    @classmethod
+    def uniform(cls, n_players: int) -> "ReachProbs":
+        """Create uniform reach probabilities for N players."""
+        return cls(np.ones(n_players, dtype=np.float64))
+
+    def update(self, player: int, action_prob: float) -> "ReachProbs":
+        """Return NEW ReachProbs object with player's probability multiplied.
+        
+        Immutable update: creates a copy, does not modify self.
+        This is essential for tree branching during MCCFR traversal.
+        """
+        new_probs = self.probs.copy()
+        new_probs[player] *= action_prob
+        return ReachProbs(new_probs)
+
+    def counterfactual_reach(self, player: int) -> float:
+        """Calculate π^{-player}(h) = product of all OTHER players' reach probs.
+        
+        This is the reach probability needed for weighting counterfactual regrets:
+            scaled_regret = regret(action) * π^{-player}(h)
+        
+        Args:
+            player: The player whose counterfactual reach we're computing
+            
+        Returns:
+            Product of all reach probabilities EXCEPT player's own
+        """
+        if len(self.probs) == 1:
+            return 1.0
+        result = 1.0
+        for i, p in enumerate(self.probs):
+            if i != player:
+                result *= float(p)
+        return result
+
+    def total_reach(self) -> float:
+        """Calculate π(h) = product of ALL players' reach probs."""
+        return float(np.prod(self.probs))
+
+    @property
+    def n_players(self) -> int:
+        """Number of players in this game."""
+        return len(self.probs)
+
+
 @dataclass
 class TraversalState:
     """Mutable state passed through MCCFR traversal."""
@@ -143,6 +204,10 @@ class MCCFRTraversal:
 
         Returns payoff in big-blind units (consistent with
         RLCardWrapper._compute_terminal_reward).
+        
+        RLCard's get_payoffs() returns an array indexed by player position,
+        which works correctly for N-player games. Each player's payoff is
+        already from their own perspective in the returned array.
         """
         bb = getattr(self.env, "config", None)
         bb = bb.big_blind if bb is not None else 2.0
@@ -181,18 +246,29 @@ class MCCFRTraversal:
         self,
         state: dict[str, Any],
         player_to_update: int,
-        reach_probs: dict[int, float],
+        reach_probs: ReachProbs,
         action_count: int = 0,
         _recursion_depth: int = 0,
     ) -> float:
-        """[CORE MCCFR — EXTERNAL SAMPLING]
+        """[CORE MCCFR — EXTERNAL SAMPLING, N-PLAYER]
 
         Recursively traverse the game tree.  For the updating player,
-        evaluate ALL legal actions (full width); for the opponent,
-        sample ONE action from the current strategy (external sampling).
+        evaluate ALL legal actions (full width); for other players,
+        sample ONE action from their current strategy (external sampling).
 
-        Returns the counterfactual value from ``player_to_update``'s
-        perspective, in big-blind units.
+        Generalized for N players: supports 2-player heads-up, 6-Max,
+        or any other number of concurrent players.
+
+        Args:
+            state: Current game state
+            player_to_update: Which player's regrets to update (0 to N-1)
+            reach_probs: ReachProbs object tracking π_i(h) for each player i
+            action_count: Depth in tree (for cutoff guard)
+            _recursion_depth: Debug recursion depth tracking
+
+        Returns:
+            Counterfactual value from ``player_to_update``'s
+            perspective, in big-blind units.
         """
         # ── Terminal: game over → return REAL payoff ─────────────────
         if self.env.is_over():
@@ -259,11 +335,9 @@ class MCCFRTraversal:
                 # Step the environment
                 next_state, reward = self.env.step(action)
 
-                # Update reach probabilities
-                new_reach = reach_probs.copy()
-                new_reach[current_player] *= strategy.get(
-                    action, 1.0 / len(legal_actions)
-                )
+                # Update reach probabilities for THIS player
+                action_prob = strategy.get(action, 1.0 / len(legal_actions))
+                new_reach = reach_probs.update(current_player, action_prob)
 
                 # Recurse
                 value = self.external_sampling_traversal(
@@ -281,7 +355,9 @@ class MCCFRTraversal:
             self._restore_env_state(saved_state)
 
             # ── Compute and store counterfactual regrets ─────────────
-            opposing_reach = reach_probs.get(1 - current_player, 1.0)
+            # ★★★ N-PLAYER FIX: Use counterfactual_reach product
+            # π^{-i}(h) = Π_{j ≠ i} π_j(h)
+            opposing_reach = reach_probs.counterfactual_reach(current_player)
 
             for action in legal_actions:
                 regret = action_values[action] - avg_value
@@ -296,7 +372,7 @@ class MCCFRTraversal:
             return avg_value
 
         # ==============================================================
-        # CASE B: Opponent's turn → sample ONE action (external sampling)
+        # CASE B: Other player's turn → sample ONE action (external sampling)
         # ==============================================================
         else:
             action_probs = np.array(
@@ -315,8 +391,8 @@ class MCCFRTraversal:
 
             next_state, reward = self.env.step(sampled_action)
 
-            new_reach = reach_probs.copy()
-            new_reach[1 - current_player] *= sampled_prob
+            # Update reach probabilities for the SAMPLED player
+            new_reach = reach_probs.update(current_player, sampled_prob)
 
             value = self.external_sampling_traversal(
                 state=next_state,
@@ -338,13 +414,22 @@ class MCCFRTraversal:
     def traverse_for_both_players(
         self, num_traversals: int = 1
     ) -> dict[str, float]:
-        """Run alternating traversals: update player 0, then player 1.
+        """Run alternating traversals: update player 0, then player 1 (and others if N-player).
 
+        Generalized for N players: iterates through all players in order,
+        updating their regrets one player at a time.
+        
         Standard MCCFR self-play loop:
             for t in 1..T:
-                v_0 = traverse(root, player=0)
-                v_1 = traverse(root, player=1)
+                for i in 0..N-1:
+                    v_i = traverse(root, player=i)
         """
+        # Determine number of players from environment
+        try:
+            num_players = getattr(self.env, "_num_players", 2)
+        except:
+            num_players = 2  # Fallback to 2-player if unavailable
+
         stats: dict[str, float] = {
             "total_traversals": 0,
             "mean_value_p0": 0.0,
@@ -352,42 +437,37 @@ class MCCFRTraversal:
             "infosets_discovered": 0,
         }
 
-        values_p0: list[float] = []
-        values_p1: list[float] = []
+        values_by_player: dict[int, list[float]] = {i: [] for i in range(num_players)}
 
         for trav_idx in range(num_traversals):
-            # ── Player 0 traversal ───────────────────────────────────
-            root_state = self.env.reset()
-            value_p0 = self.external_sampling_traversal(
-                state=root_state,
-                player_to_update=0,
-                reach_probs={0: 1.0, 1: 1.0},
-                action_count=0,
-            )
-            values_p0.append(value_p0)
-
-            # ── Player 1 traversal ───────────────────────────────────
-            root_state = self.env.reset()
-            value_p1 = self.external_sampling_traversal(
-                state=root_state,
-                player_to_update=1,
-                reach_probs={0: 1.0, 1: 1.0},
-                action_count=0,
-            )
-            values_p1.append(value_p1)
+            # Iterate through all players
+            for player_idx in range(num_players):
+                root_state = self.env.reset()
+                
+                # Initialize reach probabilities: all players at 1.0
+                reach_probs = ReachProbs.uniform(num_players)
+                
+                value = self.external_sampling_traversal(
+                    state=root_state,
+                    player_to_update=player_idx,
+                    reach_probs=reach_probs,
+                    action_count=0,
+                )
+                values_by_player[player_idx].append(value)
 
             self.traversal_count += 1
 
             if (trav_idx + 1) % 10 == 0:
                 logger.info(
-                    "MCCFR Traversal %d: V_p0=%.4f, V_p1=%.4f",
-                    trav_idx + 1, value_p0, value_p1,
+                    "MCCFR Traversal %d (all players updated)",
+                    trav_idx + 1,
                 )
 
-        if values_p0:
-            stats["mean_value_p0"] = float(np.mean(values_p0))
-        if values_p1:
-            stats["mean_value_p1"] = float(np.mean(values_p1))
+        # Compute statistics
+        if values_by_player[0]:
+            stats["mean_value_p0"] = float(np.mean(values_by_player[0]))
+        if values_by_player.get(1):
+            stats["mean_value_p1"] = float(np.mean(values_by_player[1]))
         stats["total_traversals"] = self.traversal_count
         stats["infosets_discovered"] = len(self.infoset_storage.infosets)
 

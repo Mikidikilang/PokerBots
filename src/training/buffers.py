@@ -103,6 +103,9 @@ class Transition:
             Shape: (num_actions,) - sum should be approximately 1.0
         advantages: Estimated action advantages (for advantage buffer)
             Shape: (num_actions,) or None for strategy samples
+        legal_mask: Binary mask of legal actions (for behavior cloning masking)
+            Shape: (num_actions,) - 1.0 for legal, 0.0 for illegal
+            Used to prevent Π network from assigning probability to illegal actions
         iteration: CFR iteration when this data was generated (t >= 1)
         reach_prob: Player reach probability to this infoset
             Used for importance weighting in counterfactual computations
@@ -110,12 +113,14 @@ class Transition:
             
     Notes:
         - action_probs and advantages should be numpy arrays
+        - legal_mask should be binary np.ndarray (1.0 or 0.0)
         - iteration must be >= 1
         - reach_prob should be in (0, 1]
         - Frozen: immutable once created (safe for concurrent access)
     """
     infoset_features: np.ndarray
     action_probs: np.ndarray
+    legal_mask: np.ndarray
     advantages: Optional[np.ndarray] = None
     iteration: int = 1
     reach_prob: float = 1.0
@@ -131,16 +136,32 @@ class Transition:
             raise ValueError(
                 f"action_probs must be 1D array, got shape {self.action_probs.shape}"
             )
+        if self.legal_mask.ndim != 1:
+            raise ValueError(
+                f"legal_mask must be 1D array, got shape {self.legal_mask.shape}"
+            )
         if self.advantages is not None and self.advantages.ndim != 1:
             raise ValueError(
                 f"advantages must be 1D array, got shape {self.advantages.shape}"
             )
         
         num_actions = len(self.action_probs)
+        if len(self.legal_mask) != num_actions:
+            raise ValueError(
+                f"legal_mask length {len(self.legal_mask)} != "
+                f"action_probs length {num_actions}"
+            )
         if self.advantages is not None and len(self.advantages) != num_actions:
             raise ValueError(
                 f"advantages length {len(self.advantages)} != "
                 f"action_probs length {num_actions}"
+            )
+        
+        # Check legal_mask values (should be 0.0 or 1.0)
+        unique_mask_values = np.unique(self.legal_mask)
+        if not all(v in [0.0, 1.0] for v in unique_mask_values):
+            raise ValueError(
+                f"legal_mask must contain only 0.0 or 1.0, got {unique_mask_values}"
             )
         
         # Check iteration
@@ -380,7 +401,7 @@ class PersistentStrategyBuffer:
         batch_size: int,
         current_iteration: int,
         replace: bool = True,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Sample minibatch with time-decay importance weighting.
         
         Recent data (current iteration) has weight 1.0.
@@ -392,9 +413,10 @@ class PersistentStrategyBuffer:
             replace: Allow sampling with replacement
             
         Returns:
-            Tuple of (features, action_probs, weights) where:
+            Tuple of (features, action_probs, legal_masks, weights) where:
                 - features: Shape (batch_size, feature_dim)
                 - action_probs: Shape (batch_size, num_actions)
+                - legal_masks: Shape (batch_size, num_actions) - binary masks
                 - weights: Shape (batch_size,) - importance weights for loss
                 
         Raises:
@@ -435,8 +457,9 @@ class PersistentStrategyBuffer:
         # Stack into arrays
         features = np.stack([t.infoset_features for t in sampled])
         action_probs = np.stack([t.action_probs for t in sampled])
+        legal_masks = np.stack([t.legal_mask for t in sampled])
         
-        return features, action_probs, sampled_weights
+        return features, action_probs, legal_masks, sampled_weights
     
     def size(self) -> int:
         """Return number of stored transitions."""
@@ -529,6 +552,7 @@ class BufferManager:
         self,
         infoset_features: np.ndarray,
         action_probs: np.ndarray,
+        legal_mask: np.ndarray,
         advantages: np.ndarray,
         reach_prob: float = 1.0,
     ) -> None:
@@ -537,12 +561,14 @@ class BufferManager:
         Args:
             infoset_features: State representation
             action_probs: Action probabilities
+            legal_mask: Binary mask of legal actions (1.0 for legal, 0.0 for illegal)
             advantages: Action advantages
             reach_prob: Reach probability (default 1.0)
         """
         transition = Transition(
             infoset_features=infoset_features,
             action_probs=action_probs,
+            legal_mask=legal_mask,
             advantages=advantages,
             iteration=self.current_iteration,
             reach_prob=reach_prob,

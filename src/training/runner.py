@@ -24,18 +24,299 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Optional, Callable
 
+import numpy as np
 import torch
+import torch.optim as optim
 
-from src.training.buffer import RolloutBuffer, RolloutBufferConfig
-from src.training.collector import RolloutCollector
-# from src.training.trainer import PPOTrainer, TrainerConfig  # [DEPRECATED] Removed during native integration
-from src.training.cfr_adapter import CFRTrajectoryAdapter  # [PHASE 2.5B] CFR support
-from src.training.cfr_engine import CFREngine, CFRConfig    # [PHASE 2.5B] CFR support
+from src.training.buffers import BufferManager  # [PHASE 2] Buffer management
+from src.training.vr_deep_pdcfr_engine import VRDeepPDCFREngine  # [PHASE 4] VR-DeepPDCFR+ Engine
+from src.model.networks import VRDeepPDCFRNetworks  # [PHASE 3] Network bundle (4 networks per player)
 from src.evaluation.nash_evaluator import LocalBestResponseEvaluator, NashEvalConfig  # [PHASE 6] Oracle evaluation
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# GAME STATE ADAPTER: Bridge RLCard Environment to VR-DeepPDCFR+ Engine
+# ============================================================================
+
+class GameStateAdapter:
+    """Wraps RLCardWrapper to provide the game state interface expected by VRDeepPDCFREngine.
+    
+    This adapter translates between:
+    - RLCard's environment (step, is_over, get_payoffs)
+    - VR-DeepPDCFR+ engine's game state interface (is_terminal, get_acting_player, etc.)
+    
+    Key design:
+    - Uses env.get_full_state() / set_full_state() for non-mutating action simulation
+    - Stores a snapshot of environment state to avoid parent mutation
+    - Each call to get_action_taken() returns a NEW adapter with simulated state
+    
+    Attributes:
+        env: The RLCardWrapper environment
+        obs_builder: ObservationBuilder for encoding game states to feature vectors
+        env_snapshot: Snapshot of environment state at this node
+        current_obs: Current observation dict for the environment
+    """
+    
+    def __init__(
+        self,
+        env: Any,
+        obs_builder: Any,
+        env_snapshot: dict[str, Any] | None = None,
+        current_obs: dict[str, Any] | None = None,
+    ) -> None:
+        """Initialize a game state adapter.
+        
+        Args:
+            env: RLCardWrapper environment instance
+            obs_builder: ObservationBuilder for feature encoding
+            env_snapshot: Optional snapshot to restore environment to a specific state
+                         (used internally for get_action_taken)
+            current_obs: Optional observation dict (used internally)
+        """
+        self.env = env
+        self.obs_builder = obs_builder
+        self.env_snapshot = env_snapshot or env.get_full_state()
+        self.current_obs = current_obs or env._build_obs_dict(
+            env._current_state, env._current_player_id
+        )
+    
+    def is_terminal(self) -> bool:
+        """Check if this is a terminal game state.
+        
+        Returns:
+            True if the game is over, False otherwise
+        """
+        return self.env.is_over()
+    
+    def get_terminal_payoffs(self) -> dict[int, float]:
+        """Get payoff dictionary at terminal node.
+        
+        Returns:
+            Dict mapping player_id -> payoff in big-blind units
+            
+        Raises:
+            RuntimeError: If not at terminal node
+        """
+        if not self.is_terminal():
+            raise RuntimeError(
+                "get_terminal_payoffs() called on non-terminal state"
+            )
+        
+        try:
+            # RLCard returns payoffs as array [p0_payoff, p1_payoff, ...]
+            payoffs_array = self.env._env.get_payoffs()
+            bb = self.env.config.big_blind
+            
+            # Convert to dict indexed by player_id
+            payoffs_dict = {
+                player_id: float(payoffs_array[player_id]) / bb
+                for player_id in range(len(payoffs_array))
+            }
+            
+            logger.debug(f"Terminal payoffs: {payoffs_dict}")
+            return payoffs_dict
+            
+        except Exception as exc:
+            logger.error(f"Failed to get terminal payoffs: {exc}")
+            # Fallback: return uniform payoffs
+            num_players = self.env.config.num_players
+            return {player_id: 0.0 for player_id in range(num_players)}
+    
+    def is_chance_node(self) -> bool:
+        """Check if this is a chance (stochastic) node.
+        
+        For poker, chance is handled implicitly by RLCard during reset/step.
+        We don't expose explicit chance nodes here.
+        
+        Returns:
+            False (poker has no explicit chance nodes exposed)
+        """
+        return False
+    
+    def get_chance_outcomes(self) -> list[tuple[Any, float]]:
+        """Get stochastic outcomes at chance node.
+        
+        Not used for poker (is_chance_node always returns False).
+        
+        Returns:
+            List of (next_state, probability) tuples
+        """
+        return [(self, 1.0)]
+    
+    def get_acting_player(self) -> int:
+        """Get the player whose turn it is to act.
+        
+        Returns:
+            Player ID (0-indexed)
+        """
+        return self.env._current_player_id
+    
+    def get_infoset_features(self, player_id: Optional[int] = None) -> np.ndarray:
+        """Get feature vector representation of the game state.
+        
+        Uses the ObservationBuilder to encode the observation into a flat
+        feature vector suitable for neural network input.
+        
+        Args:
+            player_id: Optional player ID to generate features from their perspective.
+                      If None, generates features for the current acting player.
+                      CRITICAL in imperfect-information games: each player's features
+                      must be generated from their own perspective, not from the
+                      perspective of another player.
+        
+        Returns:
+            Flat numpy array of shape (feature_dim,) with dtype float32
+        """
+        try:
+            # Determine target player perspective
+            pid = player_id if player_id is not None else self.get_acting_player()
+            
+            # Validate pid is an integer
+            if pid is None:
+                raise ValueError("Acting player is None - game may be in terminal state")
+            
+            # CRITICAL FIX: Fetch correct raw state for the target player
+            # ============================================================
+            # _current_state only contains the acting player's hole cards.
+            # For non-acting players, we must fetch their specific state from RLCard
+            # to avoid leaking the acting player's cards to their Q-networks.
+            acting_player = self.get_acting_player()
+            if pid == acting_player:
+                # Safe to use wrapper's current state (contains our cards)
+                raw_state = self.env._current_state
+            else:
+                # Fetch this player's state from RLCard core to prevent card leakage
+                raw_state = self.env._env.get_state(pid)
+            
+            # Build observation using the ObservationBuilder (returns tensordict with proper keys)
+            # This returns a dict with keys: hole_cards, community_cards, env_metrics, betting_history, position
+            obs_dict = self.obs_builder.build(raw_state, validate=False)
+            
+            # Flatten the observation using the observation builder
+            flat_tensor = self.obs_builder.flatten(obs_dict)
+            
+            # Convert to numpy and ensure float32
+            if hasattr(flat_tensor, 'cpu'):
+                features = flat_tensor.cpu().numpy()
+            else:
+                features = np.array(flat_tensor)
+            
+            # Ensure output is contiguous float32 array
+            return np.ascontiguousarray(features, dtype=np.float32)
+                
+        except Exception as exc:
+            logger.error(f"Failed to encode observation for player {player_id}: {exc}", exc_info=True)
+            # Fallback: return zeros
+            obs_dim = self.obs_builder.get_observation_dim()
+            return np.zeros(obs_dim, dtype=np.float32)
+    
+    def get_legal_actions(self) -> np.ndarray:
+        """Get legal action mask for current player.
+        
+        Returns:
+            Boolean array of shape (num_actions,) where True = legal, False = illegal
+        """
+        try:
+            # Get legal action indices from environment state
+            legal_action_indices = self.env._current_state.get("legal_actions", {})
+            
+            # Create boolean mask
+            # RLCard uses different action mappings, we need to convert
+            # Assume legal_action_indices is a dict or list of valid action IDs
+            if isinstance(legal_action_indices, dict):
+                legal_indices_list = list(legal_action_indices.keys())
+            elif isinstance(legal_action_indices, list):
+                legal_indices_list = legal_action_indices
+            else:
+                legal_indices_list = [0, 1]  # Fallback: fold and check
+            
+            # Create boolean array (num_actions=12 for poker)
+            num_actions = 12  # Corresponds to _FOLD through _ALL_IN
+            mask = np.zeros(num_actions, dtype=np.bool_)
+            
+            for idx in legal_indices_list:
+                if 0 <= idx < num_actions:
+                    mask[idx] = True
+            
+            logger.debug(f"Legal actions mask: {mask}")
+            return mask
+            
+        except Exception as exc:
+            logger.error(f"Failed to get legal actions: {exc}")
+            # Fallback: all actions are legal
+            num_actions = 12
+            return np.ones(num_actions, dtype=np.bool_)
+    
+    def get_action_taken(self, action_idx: int) -> "GameStateAdapter":
+        """Simulate taking an action and return new adapter for resulting state.
+        
+        This method does NOT mutate the current environment. Instead:
+        1. Saves the current environment state
+        2. Steps the action forward
+        3. Captures the new state
+        4. Restores the environment to the saved state
+        5. Returns a new adapter with the captured state
+        
+        Args:
+            action_idx: Action index (0-11 for poker)
+            
+        Returns:
+            New GameStateAdapter at child state
+            
+        Raises:
+            RuntimeError: If action is invalid or environment is terminal
+        """
+        if self.is_terminal():
+            raise RuntimeError("Cannot take action on terminal state")
+        
+        # Clamp action to valid range
+        action_idx = int(max(0, min(11, action_idx)))
+        
+        # Save current environment state
+        saved_snapshot = self.env.get_full_state()
+        
+        try:
+            # Step the action (modifies env internally)
+            next_obs, reward = self.env.step(action_idx)
+            
+            # Capture the next state's snapshot
+            next_snapshot = self.env.get_full_state()
+            
+            logger.debug(
+                f"Action {action_idx} taken by player {self.get_acting_player()}, "
+                f"reward={reward:.4f}"
+            )
+            
+            # Create new adapter for next state
+            return GameStateAdapter(
+                env=self.env,
+                obs_builder=self.obs_builder,
+                env_snapshot=next_snapshot,
+                current_obs=next_obs,
+            )
+            
+        finally:
+            # Always restore environment to pre-step state
+            self.env.set_full_state(saved_snapshot)
+            logger.debug("Environment restored to pre-action state")
+    
+    def get_reward_for_action(self, action_idx: int) -> float:
+        """Get immediate reward for taking an action.
+        
+        In poker, rewards only occur at terminal nodes.
+        Intermediate steps have zero reward.
+        
+        Args:
+            action_idx: Action index (not used, included for interface compatibility)
+            
+        Returns:
+            0.0 (no intermediate rewards in poker)
+        """
+        return 0.0
 
 
 @dataclass
@@ -106,27 +387,71 @@ class TrainingRunner:
             buffer_config or RolloutBufferConfig()
         )
         
-        # [PHASE 2.5B] Algorithm selection: Only CFR is now supported (PPO removed)
+        # [PHASE 4] VR-DeepPDCFR+ Initialization
         yaml_config = yaml_config or {}
-        cfr_cfg = yaml_config.get("cfr", {})
-        training_algorithm = cfr_cfg.get("training_algorithm", "cfr")
         
-        if training_algorithm != "cfr":
-            raise ValueError(
-                f"PPOTrainer has been removed during native integration. "
-                f"Only 'cfr' training algorithm is now supported, got: {training_algorithm}"
-            )
-        
-        # [PHASE 2.5B] Instantiate Deep CFR engine
-        cfr_config = CFRConfig.from_dict(yaml_config)
-        # [PHASE 3] Pass dynamic obs_dim from observation builder
-        # [FIX] Also pass num_actions from the network config
+        # Determine number of players from environment
+        num_players = getattr(env, "_num_players", 2)
         obs_dim = obs_builder.get_observation_dim()
         num_actions = network.config.num_actions if hasattr(network, 'config') else 9
-        self.trainer = CFREngine(
-            cfr_config, network, self.device, obs_dim=obs_dim, num_actions=num_actions
+        
+        logger.info(
+            "[PHASE 4] Initializing VR-DeepPDCFR+ with %d players, "
+            "obs_dim=%d, num_actions=%d",
+            num_players, obs_dim, num_actions,
         )
-        self.cfr_adapter = CFRTrajectoryAdapter()
+        
+        # Create per-player buffer managers
+        buffer_managers: dict[int, BufferManager] = {}
+        for player_id in range(num_players):
+            buffer_managers[player_id] = BufferManager(
+                advantage_capacity=yaml_config.get("buffer", {}).get("advantage_capacity", 100_000),
+                strategy_capacity=yaml_config.get("buffer", {}).get("strategy_capacity", 1_000_000),
+                time_decay_power=yaml_config.get("buffer", {}).get("time_decay_power", 1.0),
+            )
+        
+        # Create per-player network bundles
+        networks: dict[int, VRDeepPDCFRNetworks] = {}
+        for player_id in range(num_players):
+            networks[player_id] = VRDeepPDCFRNetworks(
+                input_dim=obs_dim,
+                output_dim=num_actions,
+                hidden_dims=yaml_config.get("network", {}).get("hidden_dims", [256, 128]),
+                activation=yaml_config.get("network", {}).get("activation", torch.nn.ReLU),
+                use_layer_norm=yaml_config.get("network", {}).get("use_layer_norm", False),
+                dropout_p=yaml_config.get("network", {}).get("dropout_p", 0.0),
+            )
+        
+        # Create per-player optimizers (4 networks per player)
+        lr = yaml_config.get("optimizer", {}).get("learning_rate", 1e-3)
+        optimizers: dict[int, dict[str, optim.Optimizer]] = {}
+        for player_id in range(num_players):
+            optimizers[player_id] = {
+                "cumulative": optim.Adam(
+                    networks[player_id].cumulative_advantage.parameters(),
+                    lr=lr,
+                ),
+                "instantaneous": optim.Adam(
+                    networks[player_id].instantaneous_advantage.parameters(),
+                    lr=lr,
+                ),
+                "value": optim.Adam(
+                    networks[player_id].value.parameters(),
+                    lr=lr,
+                ),
+                "strategy": optim.Adam(
+                    networks[player_id].strategy.parameters(),
+                    lr=lr,
+                ),
+            }
+        
+        # [PHASE 4] Instantiate VR-DeepPDCFR+ Engine
+        self.trainer = VRDeepPDCFREngine(
+            buffer_managers=buffer_managers,
+            networks=networks,
+            optimizers=optimizers,
+            device=self.device,
+        )
         
         self.collector: RolloutCollector = RolloutCollector(
             network=network,
@@ -329,17 +654,11 @@ class TrainingRunner:
     def _run_single_iteration(self) -> dict[str, float]:
         """Vegrehajt egyetlen training iteraciot.
 
-        [FIX C1] A bootstrap ertek szamitasanak javitasa:
-            REGI (eltavolitott):
-                last_value = self.collector.get_last_bootstrap_value(self.network)
-                self.buffer.compute_gae(last_value=last_value)
-            ÚJ (helyes):
-                # A collector.collect_rollout() mar atomikusan beallitotta
-                # a buffer._last_bootstrap_value-t a rollout vegen.
-                self.buffer.compute_gae(last_value=self.buffer.get_last_bootstrap_value())
-            Ez megszunteti a race conditiont: a buffer garantaltan a HELYES,
-            truncated allapothoz tartozo V(s_T)-t tarolja, nem egy lepessessel
-            kesobb szamolt kozelitest.
+        [PHASE 4] VR-DeepPDCFR+ Iteration Lifecycle:
+            1. start_iteration() : Clear ephemeral buffers, set networks to training mode
+            2. traverse()        : Recursively traverse game tree, compute advantages
+            3. train_networks()  : Gradient descent on all 4 networks per player
+            4. end_iteration()   : Increment iteration counter, update frozen networks
 
         Returns:
             Dict az iteracio statisztikaival.
@@ -348,69 +667,123 @@ class TrainingRunner:
             FloatingPointError: NaN/Inf a loss-ban.
             RuntimeError: Dimenzio mismatch vagy matematikai inkonzisztencia.
         """
-        # 1. Adatgyujtes — matematikai hibak itt is elofordulhatnak
+        # =====================================================================
+        # STEP 1: Initialize VR-DeepPDCFR+ Iteration
+        # =====================================================================
         try:
-            collect_stats = self.collector.collect_rollout(
-                n_steps=self.buffer.config.buffer_size
-            )
+            self.trainer.start_iteration()
         except (RuntimeError, ValueError) as exc:
             logger.error(
-                "MATEMATIKAI HIBA az adatgyujtesben (iter #%d): %s",
+                "HIBA a start_iteration()-ben (iter #%d): %s",
                 self.iteration, exc,
             )
             raise
 
-        # 2. GAE szamitasa — [FIX C1] a buffer-bol olvassuk a bootstrap erteket
+        # =====================================================================
+        # STEP 2: Traverse Game Tree for Each Player (External Sampling MCCFR)
+        # =====================================================================
+        # [PHASE 4] External Sampling MCCFR: For N-player games, we call traverse()
+        # once per player. For the updating_player, we enumerate all actions at their
+        # decision nodes (full counterfactual regret). For other players, we sample
+        # a single action and traverse only that branch (external sampling).
+        # This makes the algorithm tractable for large games like 6-Max NLHE (~10^161 nodes).
+        
+        num_players = len(self.trainer.buffer_managers)
+        all_traverse_values = []
+        
         try:
-            # A bootstrap erteket a collector.collect_rollout() mar atomikusan
-            # tarolta a bufferben. Nincs szukseg ujra-szamolasra.
-            bootstrap_value = self.buffer.get_last_bootstrap_value()
             logger.debug(
-                "GAE szamitas indul: bootstrap_value=%.6f (iter #%d)",
-                bootstrap_value, self.iteration,
+                "Starting External Sampling MCCFR traversal: "
+                "num_players=%d, iter=%d",
+                num_players,
+                self.iteration,
             )
-            self.buffer.compute_gae(last_value=bootstrap_value)
+            
+            for updating_player in range(num_players):
+                # Reset environment for this player's traversal
+                root_obs = self.env.reset()
+                
+                # Wrap in GameStateAdapter for VR-DeepPDCFR+ interface
+                root_state = GameStateAdapter(
+                    env=self.env,
+                    obs_builder=self.obs_builder,
+                    current_obs=root_obs,
+                )
+                
+                # Initialize reach probabilities: all players at 1.0
+                initial_reach_probs = {i: 1.0 for i in range(num_players)}
+                
+                logger.debug(
+                    "Traversing game tree for updating_player=%d (iter #%d)",
+                    updating_player, self.iteration,
+                )
+                
+                # Execute game tree traversal with External Sampling MCCFR
+                # - For updating_player: enumerate all actions, store advantages in buffer
+                # - For other players: sample one action, traverse that branch only
+                traverse_values = self.trainer.traverse(
+                    root_state, 
+                    initial_reach_probs, 
+                    updating_player=updating_player
+                )
+                
+                all_traverse_values.append(traverse_values)
+                
+                logger.debug(
+                    "Game tree traversal complete for updating_player=%d: values=%s",
+                    updating_player, traverse_values,
+                )
+            
         except (RuntimeError, ValueError) as exc:
             logger.error(
-                "HIBA a GAE szamitasaban (iter #%d): %s",
+                "HIBA a game tree traversal-ben (iter #%d): %s",
                 self.iteration, exc,
             )
             raise
 
-        # 3. PPO/CFR Gradiens frissites — NaN/Inf detektalas
+        # =====================================================================
+        # STEP 3: Train Networks on Buffered Data
+        # =====================================================================
         try:
-            # [PHASE 2.5B] Dispatch based on training algorithm
-            if isinstance(self.trainer, CFREngine):
-                # Deep CFR path: convert buffer to CFR trajectories and train
-                train_stats: dict[str, float] = self._train_cfr_step()
-            else:
-                # PPO path (backward compatible)
-                train_stats: dict[str, float] = self.trainer.train_on_buffer(self.buffer)
-
-            for key in ("policy_loss", "value_loss", "total_loss", "cfr_loss"):
-                loss_val: float = train_stats.get(key, 0.0)
+            train_stats = self.trainer.train_networks()
+            
+            # Validate loss values for NaN/Inf
+            for loss_key in ("cumulative_loss", "instantaneous_loss", "value_loss", "strategy_loss"):
+                loss_val = train_stats.get(loss_key, 0.0)
                 if loss_val != loss_val or abs(loss_val) == float("inf"):
                     raise FloatingPointError(
-                        f"KRITIKUS: {key}={loss_val} (NaN/Inf) detektalva "
+                        f"KRITIKUS: {loss_key}={loss_val} (NaN/Inf) detektalva "
                         f"az iteracio #{self.iteration}-ban!"
                     )
-
+            
         except FloatingPointError:
             raise
         except (RuntimeError, ValueError) as exc:
             logger.error(
-                "MATEMATIKAI HIBA a training lepesben (iter #%d): %s",
+                "HIBA a network training-ben (iter #%d): %s",
                 self.iteration, exc,
             )
             raise
 
-        # 4. Osszesitett statisztikak
+        # =====================================================================
+        # STEP 4: Finalize Iteration & Update Frozen Networks
+        # =====================================================================
+        try:
+            self.trainer.end_iteration()
+        except (RuntimeError, ValueError) as exc:
+            logger.error(
+                "HIBA az end_iteration()-ben (iter #%d): %s",
+                self.iteration, exc,
+            )
+            raise
+
+        # =====================================================================
+        # Compile Iteration Statistics
+        # =====================================================================
         iter_stats: dict[str, float] = {
             "iteration": float(self.iteration),
-            **{f"collect/{k}": v for k, v in collect_stats._asdict().items()},
             **{f"train/{k}": v for k, v in train_stats.items()},
             "elapsed_hours": (time.monotonic() - self._start_time) / 3600,
-            "bootstrap_value": bootstrap_value,  # diagnosztika
         }
 
         # 5. Orchestrator callback
@@ -433,39 +806,6 @@ class TrainingRunner:
         self.buffer.reset()
 
         return iter_stats
-
-    # =========================================================================
-    # [PHASE 2.5B] Deep CFR Training Step
-    # =========================================================================
-
-    def _train_cfr_step(self) -> dict[str, float]:
-        """
-        Converts buffer to CFR trajectories and trains regret/strategy networks.
-        
-        Flow:
-            1. Get mini-batches from buffer
-            2. Convert each batch to CFR trajectory format via adapter
-            3. Accumulate all trajectories
-            4. Call CFREngine.train_on_rollouts() with full trajectory list
-        
-        Returns:
-            Training stats dict with CFR-specific metrics
-        """
-        all_trajectories = []
-        
-        # Iterate through mini-batches from buffer
-        for batch in self.buffer.get_mini_batches():
-            # Convert PPO batch format to CFR trajectory format
-            trajectories = self.cfr_adapter.batch_to_cfr_trajectories(batch)
-            all_trajectories.extend(trajectories)
-        
-        # Train CFR networks on accumulated trajectories
-        if not all_trajectories:
-            logger.warning("No trajectories generated for CFR training")
-            return {"cfr_loss": 0.0, "avg_regret": 0.0}
-        
-        train_stats = self.trainer.train_on_rollouts(all_trajectories)
-        return train_stats
 
     # =========================================================================
     # Checkpoint Kezeles
