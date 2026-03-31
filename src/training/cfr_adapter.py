@@ -188,10 +188,8 @@ class CFRTrajectoryAdapter:
             idx: Batch index
         
         Returns:
-            Unique infoset identifier string
+            Unique infoset identifier (as bytes for RegretStore)
         """
-        from src.training.cfr_infoset import hash_infoset
-        
         # Extract actual cards from observation tensors (FIXED from hardcoded "A", "K")
         hero_cards = self._extract_cards(obs_dicts, idx, "hero")
         board_cards = self._extract_cards(obs_dicts, idx, "board")
@@ -205,12 +203,18 @@ class CFRTrajectoryAdapter:
             action_count = int(betting_hist_tensor.nonzero().shape[0] / 13)
             action_history = tuple(str(i) for i in range(action_count))  # String actions
         
-        return hash_infoset(
-            player=0,  # Always hero in our setup (training poker player)
-            hole_cards=hero_cards,
-            board_cards=board_cards,
-            action_history=action_history,
-        )
+        # Generate bytes key natively (canonical format from regret_store.py)
+        parts = [
+            str(0),  # Always hero in our setup (training poker player)
+            "|",
+            ",".join(sorted(hero_cards)),
+            "|",
+            ",".join(board_cards),
+            "|",
+            ",".join(action_history),
+        ]
+        canonical = "".join(parts)
+        return canonical.encode("utf-8")
     
     def _decode_card_tensor(self, card_tensor: torch.Tensor) -> tuple[str, ...]:
         """

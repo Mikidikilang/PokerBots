@@ -52,6 +52,7 @@ import multiprocessing as mp
 import time
 import zlib
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -60,7 +61,7 @@ import torch
 from src.env.wrappers import RLCardWrapper, WrapperConfig
 from src.model.networks import PokerActorCritic, NetworkConfig
 from src.training.cfr_traversal import MCCFRTraversal
-from src.training.cfr_infoset import InformationSetStorage
+from src.training.regret_store import RegretStore
 
 logger = logging.getLogger(__name__)
 
@@ -419,7 +420,9 @@ def _worker_process(
     device = torch.device("cpu")
     try:
         env = RLCardWrapper(config=WrapperConfig(num_players=2))
-        infoset_storage = InformationSetStorage()
+        infoset_storage = RegretStore(
+            base_dir=Path(__file__).parent.parent.parent / "regrets",
+        )
         network = PokerActorCritic()
         network.eval()
         network.to(device)

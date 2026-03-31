@@ -30,7 +30,7 @@ import torch
 
 from src.training.buffer import RolloutBuffer, RolloutBufferConfig
 from src.training.collector import RolloutCollector
-from src.training.trainer import PPOTrainer, TrainerConfig
+# from src.training.trainer import PPOTrainer, TrainerConfig  # [DEPRECATED] Removed during native integration
 from src.training.cfr_adapter import CFRTrajectoryAdapter  # [PHASE 2.5B] CFR support
 from src.training.cfr_engine import CFREngine, CFRConfig    # [PHASE 2.5B] CFR support
 from src.evaluation.nash_evaluator import LocalBestResponseEvaluator, NashEvalConfig  # [PHASE 6] Oracle evaluation
@@ -85,7 +85,7 @@ class TrainingRunner:
         env: Any,
         obs_builder: Any,
         network: Any,
-        trainer_config: TrainerConfig | None = None,
+        trainer_config: Any | None = None,  # [DEPRECATED] No longer used (PPOTrainer removed)
         buffer_config: RolloutBufferConfig | None = None,
         yaml_config: dict[str, Any] | None = None,
         on_iteration_end: Callable[[int, dict[str, float]], None] | None = None,
@@ -106,29 +106,27 @@ class TrainingRunner:
             buffer_config or RolloutBufferConfig()
         )
         
-        # [PHASE 2.5B] Algorithm selection: PPO (legacy) vs CFR (new)
+        # [PHASE 2.5B] Algorithm selection: Only CFR is now supported (PPO removed)
         yaml_config = yaml_config or {}
         cfr_cfg = yaml_config.get("cfr", {})
-        training_algorithm = cfr_cfg.get("training_algorithm", "ppo")
+        training_algorithm = cfr_cfg.get("training_algorithm", "cfr")
         
-        if training_algorithm == "cfr":
-            # [PHASE 2.5B] Instantiate Deep CFR engine
-            cfr_config = CFRConfig.from_dict(yaml_config)
-            # [PHASE 3] Pass dynamic obs_dim from observation builder
-            # [FIX] Also pass num_actions from the network config
-            obs_dim = obs_builder.get_observation_dim()
-            num_actions = network.config.num_actions if hasattr(network, 'config') else 9
-            self.trainer: CFREngine | PPOTrainer = CFREngine(
-                cfr_config, network, self.device, obs_dim=obs_dim, num_actions=num_actions
+        if training_algorithm != "cfr":
+            raise ValueError(
+                f"PPOTrainer has been removed during native integration. "
+                f"Only 'cfr' training algorithm is now supported, got: {training_algorithm}"
             )
-            self.cfr_adapter = CFRTrajectoryAdapter()
-        else:
-            # Backward compatible: default to PPO training
-            self.trainer: CFREngine | PPOTrainer = PPOTrainer(
-                trainer_config or TrainerConfig(),
-                network, self.device,
-            )
-            self.cfr_adapter = None
+        
+        # [PHASE 2.5B] Instantiate Deep CFR engine
+        cfr_config = CFRConfig.from_dict(yaml_config)
+        # [PHASE 3] Pass dynamic obs_dim from observation builder
+        # [FIX] Also pass num_actions from the network config
+        obs_dim = obs_builder.get_observation_dim()
+        num_actions = network.config.num_actions if hasattr(network, 'config') else 9
+        self.trainer = CFREngine(
+            cfr_config, network, self.device, obs_dim=obs_dim, num_actions=num_actions
+        )
+        self.cfr_adapter = CFRTrajectoryAdapter()
         
         self.collector: RolloutCollector = RolloutCollector(
             network=network,

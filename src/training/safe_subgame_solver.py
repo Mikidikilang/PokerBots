@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -56,7 +57,7 @@ import torch
 import torch.nn as nn
 
 from src.training.cfr_traversal import MCCFRTraversal
-from src.training.cfr_infoset import InformationSetStorage
+from src.training.regret_store import RegretStore
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +167,9 @@ class SafeSubgameSolver:
         self.device = device
         
         # CFR infrastructure
-        self.infoset_storage = InformationSetStorage()
+        self.infoset_storage = RegretStore(
+            base_dir=Path(__file__).parent.parent.parent / "regrets",
+        )
         self.cfr_traversal = None  # Created per solve() call
         
         # State during solving
@@ -388,31 +391,26 @@ class SafeSubgameSolver:
         Returns the cumulative regrets for this hand from the traversal.
         """
         try:
-            # Get the infoset ID for this hand/board configuration
-            from src.training.cfr_infoset import hash_infoset
-            
             hero_cards = tuple(hero_hand)  # 'AA' → ('A', 'A')
-            infoset_id = hash_infoset(
+            
+            # Generate infoset key using RegretStore's canonical format
+            infoset_bytes = self.infoset_storage.infoset_key(
                 player=0,
                 hole_cards=hero_cards,
                 board_cards=board,
                 action_history=(),  # Empty history (root decision point)
             )
             
-            # Retrieve the infoset
-            infoset = self.infoset_storage.get_infoset(infoset_id)
+            # Retrieve raw regrets for this infoset
+            regrets = self.infoset_storage.get_regrets(infoset_bytes)
             
-            if infoset is None:
-                logger.warning(f"Infoset not found for {hero_hand} on {board}, returning zero regrets")
-                return {0: 0.0, 1: 0.0, 2: 0.0}
-            
-            # Extract cumulative regrets for actions 0, 1, 2
-            regrets = {}
+            # Extract regrets for actions 0, 1, 2 (fold, call, raise)
+            result = {}
             for action in range(3):
-                regrets[action] = infoset.cumulative_regret.get(action, 0.0)
+                result[action] = float(regrets[action]) if action < len(regrets) else 0.0
             
-            logger.debug(f"Extracted regrets for {hero_hand}: {regrets}")
-            return regrets
+            logger.debug(f"Extracted regrets for {hero_hand}: {result}")
+            return result
             
         except Exception as e:
             logger.error(f"Error in _extract_pair_regrets: {e}", exc_info=True)

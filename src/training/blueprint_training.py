@@ -27,7 +27,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from .cfr_engine import CFREngine
-from .trainer import CFRTrainer
+# from .trainer import CFRTrainer  # [DEPRECATED] Removed during native integration
 from .exploitability import SamplingBasedExploitabilityMeasurer, ExploitabilityResult
 
 logger = logging.getLogger(__name__)
@@ -282,15 +282,11 @@ class BlueprintTrainingHarness:
         # Stub: would create based on config
         return CFREngine()
     
-    def _create_trainer(self) -> CFRTrainer:
+    def _create_trainer(self):
         """Create neural network trainer."""
-        # Stub: would create based on config
-        return CFRTrainer(
-            strategy_network=self.strategy_network,
-            num_workers=self.config.num_workers,
-            batch_size=self.config.batch_size,
-            learning_rate=self.config.learning_rate,
-        )
+        # Stub: CFRTrainer was removed during native integration
+        # Would create based on config when needed
+        return None
     
     def _run_cfr_iteration(self, iteration: int) -> float:
         """Run one CFR iteration with traversals. Returns regret."""

@@ -423,9 +423,8 @@ class MCCFRTraversal:
             return torch.cat([t.cpu() if t.device.type != "cpu" else t for t in tensors], dim=0)
         return torch.tensor([], dtype=torch.float32)
 
-    def _get_infoset_id(self, state: dict[str, Any], player: int) -> str:
-        from src.training.cfr_infoset import hash_infoset
-
+    def _get_infoset_id(self, state: dict[str, Any], player: int) -> bytes:
+        """Generate infoset key using canonical format (bytes)."""
         hole_cards = self._decode_card_tensor(
             state.get("hole_cards", torch.zeros(52))
         )
@@ -434,8 +433,20 @@ class MCCFRTraversal:
         board_cards = self._decode_card_tensor(
             state.get("community_cards", torch.zeros(52))
         )
-        action_history = ()
-        return hash_infoset(player, hole_cards, board_cards, action_history)
+        action_history = tuple(state.get("action_history", []))
+        
+        # Generate bytes key using the same canonical format as regret_store.py
+        parts = [
+            str(player),
+            "|",
+            ",".join(sorted(hole_cards)),
+            "|",
+            ",".join(board_cards),
+            "|",
+            ",".join(action_history),
+        ]
+        canonical = "".join(parts)
+        return canonical.encode("utf-8")
 
     def _decode_card_tensor(self, card_tensor: torch.Tensor) -> tuple[str, ...]:
         RANK_NAMES = ["2", "3", "4", "5", "6", "7", "8", "9", "T", "J", "Q", "K", "A"]

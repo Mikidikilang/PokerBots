@@ -55,13 +55,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
 
+from pathlib import Path
+
 from .cfr_valuator import compute_counterfactual_values, GameNode, compute_value_targets
-from .cfr_infoset import InformationSetStorage, hash_infoset
+from .regret_store import RegretStore
 from .cfr_traversal import MCCFRTraversal, ExternalSamplingMCCFR
 from .cfr_buffer import RegretBuffer, RegretValueNetwork, RegretNetworkTrainer
 from .cfr_strategy import (
@@ -251,8 +254,12 @@ class CFREngine:
             eps=config.adam_epsilon,
         )
         
-        # Use InformationSetStorage for managing infosets and regrets
-        self.infoset_storage = InformationSetStorage()
+        # Use RegretStore for managing infosets and regrets (production-grade memory-mapped storage)
+        self.regret_store = RegretStore(
+            base_dir=Path(__file__).parent.parent.parent / "regrets",
+            n_shards=256,
+            max_hot_shards=32,
+        )
         
         # Legacy infosets dict (kept for backward compatibility with get_policy)
         self.infosets: dict[str, InformationSet] = {}
