@@ -248,9 +248,36 @@ class VRDeepPDCFRTrainer:
         logger.info("Starting VR-DeepPDCFR+ Training Loop")
         logger.info("=" * 80)
         
+        # ITEM 11: Extract curriculum configuration
+        curriculum_config = self.config.get("curriculum", {})
+        curriculum_phases = curriculum_config.get("phases", [
+            {"name": "Phase 1: Exploration", "iter_pct": (0, 0.20)},
+            {"name": "Phase 2: Development", "iter_pct": (0.20, 0.80)},
+            {"name": "Phase 3: Refinement", "iter_pct": (0.80, 1.00)},
+        ])
+        current_curriculum_phase = None
+        
         try:
             for iteration in range(1, self.total_iterations + 1):
                 self.current_iteration = iteration
+                
+                # ITEM 11: Determine current curriculum phase
+                iter_pct = (iteration - 1) / max(1, self.total_iterations - 1)
+                next_phase = None
+                for phase in curriculum_phases:
+                    phase_name = phase.get("name", "Unknown")
+                    iter_min, iter_max = phase.get("iter_pct", (0, 1))
+                    if iter_min <= iter_pct < iter_max:
+                        next_phase = phase_name
+                        break
+                
+                # Log phase transitions
+                if next_phase != current_curriculum_phase:
+                    current_curriculum_phase = next_phase
+                    logger.info(f"=" * 80)
+                    logger.info(f"CURRICULUM PHASE CHANGE: {current_curriculum_phase}")
+                    logger.info(f"Progress: {iter_pct*100:.1f}% ({iteration}/{self.total_iterations} iterations)")
+                    logger.info(f"=" * 80)
                 
                 # Log iteration start
                 logger.info(f"Iteration {iteration}/{self.total_iterations} - Starting")

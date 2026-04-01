@@ -306,6 +306,15 @@ class VRDeepPDCFREngine:
         Returns:
             Dict[player_id] -> expected value from this state
         """
+        # SAFETY CHECK: Prevent infinite recursion
+        if depth > 200:  # Absolute failsafe (should never hit max_depth)
+            logger.error(f"CRITICAL: Depth limit EXCEEDS 200! depth={depth}, max_depth={self.max_depth}")
+            logger.error("This indicates infinite recursion in game tree traversal.")
+            logger.error("Probable causes: get_action_taken() not properly advancing game state,")
+            logger.error("               or is_terminal()/is_chance_node() always returning False.")
+            # Return zero value to exit recursion
+            return {p: 0.0 for p in self.networks.keys()}
+        
         # BASE CASE: Terminal node
         if state.is_terminal():
             payoffs = state.get_terminal_payoffs()

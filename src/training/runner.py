@@ -161,13 +161,16 @@ class GameStateAdapter:
         In external sampling MCCFR, we sample exactly ONE outcome at chance nodes.
         For RLCard poker, this means advancing the street and dealing cards.
         
+        CRITICAL: This method MUST restore the environment to its pre-call state
+        to prevent infinite loops in traversal. Uses save/restore pattern like get_action_taken().
+        
         Returns:
             New GameStateAdapter with the sampled cards at the next street
         """
+        # Save current environment state BEFORE any modifications
+        saved_snapshot = self.env.get_full_state()
+        
         try:
-            # Save current environment snapshot
-            snapshot_before = self.env.get_full_state()
-            
             # RLCard advances to the next street internally when we call step()
             # with any valid action during chance/transition. We step with
             # the first legal action (or 0 if none available), which causes
@@ -176,31 +179,37 @@ class GameStateAdapter:
             action_id = min(legal_actions.keys()) if legal_actions else 0
             
             # Step the environment - this applies the chance event (card dealing)
-            try:
-                raw_result = self.env._env.step(action_id)
-                next_state, next_player = self.env._unpack_step(raw_result)
-                self.env._current_player_id = next_player
-                self.env._current_state = next_state
-                self.env._terminal = bool(self.env._env.is_over())
-            except Exception:
-                # If step fails, restore and re-raise
-                self.env.set_full_state(snapshot_before)
-                raise
+            raw_result = self.env._env.step(action_id)
+            next_state, next_player = self.env._unpack_step(raw_result)
+            self.env._current_player_id = next_player
+            self.env._current_state = next_state
+            self.env._terminal = bool(self.env._env.is_over())
+            
+            # Capture the new state AFTER stepping
+            next_snapshot = self.env.get_full_state()
+            new_obs = self.env._build_obs_dict(next_state, next_player)
+            
+            logger.debug(f"Chance node: sampled card dealing, next player={next_player}")
             
             # Create and return a new adapter with the sampled state
-            new_obs = self.env._build_obs_dict(next_state, next_player)
             child_adapter = GameStateAdapter(
                 env=self.env,
                 obs_builder=self.obs_builder,
-                env_snapshot=self.env.get_full_state(),
+                env_snapshot=next_snapshot,
                 current_obs=new_obs,
             )
             
             return child_adapter
+            
         except Exception as exc:
-            logger.warning(f"Failed to sample chance outcome: {exc}")
+            logger.warning(f"Failed to sample chance outcome: {exc}", exc_info=True)
             # Fallback: return self unchanged
             return self
+        finally:
+            # CRITICAL: Always restore environment to pre-call state
+            # This ensures traversal can continue without state pollution
+            self.env.set_full_state(saved_snapshot)
+            logger.debug("Environment restored after chance node sampling")
     
     def get_chance_outcomes(self) -> list[tuple[Any, float]]:
         """Get stochastic outcomes at chance node (deprecated; use sample_chance_outcome).
@@ -237,6 +246,10 @@ class GameStateAdapter:
         
         Returns:
             Flat numpy array of shape (feature_dim,) with dtype float32
+            
+        ITEM 10 FIX: Enforces strict per-player state isolation.
+        Each player's observation is built from RLCard's get_state(player_id),
+        preventing card leakage between players' Q-networks.
         """
         try:
             # Determine target player perspective
@@ -246,18 +259,13 @@ class GameStateAdapter:
             if pid is None:
                 raise ValueError("Acting player is None - game may be in terminal state")
             
-            # CRITICAL FIX: Fetch correct raw state for the target player
-            # ============================================================
-            # _current_state only contains the acting player's hole cards.
-            # For non-acting players, we must fetch their specific state from RLCard
-            # to avoid leaking the acting player's cards to their Q-networks.
-            acting_player = self.get_acting_player()
-            if pid == acting_player:
-                # Safe to use wrapper's current state (contains our cards)
-                raw_state = self.env._current_state
-            else:
-                # Fetch this player's state from RLCard core to prevent card leakage
-                raw_state = self.env._env.get_state(pid)
+            # ITEM 10 FIX: Fetch correct raw state for the target player
+            # ===========================================================
+            # CRITICAL: Always use self.env._env.get_state(pid) to fetch player-specific state.
+            # This prevents leaking cards from one player's hole cards to another player's networks.
+            # RLCard's get_state(player_id) returns ONLY what that player can see,
+            # excluding opponent hole cards.
+            raw_state = self.env._env.get_state(pid)
             
             # Build observation using the ObservationBuilder (returns tensordict with proper keys)
             # This returns a dict with keys: hole_cards, community_cards, env_metrics, betting_history, position
