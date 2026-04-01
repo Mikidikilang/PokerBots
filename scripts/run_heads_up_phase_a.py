@@ -125,7 +125,7 @@ class HeadsUpNashConvergenceTester:
     
     def _load_config(self) -> Dict[str, Any]:
         """Load YAML configuration."""
-        with open(self.config_path, "r") as f:
+        with open(self.config_path, "r", encoding="utf-8") as f:
             return yaml.safe_load(f)
     
     def _setup_logging(self):
@@ -252,13 +252,14 @@ class HeadsUpNashConvergenceTester:
             
             for iteration in range(1, self.total_iterations + 1):
                 self.current_iteration = iteration
+                logger.info(f"Starting Iteration {iteration}/{self.total_iterations}")
                 
                 # Start iteration
                 self.engine.start_iteration()
                 
                 # External Sampling MCCFR: multiple traversals per iteration
                 traversals_per_iter = self.config["cfr"].get("traversals_per_iteration", 100)
-                for _ in range(traversals_per_iter):
+                for trav_idx in range(traversals_per_iter):
                     for updating_player in range(self.num_players):
                         # Fresh environment reset for each traversal
                         self.env.reset()
@@ -268,13 +269,20 @@ class HeadsUpNashConvergenceTester:
                         initial_reach_probs = {i: 1.0 for i in range(self.num_players)}
                         
                         # Execute traversal
-                        values = self.engine.traverse(
-                            state=root_state,
-                            player_reach_probs=initial_reach_probs,
-                            updating_player=updating_player,
-                            depth=0,
-                        )
+                        logger.info(f"Iter {iteration}: Traversal {trav_idx+1}/{traversals_per_iter}, Player {updating_player}")
+                        try:
+                            values = self.engine.traverse(
+                                state=root_state,
+                                player_reach_probs=initial_reach_probs,
+                                updating_player=updating_player,
+                                depth=0,
+                            )
+                            logger.info(f"Iter {iteration}: Traversal {trav_idx+1} completed, values={values}")
+                        except Exception as e:
+                            logger.error(f"Traversal failed: {e}", exc_info=True)
+                            raise
                 
+                # Train all networks
                 # Train all networks
                 batch_size = self.config["cfr"].get("batch_size", 4096)
                 num_epochs = self.config["cfr"].get("num_network_epochs", 4)

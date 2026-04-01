@@ -422,6 +422,8 @@ class VRDeepPDCFREngine:
                 # Update reach probabilities
                 new_reach_probs = dict(player_reach_probs)
                 new_reach_probs[acting_player] *= predictive_strategy[action_idx]
+                # Clamp to avoid numerical underflow to exactly 0.0
+                new_reach_probs[acting_player] = max(new_reach_probs[acting_player], 1e-10)
                 
                 # Recursively traverse ALL actions unconditionally
                 # CRITICAL: In External Sampling MCCFR, we must explore every legal action
@@ -498,6 +500,8 @@ class VRDeepPDCFREngine:
             # Update reach probabilities for the sampled action
             new_reach_probs = dict(player_reach_probs)
             new_reach_probs[acting_player] *= predictive_strategy[sampled_action_idx]
+            # Clamp to avoid numerical underflow to exactly 0.0
+            new_reach_probs[acting_player] = max(new_reach_probs[acting_player], 1e-10)
             
             # Recursively traverse ONLY the sampled branch
             child_values = self.traverse(child_state, new_reach_probs, updating_player, depth=depth + 1)
