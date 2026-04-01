@@ -70,6 +70,7 @@ import torch.nn.functional as F
 from torch.optim import Optimizer
 
 from src.training.buffers import BufferManager, Transition
+from src.training.dcfr_params import compute_dcfr_discount, DCFRParameters
 from src.model.networks import VRDeepPDCFRNetworks
 
 logger = logging.getLogger(__name__)
@@ -193,6 +194,7 @@ class VRDeepPDCFREngine:
         optimizers: Dict[int, Dict[str, Optimizer]],
         device: torch.device = torch.device("cpu"),
         max_depth: int = 10,
+        dcfr_params: Optional[DCFRParameters] = None,
     ) -> None:
         """Initialize VR-DeepPDCFR+ engine.
         
@@ -209,6 +211,7 @@ class VRDeepPDCFREngine:
             max_depth: Maximum depth for game tree traversal. When depth >= max_depth,
                       return estimated values from Q networks instead of continuing traversal.
                       Prevents infinite recursion on large games like 6-Max NLHE.
+            dcfr_params: DCFR parameters for loss weighting (default: standard Brown & Sandholm 2019)
         """
         self.buffer_managers = buffer_managers
         self.networks = networks
@@ -217,13 +220,21 @@ class VRDeepPDCFREngine:
         self.current_iteration = 1
         self.max_depth = max_depth
         
+        # Initialize DCFR parameters for loss weighting
+        self.dcfr_params = dcfr_params or DCFRParameters(
+            alpha=1.5,
+            beta=0.0,
+            gamma=2.0
+        )
+        
         # Move all networks to device
         for player_id, net_bundle in self.networks.items():
             net_bundle.to_device(device)
         
         logger.info(
             f"VRDeepPDCFREngine initialized: {len(networks)} players, "
-            f"device={device}"
+            f"device={device}, DCFR params: alpha={self.dcfr_params.alpha}, "
+            f"beta={self.dcfr_params.beta}, gamma={self.dcfr_params.gamma}"
         )
     
     def start_iteration(self) -> None:
@@ -319,18 +330,22 @@ class VRDeepPDCFREngine:
             logger.debug(f"Estimated values at depth limit: {estimated_values}")
             return estimated_values
         
-        # CHANCE NODE: Stochastic transition
+        # CHANCE NODE: Stochastic transition (External Sampling MCCFR)
         if state.is_chance_node():
-            outcomes = state.get_chance_outcomes()
-            expected_values = {player_id: 0.0 for player_id in self.networks.keys()}
+            # External Sampling: sample exactly ONE chance outcome, not all
+            # This is mathematically correct for External Sampling MCCFR:
+            # we explore the sampled branch with importance weighting
+            logger.debug(f"Chance node at depth {depth}: sampling one outcome")
             
-            for outcome_state, outcome_prob in outcomes:
-                child_values = self.traverse(outcome_state, player_reach_probs, updating_player, depth=depth + 1)
-                for player_id in expected_values.keys():
-                    expected_values[player_id] += outcome_prob * child_values[player_id]
+            child_state = state.sample_chance_outcome()
             
-            logger.debug(f"Chance node: expected_values={expected_values}")
-            return expected_values
+            # Recursively traverse the sampled branch
+            # No reach probability weighting for chance: reach stays the same
+            # (chance events don't have player reach probabilities)
+            child_values = self.traverse(child_state, player_reach_probs, updating_player, depth=depth + 1)
+            
+            logger.debug(f"Chance node: traversed sampled branch, values={child_values}")
+            return child_values
         
         # PLAYER NODE: Decision point
         acting_player = state.get_acting_player()
@@ -408,15 +423,13 @@ class VRDeepPDCFREngine:
                 new_reach_probs = dict(player_reach_probs)
                 new_reach_probs[acting_player] *= predictive_strategy[action_idx]
                 
-                # Recursively traverse (only if reach probability is non-negligible)
-                if new_reach_probs[acting_player] > 1e-10:
-                    child_values = self.traverse(child_state, new_reach_probs, updating_player, depth=depth + 1)
-                    action_values[action_idx] = child_values
-                else:
-                    # Zero-reach subtree: skip traversal
-                    action_values[action_idx] = {
-                        player_id: 0.0 for player_id in self.networks.keys()
-                    }
+                # Recursively traverse ALL actions unconditionally
+                # CRITICAL: In External Sampling MCCFR, we must explore every legal action
+                # at the updating player's nodes, regardless of reach probability. The reach
+                # probability of an action does not justify skipping its traversal, as CFR
+                # explicitly computes counterfactual values assuming the action was taken.
+                child_values = self.traverse(child_state, new_reach_probs, updating_player, depth=depth + 1)
+                action_values[action_idx] = child_values
             
             # Compute state value via strategy
             state_values = {player_id: 0.0 for player_id in self.networks.keys()}
@@ -493,14 +506,18 @@ class VRDeepPDCFREngine:
             # The values from this branch are unbiased estimators via importance weighting
             return child_values
     
-    def train_networks(self) -> Dict[str, float]:
+    def train_networks(self, batch_size: int = 4096, num_epochs: int = 4) -> Dict[str, float]:
         """Train all networks from buffered data.
         
-        Performs one epoch of gradient descent using:
+        Performs multiple epochs of gradient descent using:
         - π (Strategy): Cross-entropy with time-decay weights
         - φ (Instantaneous Advantage): MSE
         - Q (Value Baseline): MSE
         - θ (Cumulative Advantage): Bootstrapped MSE with temporal discounting
+        
+        Args:
+            batch_size: Number of samples per minibatch (default 4096)
+            num_epochs: Number of training epochs (default 4)
         
         Returns:
             Dict of loss values for logging
@@ -508,17 +525,14 @@ class VRDeepPDCFREngine:
         losses = {}
         
         for player_id, network_bundle in self.networks.items():
-            logger.info(f"Training player {player_id} networks...")
+            logger.info(f"Training player {player_id} networks (batch_size={batch_size}, epochs={num_epochs})...")
             
             buffer_manager = self.buffer_managers[player_id]
             optim_dict = self.optimizers[player_id]
             
-            # Determine batch sizes from buffer manager, not network
+            # Get buffer sizes for logging
             adv_buffer_size = buffer_manager.advantage_buffer.size()
             strat_buffer_size = buffer_manager.strategy_buffer.size()
-            
-            batch_size = min(32, max(adv_buffer_size, strat_buffer_size // 10) if max(adv_buffer_size, strat_buffer_size) > 0 else 1)
-            num_epochs = 1  # Single epoch to preserve buffer quality
             
             for epoch in range(num_epochs):
                 # =========================================================
@@ -618,24 +632,58 @@ class VRDeepPDCFREngine:
         buffer_manager: BufferManager,
         batch_size: int,
     ) -> torch.Tensor:
-        """Compute φ (instantaneous advantage) loss.
+        """Compute φ (instantaneous advantage) loss with DCFR weighting.
         
-        Loss = MSE(predicted_advantages, observed_advantages)
+        Loss = weighted MSE where each sample is weighted by DCFR discount factor
         
-        No weighting: all samples contribute equally.
+        DCFR Weight: w_t = (t / (t + γ))^α
+        where t = iteration when sample was generated
+        
+        Weighted Loss = mean( w_t * MSE(predicted, observed) for each sample )
+        
+        This emphasizes recent samples (higher iteration = higher weight) and
+        ensures the network focuses on the most accurate advantage estimates.
         """
         if buffer_manager.advantage_buffer.size() == 0:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
         
-        features, _, observed_advantages = buffer_manager.advantage_buffer.sample_minibatch(
+        # Sample minibatch INCLUDING iterations for DCFR weighting
+        features, _, observed_advantages, iterations = buffer_manager.advantage_buffer.sample_minibatch(
             batch_size, replace=True
         )
         
         features_tensor = torch.FloatTensor(features).to(self.device)
         observed_tensor = torch.FloatTensor(observed_advantages).to(self.device)
         
+        # Compute DCFR discount weight for each sample in the batch
+        # weight_t = (t / (t + γ))^α  [using alpha exponent for all samples]
+        dcfr_weights = np.array([
+            compute_dcfr_discount(
+                iteration=int(t) - 1,  # Convert to 0-indexed for the function
+                regret_old=1.0,  # Use positive regret_old to always apply alpha discount
+                params=self.dcfr_params
+            )
+            for t in iterations
+        ], dtype=np.float32)
+        
+        dcfr_weights_tensor = torch.FloatTensor(dcfr_weights).to(self.device).unsqueeze(-1)
+        
+        # Predict and compute weighted MSE loss
         predicted = network_bundle.instantaneous_advantage(features_tensor)
-        loss = F.mse_loss(predicted, observed_tensor)
+        
+        # Element-wise MSE
+        mse_per_sample = (predicted - observed_tensor) ** 2  # Shape: (batch, num_actions)
+        
+        # Apply DCFR weights: scale each sample's loss
+        weighted_mse = mse_per_sample * dcfr_weights_tensor  # Broadcasting: (batch, num_actions)
+        
+        # Average over batch and actions
+        loss = weighted_mse.mean()
+        
+        logger.debug(
+            f"φ loss: DCFR weights range [{dcfr_weights.min():.6f}, {dcfr_weights.max():.6f}], "
+            f"mean weight: {dcfr_weights.mean():.6f}"
+        )
         
         return loss
     
@@ -651,28 +699,23 @@ class VRDeepPDCFREngine:
         
         Target: compute expected return from instantaneous advantages weighted by strategy
         """
-        if buffer_manager.strategy_buffer.size() == 0:
+        if buffer_manager.advantage_buffer.size() == 0:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
         
-        features, target_probs, _, _ = buffer_manager.strategy_buffer.sample_minibatch(
-            batch_size, current_iteration=self.current_iteration, replace=True
-        )
-        
-        # We need the corresponding advantages for the same states
-        # Sample from advantage_buffer using indices from strategy_buffer
-        features_adv, _, advantages = buffer_manager.advantage_buffer.sample_minibatch(
+        # Sample coherent (features, action_probs, advantages, iterations) tuple from advantage_buffer
+        # All three components come from the SAME state, ensuring alignment
+        features, action_probs, advantages, _ = buffer_manager.advantage_buffer.sample_minibatch(
             batch_size, replace=True
         )
         
         features_tensor = torch.FloatTensor(features).to(self.device)
-        target_probs_tensor = torch.FloatTensor(target_probs).to(self.device)
+        action_probs_tensor = torch.FloatTensor(action_probs).to(self.device)
         advantages_tensor = torch.FloatTensor(advantages).to(self.device)
         
         # Compute target: expected value from action advantages weighted by strategy
-        # V_target = V_baseline + sum_a pi(a) * A(a)
-        # Since we don't have explicit V_baseline, we compute weighted sum of advantages
+        # V_target = sum_a pi(a|s) * A(a|s) for the SAME state s
         target_values = torch.sum(
-            target_probs_tensor * advantages_tensor, dim=1, keepdim=True
+            action_probs_tensor * advantages_tensor, dim=1, keepdim=True
         )  # Shape: (batch, 1)
         
         predicted_values = network_bundle.value(features_tensor)  # Shape: (batch, 1)
@@ -759,7 +802,7 @@ class VRDeepPDCFREngine:
         if buffer_manager.advantage_buffer.size() == 0:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
         
-        features, _, observed_advantages = buffer_manager.advantage_buffer.sample_minibatch(
+        features, _, observed_advantages, _ = buffer_manager.advantage_buffer.sample_minibatch(
             batch_size, replace=True
         )
         
@@ -776,9 +819,9 @@ class VRDeepPDCFREngine:
             )  # Shape: (batch, num_actions)
         
         # Compute bootstrapped target
-        # target_θ = w_t * θ_frozen + φ_observed
-        # This maintains cumulative sum structure, weighting frozen contribution
-        target = decay_weight * theta_frozen_pred + observed_tensor
+        # target_θ = w_t * θ_frozen + (1 - w_t) * φ_observed
+        # This maintains cumulative sum structure as a convex combination
+        target = decay_weight * theta_frozen_pred + (1 - decay_weight) * observed_tensor
         
         # Apply CFR+ clipping: non-negative cumulative advantages
         target = torch.clamp(target, min=0.0)

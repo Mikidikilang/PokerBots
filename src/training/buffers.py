@@ -253,7 +253,7 @@ class EphemeralAdvantageBuffer:
         self,
         batch_size: int,
         replace: bool = True,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Sample a random minibatch from the buffer.
         
         Args:
@@ -261,10 +261,11 @@ class EphemeralAdvantageBuffer:
             replace: Allow sampling with replacement (default: True)
             
         Returns:
-            Tuple of (features, action_probs, advantages) where:
+            Tuple of (features, action_probs, advantages, iterations) where:
                 - features: Shape (batch_size, feature_dim)
                 - action_probs: Shape (batch_size, num_actions)
                 - advantages: Shape (batch_size, num_actions)
+                - iterations: Shape (batch_size,) - CFR iteration when each sample was generated
                 
         Raises:
             ValueError: If buffer is empty or batch_size > buffer size
@@ -294,8 +295,9 @@ class EphemeralAdvantageBuffer:
         features = np.stack([t.infoset_features for t in sampled])
         action_probs = np.stack([t.action_probs for t in sampled])
         advantages = np.stack([t.advantages for t in sampled])
+        iterations = np.array([t.iteration for t in sampled], dtype=np.int32)
         
-        return features, action_probs, advantages
+        return features, action_probs, advantages, iterations
     
     def clear(self) -> None:
         """Wipe all transitions (called at start of new iteration).

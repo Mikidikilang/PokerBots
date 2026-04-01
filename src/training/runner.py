@@ -129,23 +129,90 @@ class GameStateAdapter:
     def is_chance_node(self) -> bool:
         """Check if this is a chance (stochastic) node.
         
-        For poker, chance is handled implicitly by RLCard during reset/step.
-        We don't expose explicit chance nodes here.
+        In RLCard, chance events occur when transitioning between streets.
+        We detect this by checking if the current player is betting/acting,
+        or if we're in a state where no one can act (need cards dealt).
         
         Returns:
-            False (poker has no explicit chance nodes exposed)
+            True if at a chance node (card dealing transition), False otherwise
         """
-        return False
+        try:
+            # Get current game state to check if we're at a street transition
+            # In RLCard, when it's time to deal the next community cards,
+            # the legal_actions for the current player may be empty or the
+            # round state indicates a street advance is coming
+            legal_actions = self.env._current_state.get("legal_actions", {})
+            
+            # If there are legal actions, it's a normal player node, not chance
+            if legal_actions:
+                return False
+            
+            # If no legal actions and game is not over, we're likely at a chance transition
+            if not self.env.is_over():
+                return True
+            
+            return False
+        except Exception:
+            return False
+    
+    def sample_chance_outcome(self) -> GameStateAdapter:
+        """Sample a single chance outcome (card dealing) via RLCard's internal logic.
+        
+        In external sampling MCCFR, we sample exactly ONE outcome at chance nodes.
+        For RLCard poker, this means advancing the street and dealing cards.
+        
+        Returns:
+            New GameStateAdapter with the sampled cards at the next street
+        """
+        try:
+            # Save current environment snapshot
+            snapshot_before = self.env.get_full_state()
+            
+            # RLCard advances to the next street internally when we call step()
+            # with any valid action during chance/transition. We step with
+            # the first legal action (or 0 if none available), which causes
+            # RLCard to deal the next community cards and move to the next street.
+            legal_actions = self.env._current_state.get("legal_actions", {})
+            action_id = min(legal_actions.keys()) if legal_actions else 0
+            
+            # Step the environment - this applies the chance event (card dealing)
+            try:
+                raw_result = self.env._env.step(action_id)
+                next_state, next_player = self.env._unpack_step(raw_result)
+                self.env._current_player_id = next_player
+                self.env._current_state = next_state
+                self.env._terminal = bool(self.env._env.is_over())
+            except Exception:
+                # If step fails, restore and re-raise
+                self.env.set_full_state(snapshot_before)
+                raise
+            
+            # Create and return a new adapter with the sampled state
+            new_obs = self.env._build_obs_dict(next_state, next_player)
+            child_adapter = GameStateAdapter(
+                env=self.env,
+                obs_builder=self.obs_builder,
+                env_snapshot=self.env.get_full_state(),
+                current_obs=new_obs,
+            )
+            
+            return child_adapter
+        except Exception as exc:
+            logger.warning(f"Failed to sample chance outcome: {exc}")
+            # Fallback: return self unchanged
+            return self
     
     def get_chance_outcomes(self) -> list[tuple[Any, float]]:
-        """Get stochastic outcomes at chance node.
+        """Get stochastic outcomes at chance node (deprecated; use sample_chance_outcome).
         
-        Not used for poker (is_chance_node always returns False).
+        For external sampling MCCFR, use sample_chance_outcome() instead.
+        This method is kept for compatibility but should not be called.
         
         Returns:
-            List of (next_state, probability) tuples
+            List containing a single sampled outcome
         """
-        return [(self, 1.0)]
+        # For external sampling, we only return one outcome
+        return [(self.sample_chance_outcome(), 1.0)]
     
     def get_acting_player(self) -> int:
         """Get the player whose turn it is to act.

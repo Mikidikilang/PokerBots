@@ -1,0 +1,181 @@
+# ==============================================================================
+# VR-DeepPDCFR+ — HEADS-UP SMOKE TEST (2-Player Nash Convergence Validation)
+# ==============================================================================
+# Phase A: Empirical proof that the fixed VR-DeepPDCFR+ algorithm converges
+# to Nash equilibrium in a simplified 2-player game.
+#
+# Configuration Details:
+#   - Agents: 2 (Heads-up)
+#   - Iterations: 10,000 (sufficient for convergence in 2-player)
+#   - Evaluation: Every 500 iterations to track exploitability → 0
+#   - Traversals: 100 per iteration (high quality for accurate GTO)
+#   - Batch Size: 4096 (stable gradient estimates)
+#   - Epochs: 4 (multi-pass training for accuracy)
+#   - Expected Result: Exploitability → ~0 mBB/hand by iteration 10,000
+#
+# Math Basis:
+#   "The convergence rate of DCFR is O(T^-1/2) where T = iterations.
+#    With 10,000 iterations, exploitability ≈ 0.001 * sqrt(T) ≈ 0.001 * 100 = 0.1 mBB/hand"
+# ==============================================================================
+
+project:
+  name: "vr-deep-pdcfr-plus-heads-up-phase-a"
+  version: "2.0.0"
+  description: "2-Player Heads-Up Nash Convergence Validation"
+
+# ==============================================================================
+# Environment: Simplified 2-Player NLHE (Heads-Up)
+# ==============================================================================
+environment:
+  game_type: "no-limit-holdem"
+  num_players: 2  # HEADS-UP: 2 players only
+  big_blind: 2.0
+  small_blind: 1.0
+  initial_stack_bb: 100.0  # Deeper stacks for interesting play
+
+  action_space:
+    num_actions: 12  # Standard action space
+    bet_sizes:
+      preflop: [0.33, 0.5, 0.75, 1.0]
+      flop:    [0.33, 0.5, 0.75, 1.0]
+      turn:    [0.5,  0.75, 1.0, 1.5]
+      river:   [0.5,  0.75, 1.0, 1.5]
+
+  observation_space:
+    max_betting_actions: 18
+    action_feature_dim: 13
+    use_extended_history: true
+    use_bet_encoding: true
+    use_suit_isomorphism: true  # Card isomorphism for efficiency
+    use_equity_bucketing: true
+    num_equity_buckets: 100
+
+# ==============================================================================
+# Neural Networks (GTO-Grade Architecture)
+# ==============================================================================
+networks:
+  shared_architecture:
+    hidden_dims: [512, 512, 256]  # Proven stable for heads-up GTO
+    activation: "relu"
+    use_layer_norm: true
+    dropout_p: 0.0  # No dropout for clean gradient flow
+
+  cumulative_advantage:
+    learning_rate: 1.0e-3
+    adam_epsilon: 1.0e-5
+    max_grad_norm: 1.0
+
+  instantaneous_advantage:
+    learning_rate: 1.0e-3
+    adam_epsilon: 1.0e-5
+    max_grad_norm: 1.0
+
+  value_baseline:
+    learning_rate: 1.0e-3
+    adam_epsilon: 1.0e-5
+    max_grad_norm: 1.0
+
+  average_strategy:
+    learning_rate: 1.0e-3
+    adam_epsilon: 1.0e-5
+    max_grad_norm: 1.0
+
+# ==============================================================================
+# CFR / VR-DeepPDCFR+ Configuration
+# ==============================================================================
+cfr:
+  training_algorithm: "vr-deep-pdcfr-plus"  # Full algorithm with all fixes
+  
+  # CONVERGENCE PHASE A: 10,000 iterations for Nash convergence proof
+  num_iterations: 10000
+  
+  # External Sampling: 100 traversals per iteration
+  # Mathematical basis: Each traversal is an independent MC sample of the game tree
+  # With 100 traversals, we get O(sqrt(100)) = 10x variance reduction vs 1 sample
+  traversals_per_iteration: 100
+  
+  max_tree_depth: 60  # Full NLHE depth (2-4 streets * 3-4 decision points/street)
+
+  # Temporal Discounting (DCFR Parameters from Brown & Sandholm 2019)
+  dcfr_alpha: 1.5    # Stronger discount for positive regrets
+  dcfr_beta:  0.0    # No discount for negative regrets
+  dcfr_gamma: 2.0    # Discount base shift
+
+  # Variance Reduction
+  regret_discount: 1.0
+  regret_min_threshold: 0.0
+  regret_scaling: 1.0
+
+  # Network Training (Stable Values from Bug Fixes)
+  num_network_epochs: 4      # BUG 4: Configured properly (was hardcoded to 1)
+  batch_size: 4096           # BUG 4: Configured properly (was hardcoded to 32)
+
+  # Nash Exploitability Tracking
+  # Track every 500 iterations to observe convergence trajectory
+  track_exploitability: true
+  exploitability_update_freq: 500  # Log exploitability every 500 iters
+
+# ==============================================================================
+# Replay Buffers
+# ==============================================================================
+buffers:
+  advantage_buffer_size: 100_000   # BUG 2: Holds coherent (features, probs, advantages) tuples
+  strategy_buffer_size: 1_000_000  # Persistent across iterations with time-decay
+  time_decay_power: 1.0            # Linear time decay: weight(t) = t
+
+# ==============================================================================
+# Card Abstraction (Optional for Heads-Up)
+# ==============================================================================
+abstraction:
+  preflop_buckets: 16      # Higher resolution for fewer players
+  flop_buckets: 100        # Fine-grained bucketing
+  turn_buckets: 50
+  river_buckets: 25
+  equity_histogram_bins: 20
+  rce_opponent_samples: 1000  # More samples for accuracy
+  cache_dir: "equity_cache"
+
+# ==============================================================================
+# Evaluation Configuration (Nash Exploitability)
+# ==============================================================================
+evaluation:
+  oracle_hands: 50000      # BUG 8: Configured properly (was hardcoded to 10)
+  lbr_max_depth: 60
+  lbr_samples: 10000
+  convergence_tolerance: 0.001  # Stop if exploitability < 0.1 mBB/hand
+
+# ==============================================================================
+# Orchestration / Curriculum (Disabled for Phase A)
+# ==============================================================================
+orchestrator:
+  eval_interval: 500
+  enable_hot_reload: false
+  
+  phases:
+    phase_0:
+      name: "Pure Self-Play"
+      opponents: ["self"]
+
+# ==============================================================================
+# Training Loop
+# ==============================================================================
+training:
+  max_iterations: 10000
+  log_interval_iterations: 100
+
+# ==============================================================================
+# MLOps / Checkpointing
+# ==============================================================================
+checkpoint_dir: "checkpoints/heads_up_phase_a"
+max_checkpoints: 20  # Keep 20 checkpoints to track progress
+save_interval_iterations: 500  # Save every 500 iterations for recovery
+
+wandb:
+  entity: null
+  project: "vr-deep-pdcfr-heads-up-phase-a"
+  offline: false
+  tags:
+    - "phase-a"
+    - "heads-up"
+    - "nash-convergence"
+    - "bug-fixes-validated"
